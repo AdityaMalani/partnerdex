@@ -2,7 +2,7 @@ import express from 'express';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { getConfig } from '../config.js';
+import { ConfigError, getConfig } from '../config.js';
 import { getCustomer, listCustomers, type CustomerSort } from '../customers/index.js';
 import { getDb } from '../db/index.js';
 import { type RawMetricQuery } from '../metrics/context.js';
@@ -20,10 +20,15 @@ import { buildReviewEvents } from '../appstore/events.js';
 import { resolveScopedAppIds } from '../sync/index.js';
 import { onSyncComplete, startSyncScheduler, syncStatus } from '../sync/scheduler.js';
 import { authRequired, authRouter, requireAuth } from './auth.js';
+import { portalAuthRouter, requirePortalAuth } from './portalAuth.js';
+import { portalRouter } from './portal.js';
+import { signupRouter } from './signup.js';
+import { referralRedirectRouter } from './referralRedirect.js';
 import { sendError } from './errors.js';
 import { notificationsRouter } from './notifications.js';
 import { listingsRouter } from './listings.js';
 import { bigqueryRouter } from './bigquery.js';
+import { affiliatesAdminRouter } from './affiliatesAdmin.js';
 import { organizationsRouter } from './organizations.js';
 import { listAppSources } from '../bigquery/connection.js';
 import { funnelReport } from '../metrics/reports/funnel.js';
@@ -64,7 +69,74 @@ function orgOf(request: express.Request): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
 }
 
+/** Where `npm run build:web` leaves both bundles. */
+const WEB_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../web');
+
+/**
+ * The affiliate portal's shell — its own HTML entry, not the dashboard's.
+ *
+ * Separate bundles rather than one app with a route, so an affiliate's browser
+ * is never sent the dashboard's code at all. That is not a security boundary on
+ * its own (the API is), but shipping the admin bundle to hundreds of external
+ * people would hand them a map of every endpoint worth attacking.
+ */
+function servePortal(response: express.Response, next: express.NextFunction): void {
+  const file = path.join(WEB_ROOT, 'portal.html');
+  if (!fs.existsSync(file)) {
+    next();
+    return;
+  }
+  response.sendFile(file);
+}
+
+/**
+ * Refuse to build a server that would serve everything to everybody by accident.
+ *
+ * `isAuthenticated` returns true for every caller when `DASHBOARD_PASSWORD` is
+ * unset. That is a supported mode — it is what a localhost install has always
+ * done — but it is indistinguishable, from inside this process, from a
+ * deployment whose secret failed to arrive. The review's F6 spells out what is
+ * on the other side of that gate, and the worst of it is
+ * `POST /api/affiliates/set-password-links`: one unauthenticated request
+ * returning a live 24-hour takeover link for each of hundreds of affiliates.
+ *
+ * So the open mode is now something an operator asks for, not something that
+ * happens when a variable is missing. `ALLOW_NO_AUTH=true` keeps the documented
+ * localhost workflow exactly as it was, one line in `.env`; anything else stops
+ * here, at startup, where somebody is watching — rather than at the first
+ * request from a stranger, where nobody is.
+ *
+ * Thrown from `createApp` rather than from `getConfig` on purpose: `partnerdex
+ * sync`, `rebuild`, `doctor` and the importers have no HTTP surface and no
+ * business needing a dashboard password.
+ */
+function assertAuthIsIntentional(): void {
+  const { password, allowNoAuth } = getConfig().auth;
+  if (password !== null || allowNoAuth) return;
+  throw new ConfigError(
+    'DASHBOARD_PASSWORD is not set, so every /api route would be open to anyone ' +
+      'who can reach this port — including the one that mints set-password links ' +
+      'for every affiliate. Set DASHBOARD_PASSWORD, or set ALLOW_NO_AUTH=true to ' +
+      'confirm you mean to run without a login (local development).',
+  );
+}
+
 export function createApp(): express.Express {
+  assertAuthIsIntentional();
+
+  if (!authRequired()) {
+    // Loud, repeated, and on stderr: an operator who typed ALLOW_NO_AUTH=true
+    // into a production environment should trip over this in the logs.
+    console.error(
+      '[partnerdex] ############################################################\n' +
+        '[partnerdex] # ALLOW_NO_AUTH=true — the dashboard API has NO login.     #\n' +
+        '[partnerdex] # Every /api route, including affiliate set-password       #\n' +
+        '[partnerdex] # links, is open to anyone who can reach this port.        #\n' +
+        '[partnerdex] # Do not expose this process to a network.                 #\n' +
+        '[partnerdex] ############################################################',
+    );
+  }
+
   const app = express();
   app.disable('x-powered-by');
 
@@ -77,13 +149,21 @@ export function createApp(): express.Express {
   const orgScope = (orgId: string | undefined): string[] =>
     orgId === undefined ? [] : resolveScopedAppIds(getDb(), orgId);
 
-  // Behind a TLS-terminating proxy the request arrives as plain HTTP, so
-  // `request.protocol` reads "http" and the session cookie would ship without
-  // its Secure flag; `request.ip` would be the proxy's, collapsing every failed
-  // login into one lockout bucket. One hop, because that is what a proxy in
-  // front of this process is — trusting more would trust whatever a client put
-  // in the header.
-  if (getConfig().runtime.trustProxy) app.set('trust proxy', 1);
+  /*
+   * Behind a TLS-terminating proxy the request arrives as plain HTTP, so
+   * `request.protocol` reads "http" and the session cookie would ship without
+   * its Secure flag; `request.ip` would be the proxy's, collapsing every failed
+   * login into one lockout bucket.
+   *
+   * The hop count is configuration rather than the compiled-in `1` it used to
+   * be, because it is the number that decides whether a client can choose its
+   * own rate-limit key, and it is different for the deployment we have and the
+   * one the runbook proposes. Fly-direct is one appending hop (measured);
+   * Pangolin in front of Fly is two. See `TRUST_PROXY_HOPS` in `config.ts` for
+   * what each kind of wrongness costs.
+   */
+  const { trustProxy, trustProxyHops } = getConfig().runtime;
+  if (trustProxy) app.set('trust proxy', trustProxyHops);
   // Only the notification routes accept a body, and the largest of those is a
   // name and a URL. A small ceiling keeps a stray upload from becoming memory.
   app.use(express.json({ limit: '64kb' }));
@@ -99,6 +179,31 @@ export function createApp(): express.Express {
   app.use('/api/auth', authRouter());
 
   /*
+   * The affiliate realm, entire. Everything it serves lives under `/portal` and
+   * `/r`, neither of which is a prefix of `/api`, so no affiliate request can
+   * reach `requireAuth`'s routes by falling through — and `requirePortalAuth`
+   * guards nothing outside its own mount. See `portalAuth.ts` for why the two
+   * realms share no cookie name and no signing key.
+   */
+  app.use('/r', referralRedirectRouter());
+  app.use('/portal/api/auth', portalAuthRouter());
+  /*
+   * Self-signup, mounted *ahead* of `requirePortalAuth` and public by design —
+   * a partner applying to join has, by definition, no session to present. It
+   * sits beside `/portal/api/auth` rather than inside it because it is not an
+   * auth route: it writes to the affiliate ledger, which is the only fully
+   * public write in this process and the reason `signup.ts` opens with the
+   * security review's findings rather than a description.
+   *
+   * Order matters. Express matches in registration order, so this has to be
+   * above the `/portal/api` mount or `requirePortalAuth` would 401 every
+   * applicant — a failure that would look exactly like a broken form.
+   */
+  app.use('/portal/api/signup', signupRouter());
+  app.use('/portal/api', requirePortalAuth, portalRouter());
+  app.get(['/portal', '/portal/*'], (_request, response, next) => servePortal(response, next));
+
+  /*
    * Everything below reads the store, so everything below is gated. The static
    * dashboard bundle deliberately is not: it holds no data, and it has to load
    * before it can ask for the password.
@@ -108,10 +213,15 @@ export function createApp(): express.Express {
   app.use('/api/notifications', notificationsRouter());
   app.use('/api/listings', listingsRouter());
   app.use('/api/bigquery', bigqueryRouter());
+  // Inside the gate, and that is the point: this router can reassign a merchant
+  // from one affiliate to another. It is admin, never the partner-facing realm.
+  app.use('/api/affiliates', affiliatesAdminRouter());
   /*
    * Organization management, inside the same gate and for a stronger reason
    * than most of what is in here: it holds live Partner API credentials, and a
    * request that reached it could point one at an organization of its choosing.
+   * Admin realm only — the affiliate portal's cookie is a different name, a
+   * different path and a different signing key, and none of it reaches `/api`.
    */
   app.use('/api/organizations', organizationsRouter());
 

@@ -9,6 +9,18 @@ import { runSync } from './sync/index.js';
 import { rebuildDerivedTables } from './sync/derive.js';
 import { runMetric, listMetrics } from './metrics/registry.js';
 import { serve } from './server/index.js';
+import {
+  formatImportReport,
+  ImportInputError,
+  parseAppIds,
+  runMantleImport,
+} from './affiliates/importRun.js';
+import {
+  formatOnboardingSummary,
+  OnboardingError,
+  runOnboarding,
+} from './notifications/onboarding.js';
+import { issueSetPasswordLink } from './server/portalAuth.js';
 import { runValidators } from './validate.js';
 
 const USAGE = `partnerdex - self-hosted analytics for your Shopify apps
@@ -19,6 +31,12 @@ Usage:
   partnerdex rebuild             Recompile the derived indexes from local data
   partnerdex serve               Start the API and dashboard
   partnerdex validate            Run the trust checks
+  partnerdex portal-link --email=<address> | --all
+                                 Mint affiliate set-password links and print them
+  partnerdex onboard-affiliates [--dry-run] [--limit=N] [--resend] [--spacing-ms=N]
+                                 Email set-password links to affiliates who have none
+  partnerdex import-affiliates --exports=<dir> [--dry-run] [--app=<mantleAppId>=<appId>]
+                                 Import the Mantle affiliate export into the ledger
   partnerdex query <metric> [--period=last_12_months] [--interval=month] [--asOf=YYYY-MM-DD]
 
 Metrics:
@@ -209,6 +227,152 @@ async function main(): Promise<void> {
         if (finding.detail) console.log(`         ${JSON.stringify(finding.detail)}`);
       }
       process.exitCode = findings.some((f) => f.severity === 'high') ? 1 : 0;
+      break;
+    }
+
+    /**
+     * Mint set-password links for affiliates, at a terminal, on purpose.
+     *
+     * The imported accounts have no passwords, so a link is the only way in
+     * for every one of them. Printing links used to happen by itself, into the
+     * application log, for every link anyone requested — which published live
+     * account-takeover URLs to everyone holding `fly logs`. Here the same output
+     * requires somebody to type the command, and lands on their terminal rather
+     * than in a log stream with an unbounded audience. That difference is the
+     * whole fix; the token, its lifetime and its storage are unchanged.
+     *
+     * `--csv` because onboarding hundreds of people means a mail merge, and the
+     * shape
+     * that survives a spreadsheet is two columns and a comma. Emails and names
+     * are quoted; the URL cannot contain a comma (base64url plus a UUID).
+     */
+    case 'portal-link': {
+      const db = getDb();
+      const all = flags.all === 'true';
+      const email = flags.email?.trim().toLowerCase() ?? '';
+      if (!all && !email) {
+        console.error('Usage: partnerdex portal-link --email=<address> | --all [--csv]');
+        process.exitCode = 1;
+        break;
+      }
+
+      const rows = (
+        all
+          ? db
+              .prepare(`SELECT id FROM affiliates WHERE status = 'active' ORDER BY created_at`)
+              .all()
+          : db
+              .prepare(
+                `SELECT id FROM affiliates
+                  WHERE LOWER(email) = ? AND status = 'active' ORDER BY created_at`,
+              )
+              .all(email)
+      ) as Array<{ id: string }>;
+
+      if (rows.length === 0) {
+        console.error(
+          all ? 'No active affiliates.' : `No active affiliate with the address ${email}.`,
+        );
+        process.exitCode = 1;
+        break;
+      }
+
+      // Said before the links, not after: on a long run the warning would
+      // otherwise scroll away above whatever the operator is about to copy.
+      console.error(
+        `Minting ${rows.length} link(s). Each one opens that affiliate's account for 24 ` +
+          `hours — treat this output as a list of passwords, and note that minting ` +
+          `replaces any link already outstanding for the same affiliate.`,
+      );
+
+      const csv = flags.csv === 'true';
+      if (csv) console.log('email,name,url,expiresAt');
+      for (const row of rows) {
+        const link = issueSetPasswordLink(db, row.id);
+        if (!link) continue;
+        const quote = (value: string): string => `"${value.replace(/"/g, '""')}"`;
+        console.log(
+          csv
+            ? `${quote(link.email)},${quote(link.name)},${link.url},${link.expiresAt}`
+            : `${link.email.padEnd(32)} ${link.url}  (valid until ${link.expiresAt})`,
+        );
+      }
+      break;
+    }
+
+    /**
+     * The bulk onboarding send, and the reason the portal is usable at all.
+     *
+     * Every one of the imported accounts arrived without a password, so a
+     * set-password link is the only way in for all of them. `portal-link --all`
+     * above prints those links for a mail merge, which works and which, in
+     * practice, nobody was ever going to finish: hundreds of copy-pastes is a
+     * task that
+     * quietly does not happen. This does the same thing with the links going
+     * straight to a relay instead of to a terminal, and with a ledger behind it
+     * so a run that stops halfway is resumed by running it again.
+     *
+     * `--dry-run` first, always. It reports the batch without minting a token or
+     * opening a socket, and it is where the shared-address groups show up — one
+     * inbox that two separate affiliate accounts both claim. Those are never
+     * sent automatically; see `onboarding.ts`.
+     */
+    case 'onboard-affiliates': {
+      const spacing = Number(flags['spacing-ms']);
+      const limit = Number(flags.limit);
+      try {
+        const summary = await runOnboarding(getDb(), {
+          dryRun: flags['dry-run'] === 'true',
+          resend: flags.resend === 'true',
+          limit: Number.isFinite(limit) ? limit : undefined,
+          spacingMs: Number.isFinite(spacing) ? spacing : undefined,
+          // Printed as they go rather than only at the end: a fifteen-minute run
+          // with no output is indistinguishable from a hung one.
+          onProgress: (message) => console.log(message),
+        });
+        console.log(formatOnboardingSummary(summary));
+        process.exitCode = summary.failed > 0 ? 1 : 0;
+      } catch (error) {
+        if (!(error instanceof OnboardingError)) throw error;
+        console.error(error.message);
+        process.exitCode = 1;
+      }
+      break;
+    }
+
+    /**
+     * The one-way move off Mantle, runnable where the database actually is.
+     *
+     * A subcommand rather than only a script because the production image is
+     * runtime-only: it carries `dist/`, production dependencies and nothing
+     * else, so `scripts/import-mantle-affiliates.ts` and the `tsx` that runs it
+     * are both absent there. The deployed database is exactly where the
+     * affiliates have to end up — until they do, every referral link 404s — so
+     * the import has to ship in `dist/`.
+     *
+     * Safe to re-run, and expected to be. Every write is keyed on Mantle's own
+     * ids, so an interrupted run is repaired by running it again, and a referral
+     * whose merchant had not synced yet gets its shop filled in by a later pass.
+     * `--dry-run` does the whole import and rolls it back.
+     */
+    case 'import-affiliates': {
+      try {
+        const { report } = runMantleImport({
+          exportsDir: flags.exports ?? '',
+          dryRun: flags['dry-run'] === 'true',
+          appIds: parseAppIds(flags.app),
+          onProgress: (message) => console.log(message),
+        });
+        console.log(formatImportReport(report, flags['dry-run'] === 'true'));
+      } catch (error) {
+        if (!(error instanceof ImportInputError)) throw error;
+        console.error(error.message);
+        console.error(
+          'Usage: partnerdex import-affiliates --exports=<dir> [--dry-run] ' +
+            '[--app=<mantleAppId>=<appId>]',
+        );
+        process.exitCode = 1;
+      }
       break;
     }
 

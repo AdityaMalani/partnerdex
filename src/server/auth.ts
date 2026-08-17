@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import express from 'express';
 import { getConfig } from '../config.js';
+import { createThrottle } from './throttle.js';
 
 /**
  * A single shared password in front of the dashboard.
@@ -25,12 +26,21 @@ const REMEMBER_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
 /**
  * Guessing is cheap over a network and a shared password is short, so failed
- * attempts are throttled per client. In-memory and per-process: a restart
- * forgets, which is the right trade for a tool whose whole state is one file.
+ * attempts are throttled per client. The mechanism moved to `throttle.ts` when
+ * the affiliate portal needed the same one; this realm keeps its own counters,
+ * so a partner guessing at the portal cannot lock the operator out of here.
+ *
+ * Keyed on the client address alone, and — unlike the portal — that cannot be
+ * narrowed: there is one account, so there is nothing to mix in. The collateral
+ * is therefore real and is accepted rather than solved. Anyone sharing the
+ * operator's egress address who burns five attempts locks the operator out for
+ * a minute, and the review measured exactly that against the live deployment.
+ * Two things make it tolerable here: the population sharing this bucket is one
+ * person rather than hundreds, and failures now age out on their own (see
+ * `throttle.ts`), so the lockout cannot be walked up indefinitely by an attacker
+ * spending one wrong password per expiry.
  */
-const MAX_ATTEMPTS = 5;
-const LOCKOUT_MS = 60_000;
-const failures = new Map<string, { count: number; until: number }>();
+const throttle = createThrottle();
 
 export function authPassword(): string | null {
   return getConfig().auth.password;
@@ -74,6 +84,15 @@ function tokenIsValid(token: string, password: string): boolean {
  * Compared over digests rather than the raw strings, so the comparison is
  * constant-time in the password's *content* and tells an attacker nothing from
  * its length either.
+ *
+ * Checked against the availability review and deliberately left synchronous.
+ * The portal login had to move to async, capped scrypt because it runs a ~22 ms
+ * key-derivation on every attempt; this runs two SHA-256 digests over a short
+ * string, which is single-digit microseconds. Flooding it is a bandwidth
+ * attack, not an event-loop attack, and moving it onto the libuv pool would add
+ * a queue and a failure mode to defend against nothing. If this ever becomes a
+ * real KDF — which it should if this password is ever more than one operator's
+ * — it must move to `scryptPool.ts` at the same time.
  */
 function passwordMatches(presented: string, actual: string): boolean {
   const a = crypto.createHash('sha256').update(presented).digest();
@@ -82,7 +101,7 @@ function passwordMatches(presented: string, actual: string): boolean {
 }
 
 /** Express only parses cookies with middleware; one name is not worth a dependency. */
-function readCookie(request: express.Request, name: string): string | null {
+export function readCookie(request: express.Request, name: string): string | null {
   const header = request.headers.cookie;
   if (!header) return null;
   for (const part of header.split(';')) {
@@ -105,26 +124,8 @@ export function isAuthenticated(request: express.Request): boolean {
   return token !== null && tokenIsValid(token, password);
 }
 
-function clientKey(request: express.Request): string {
+export function clientKey(request: express.Request): string {
   return request.ip ?? request.socket.remoteAddress ?? 'unknown';
-}
-
-/** Remaining lockout in seconds, or 0 when the client may try again. */
-function lockoutSeconds(key: string): number {
-  const record = failures.get(key);
-  if (!record || record.until <= Date.now()) return 0;
-  return Math.ceil((record.until - Date.now()) / 1000);
-}
-
-function recordFailure(key: string): void {
-  const record = failures.get(key) ?? { count: 0, until: 0 };
-  record.count += 1;
-  // Each attempt past the threshold locks for longer, so a script slows down
-  // while a person who mistyped twice is not locked out at all.
-  if (record.count >= MAX_ATTEMPTS) {
-    record.until = Date.now() + LOCKOUT_MS * (record.count - MAX_ATTEMPTS + 1);
-  }
-  failures.set(key, record);
 }
 
 export function authRouter(): express.Router {
@@ -149,7 +150,7 @@ export function authRouter(): express.Router {
     }
 
     const key = clientKey(request);
-    const locked = lockoutSeconds(key);
+    const locked = throttle.lockoutSeconds(key);
     if (locked > 0) {
       response
         .status(429)
@@ -162,14 +163,14 @@ export function authRouter(): express.Router {
     const remember = body?.remember === true;
 
     if (!presented || !passwordMatches(presented, password)) {
-      recordFailure(key);
+      throttle.recordFailure(key);
       // One message for "empty" and "wrong": there is nothing useful to
       // distinguish, and distinguishing them is what leaks.
       response.status(401).json({ error: 'Incorrect password.' });
       return;
     }
 
-    failures.delete(key);
+    throttle.clear(key);
     const ttl = remember ? REMEMBER_TTL_MS : SESSION_TTL_MS;
     response.cookie(COOKIE_NAME, issueToken(password, ttl), {
       httpOnly: true,

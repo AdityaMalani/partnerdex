@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Affiliate portal — PartnerDex</title>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <!--
+      Same pre-paint theme settle as the dashboard, under the same storage key:
+      an affiliate and an operator are never the same browser, so there is no
+      state to collide, and sharing the key means one implementation.
+    -->
+    <script>
+      document.documentElement.dataset.theme =
+        localStorage.getItem('partnerdex:theme') === 'light' ? 'light' : 'dark';
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/portal/main.tsx"></script>
+  </body>
+</html>

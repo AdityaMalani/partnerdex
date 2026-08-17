@@ -22,6 +22,7 @@ import {
 import { rebuildDerivedTables } from './derive.js';
 import { syncReviews, type ReviewSyncResult } from '../appstore/ingest.js';
 import { syncListingEvents, type ListingSyncResult } from '../bigquery/ingest.js';
+import { syncAffiliates, type AffiliateSyncResult } from '../affiliates/pipeline.js';
 import { HEARTBEAT_INTERVAL_MS, SyncReporter, type PhaseEvent } from './progress.js';
 
 /**
@@ -190,7 +191,7 @@ export function transactionVariables(
  * The apps in scope, across every organization by default.
  *
  * Unfiltered is the default deliberately: every reader of this function — the
- * dashboard, the metrics, the funnel, the notifier — is
+ * dashboard, the metrics, the funnel, the notifier, the affiliate ledger — is
  * asking "what does this instance cover?", and the answer to that has always
  * been "all of it". Making it default to one org would silently drop the second
  * org's apps out of every existing figure the moment it was configured.
@@ -363,6 +364,7 @@ export interface SyncResult {
   reviewEvents: number;
   reviews: ReviewSyncResult;
   listing: ListingSyncResult;
+  affiliates: AffiliateSyncResult;
 }
 
 /**
@@ -600,6 +602,33 @@ async function runSyncReported(options: SyncOptions, reporter: SyncReporter): Pr
     warmDashboardMetrics();
   });
 
+  /*
+   * The affiliate ledger, last and on purpose.
+   *
+   * It reads what every step above just wrote: `shops` for the referrals that
+   * arrived before their merchant did, `install_intervals` for the 30-day
+   * unassignment rule, and `transactions` for the commissions themselves. Run
+   * any earlier and each of those would be a sync behind.
+   *
+   * It cannot fail this function. Attribution needs BigQuery, which is optional
+   * in this product and unconfigured in most installs, and a partner who has
+   * never heard of the affiliate program must not lose their MRR sync to it —
+   * the same bargain `syncListingEvents` makes above.
+   */
+  const affiliates = await reporter.phase(
+    'affiliates',
+    null,
+    () => syncAffiliates(db, appIds, steps),
+    (result) => ({
+      created: result.attribution.created,
+      updated: result.attribution.updated,
+      resolved: result.shopsResolved,
+    }),
+  );
+  if (affiliates.error) {
+    onProgress(`Affiliate pipeline skipped: ${affiliates.error}`);
+  }
+
   if (failures.length > 0) {
     throw new Error(
       `${failures.length} of ${orgs.length} organization(s) failed to sync: ` +
@@ -615,6 +644,7 @@ async function runSyncReported(options: SyncOptions, reporter: SyncReporter): Pr
     events,
     reviews,
     listing,
+    affiliates,
     ...derived,
   };
 }
