@@ -19,6 +19,7 @@ import {
 import { rebuildDerivedTables } from './derive.js';
 import { syncReviews, type ReviewSyncResult } from '../appstore/ingest.js';
 import { syncListingEvents, type ListingSyncResult } from '../bigquery/ingest.js';
+import { HEARTBEAT_INTERVAL_MS, SyncReporter, type PhaseEvent } from './progress.js';
 
 /**
  * Transactions and events can be recorded slightly after they occur, so each
@@ -43,6 +44,16 @@ export interface SyncOptions {
   /** Ignore stored watermarks and re-read everything from SYNC_START_DATE. */
   full?: boolean;
   onProgress?: SyncProgress;
+  /**
+   * Phase transitions, heartbeats and failures.
+   *
+   * Separate from `onProgress` because the two have different audiences and
+   * very different volumes: `onProgress` is a line per page of results, which
+   * the CLI prints and a daemon must not, while this is a handful of lines per
+   * run and is the only thing worth logging from a process that has been
+   * running every few minutes for months.
+   */
+  onPhase?: (event: PhaseEvent) => void;
 }
 
 /**
@@ -81,6 +92,7 @@ async function syncTransactionsFor(
   db: Db,
   appId: string | null,
   options: SyncOptions,
+  signal?: AbortSignal,
 ): Promise<number> {
   const { scope } = getConfig();
   const onProgress = options.onProgress ?? noop;
@@ -100,6 +112,7 @@ async function syncTransactionsFor(
     transactionVariables(appId, createdAtMin, SALE_TRANSACTION_TYPES),
     (data) => data?.transactions,
     cursor,
+    { signal },
   );
 
   for await (const page of pages) {
@@ -117,7 +130,12 @@ async function syncTransactionsFor(
   return total;
 }
 
-async function syncEventsFor(db: Db, appId: string, options: SyncOptions): Promise<number> {
+async function syncEventsFor(
+  db: Db,
+  appId: string,
+  options: SyncOptions,
+  signal?: AbortSignal,
+): Promise<number> {
   const { scope } = getConfig();
   const onProgress = options.onProgress ?? noop;
   const key = `events:${appId}`;
@@ -140,6 +158,7 @@ async function syncEventsFor(db: Db, appId: string, options: SyncOptions): Promi
     },
     (data) => data?.app?.events,
     cursor,
+    { signal },
   );
 
   for await (const page of pages) {
@@ -157,10 +176,11 @@ async function syncEventsFor(db: Db, appId: string, options: SyncOptions): Promi
 }
 
 /** Confirms an allowlisted app id exists and records its name locally. */
-async function confirmApp(db: Db, appId: string): Promise<boolean> {
+async function confirmApp(db: Db, appId: string, signal?: AbortSignal): Promise<boolean> {
   const data = await partnerQuery<{ app: { id: string; name: string; apiKey: string } | null }>(
     APP_QUERY,
     { appId: `gid://partners/App/${appId}` },
+    { signal },
   );
   if (!data.app) return false;
   upsertApp(db, data.app);
@@ -180,30 +200,70 @@ export interface SyncResult {
 }
 
 export async function runSync(options: SyncOptions = {}): Promise<SyncResult> {
+  // The heartbeat cadence is readable from the environment for the same reason
+  // the timeouts are: so it can be turned down to watch a run without waiting
+  // out half-minute silences, and up on an install that finds it chatty.
+  const beat = Number(process.env.SYNC_HEARTBEAT_MS);
+  const reporter = new SyncReporter(
+    { onProgress: options.onProgress, onPhase: options.onPhase },
+    Number.isFinite(beat) && beat > 0 ? beat : HEARTBEAT_INTERVAL_MS,
+  );
+  try {
+    return await runSyncReported(options, reporter);
+  } finally {
+    reporter.close();
+  }
+}
+
+async function runSyncReported(options: SyncOptions, reporter: SyncReporter): Promise<SyncResult> {
   const db = getDb();
   const { scope } = getConfig();
-  const onProgress = options.onProgress ?? noop;
+
+  /*
+   * Every step below is handed the reporter's own callback rather than the
+   * caller's, so a detail line updates the heartbeat's "how far has it got"
+   * before it reaches whoever asked for it. The caller still sees each line
+   * unchanged; it just no longer goes straight past the thing narrating the run.
+   */
+  const steps: SyncOptions = { full: options.full, onProgress: reporter.progressCallback() };
+  const onProgress = steps.onProgress ?? noop;
 
   let transactions = 0;
 
   if (scope.appIds.length > 0) {
     onProgress(`Scope: ${scope.appIds.length} app(s) from PARTNER_APP_IDS.`);
-    for (const appId of scope.appIds) {
-      const exists = await confirmApp(db, appId);
-      if (!exists) {
-        throw new Error(
-          `App id ${appId} from PARTNER_APP_IDS was not found in this organization.`,
-        );
-      }
-    }
+    await reporter.phase(
+      'scope',
+      null,
+      async () => {
+        for (const appId of scope.appIds) {
+          if (!(await confirmApp(db, appId))) {
+            throw new Error(
+              `App id ${appId} from PARTNER_APP_IDS was not found in this organization.`,
+            );
+          }
+        }
+        return scope.appIds;
+      },
+      (found) => ({ apps: found.length }),
+    );
     for (const appId of scope.appIds) {
       onProgress(`Syncing transactions for app ${appId}...`);
-      transactions += await syncTransactionsFor(db, appId, options);
+      transactions += await reporter.phase(
+        'transactions',
+        null,
+        () => syncTransactionsFor(db, appId, steps),
+        (rows) => ({ rows }),
+      );
     }
   } else {
     onProgress('Scope: every app with recorded transactions (PARTNER_APP_IDS is empty).');
-    onProgress('Syncing transactions...');
-    transactions += await syncTransactionsFor(db, null, options);
+    transactions += await reporter.phase(
+      'transactions',
+      null,
+      () => syncTransactionsFor(db, null, steps),
+      (rows) => ({ rows }),
+    );
   }
 
   const appIds = resolveScopedAppIds(db);
@@ -214,24 +274,48 @@ export async function runSync(options: SyncOptions = {}): Promise<SyncResult> {
   let events = 0;
   for (const appId of appIds) {
     onProgress(`Syncing events for app ${appId}...`);
-    events += await syncEventsFor(db, appId, options);
+    events += await reporter.phase(
+      'events',
+      null,
+      () => syncEventsFor(db, appId, steps),
+      (rows) => ({ rows }),
+    );
   }
 
   // Before the rebuild, so a review that arrives this run is matched to a
   // customer and compiled onto their timeline in the same pass rather than
   // waiting out a sync.
-  const reviews = await syncReviews(db, { full: options.full, onProgress });
+  const reviews = await reporter.phase(
+    'reviews',
+    null,
+    () => syncReviews(db, steps),
+    (result) => ({ added: result.added, updated: result.updated, removed: result.removed }),
+  );
 
   // The pre-install half of the funnel. Independent of everything above — it is
   // Google's data, not Shopify's — and quiet when BigQuery is not connected,
   // which is every install that has not filled in the settings page.
-  const listing = await syncListingEvents(db, appIds, { full: options.full, onProgress });
+  const listing = await reporter.phase(
+    'listing',
+    null,
+    () => syncListingEvents(db, appIds, steps),
+    (result) => ({ rows: result.rows, apps: result.apps.length, skipped: result.skipped.length }),
+  );
   if (listing.rows > 0) {
     onProgress(`Listing traffic: ${listing.rows} event(s) across ${listing.apps.length} app(s).`);
   }
 
   onProgress('Rebuilding derived subscription and install indexes...');
-  const derived = rebuildDerivedTables(db);
+  const derived = await reporter.phase(
+    'derive',
+    null,
+    async () => rebuildDerivedTables(db),
+    (result) => ({
+      subscriptions: result.subscriptions,
+      installs: result.installs,
+      customerEvents: result.customerEvents,
+    }),
+  );
 
   return { apps: appIds, transactions, events, reviews, listing, ...derived };
 }

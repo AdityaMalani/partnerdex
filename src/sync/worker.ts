@@ -1,6 +1,7 @@
 import { closeDb } from '../db/index.js';
-import { reportAndExit } from './fork.js';
+import { reportAndExit, reportUpdate } from './fork.js';
 import { runSync } from './index.js';
+import { formatPhaseEvent, type PhaseEvent } from './progress.js';
 
 /**
  * The sync, running off the request thread.
@@ -23,7 +24,52 @@ import { runSync } from './index.js';
  * stays invisible until it commits rather than exposing half-rebuilt tables.
  */
 
-runSync().then(
+/*
+ * What the operator sees, and why it is only this.
+ *
+ * The sync's detail callback fires once per page of results, which on a real
+ * store is thousands of lines per pass — fine for a CLI someone is watching,
+ * ruinous for a process that has been running every few minutes for months. So
+ * the detail lines are not printed here at all. What is printed is the phase
+ * boundaries, a heartbeat carrying the newest detail line while a phase is in
+ * flight, and any failure with the phase and organization on it. That is a few
+ * dozen lines for a healthy pass and, crucially, a line every half minute for
+ * one that is stuck — which is the case this process used to report by saying
+ * nothing whatsoever for fifty minutes.
+ *
+ * The same events go to the parent, which is where `/api/status` reads the
+ * current phase from.
+ */
+function onPhase(event: PhaseEvent): void {
+  const line = `[partnerdex:sync] ${formatPhaseEvent(event)}`;
+  if (event.state === 'error') console.error(line);
+  else console.log(line);
+  reportUpdate(event);
+}
+
+/*
+ * A rejection nothing awaited must still end the run.
+ *
+ * Node's default is to print and exit non-zero, which the parent does see — as
+ * "worker exited before reporting a result", with no cause attached. Catching it
+ * here turns the same event into a failure that names what actually happened,
+ * and guarantees the parent is told rather than left inferring it from an exit
+ * code.
+ */
+for (const signal of ['unhandledRejection', 'uncaughtException'] as const) {
+  process.on(signal, (cause: unknown) => {
+    const error = cause instanceof Error ? cause : new Error(String(cause));
+    console.error(`[partnerdex:sync] ${signal}: ${error.message}`);
+    try {
+      closeDb();
+    } catch {
+      // Already closed, or never opened. Reporting matters more.
+    }
+    reportAndExit({ ok: false, message: `${signal}: ${error.message}`, stack: error.stack });
+  });
+}
+
+runSync({ onPhase }).then(
   (result) => {
     closeDb();
     reportAndExit({ ok: true, result });

@@ -56,6 +56,18 @@ export interface SyncStatus {
   lastError: string | null;
   consecutiveFailures: number;
   nextRunAt: string | null;
+  /** The phase in flight, and since when. Null between runs. */
+  phase: string | null;
+  phaseOrg: string | null;
+  phaseStartedAt: string | null;
+  /** The newest detail line the run has produced. */
+  lastMessage: string | null;
+  lastMessageAt: string | null;
+  /** Where the last failure happened, which `lastError` alone never said. */
+  lastErrorPhase: string | null;
+  lastErrorOrg: string | null;
+  lastErrorAt: string | null;
+  lastDurationMs: number | null;
 }
 
 export interface Status {
