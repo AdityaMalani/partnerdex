@@ -2,6 +2,7 @@ import { getConfig, normalizeAppId } from '../config.js';
 import { getDb, type Db } from '../db/index.js';
 import { resolveScopedAppIds } from '../sync/index.js';
 import { cacheKey, readCache, writeCache } from './cache.js';
+import { appIdFilter, rollupReady } from './rollup.js';
 import type { AsOfOptions } from './asof.js';
 import { resolveWindow, type Window } from './time.js';
 
@@ -79,32 +80,40 @@ export function currencyProfileKey(appIds: string[]): string {
  * normally single-currency; if an org mixes them the reports would be summing
  * unlike units, so the mix is surfaced in `meta` rather than silently converted.
  *
- * This is the uncached form, and it is the most expensive statement on the
- * request path: `currency <> ''` matches nearly every row, so the answer costs a
- * pass over the whole transactions table however few currencies come back —
- * 1.8 s at 4.1M transactions, measured. `buildContext` calls it for *every*
- * metric, before the metric cache is even consulted and again for the
- * comparison window, which is what made a fully cached 23-metric dashboard load
- * take 42 s. Callers want `currencyProfile` below; this exists for the warm
- * pass, which computes every scope's answer in one go.
+ * This is the uncached form, and it used to be the most expensive statement on
+ * the request path: `currency <> ''` matches nearly every row, so the answer
+ * cost a pass over the whole transactions table however few currencies came
+ * back. `buildContext` calls it for *every* metric, before the metric cache is
+ * even consulted and again for the comparison window, which is what put a floor
+ * of several seconds under every metric on the dashboard including the ones that
+ * only read small tables.
+ *
+ * It is now counted off `transaction_daily`, which carries `txn_count` per
+ * currency for exactly this: thousands of rows instead of millions, and the same
+ * counts, because the rollup groups every transaction and drops none. The raw
+ * scan remains as the answer for a database whose rollup has not been built yet
+ * — correct and slow beats fast and blank, and it is the same cost this always
+ * had.
  */
 export function computeCurrencyProfile(db: Db, appIds: string[]): CurrencyProfile {
-  const params: Record<string, unknown> = {};
-  const names = appIds.map((id, index) => {
-    params[`c${index}`] = id;
-    return `@c${index}`;
-  });
-  const filter = names.length > 0 ? `AND app_id IN (${names.join(', ')})` : '';
+  const useRollup = rollupReady(db);
+  const apps = appIdFilter(appIds, 'app_id', 'c');
 
   const rows = db
     .prepare(
-      `SELECT currency, COUNT(*) AS n
-       FROM transactions
-       WHERE currency <> '' ${filter}
-       GROUP BY currency
-       ORDER BY n DESC`,
+      useRollup
+        ? `SELECT currency, SUM(txn_count) AS n
+             FROM transaction_daily
+            WHERE currency <> '' ${apps.sql ? `AND ${apps.sql}` : ''}
+            GROUP BY currency
+            ORDER BY n DESC`
+        : `SELECT currency, COUNT(*) AS n
+             FROM transactions
+            WHERE currency <> '' ${apps.sql ? `AND ${apps.sql}` : ''}
+            GROUP BY currency
+            ORDER BY n DESC`,
     )
-    .all(params) as Array<{ currency: string; n: number }>;
+    .all(apps.params) as Array<{ currency: string; n: number }>;
 
   if (rows.length === 0) return { currency: null, mixed: false };
   return { currency: rows[0]!.currency, mixed: rows.length > 1 };
@@ -151,10 +160,15 @@ export function currencyProfile(db: Db, appIds: string[]): CurrencyProfile {
 export function warmCurrencyProfiles(db: Db, appIds: string[]): number {
   const rows = db
     .prepare(
-      `SELECT app_id, currency, COUNT(*) AS n
-         FROM transactions
-        WHERE currency <> ''
-        GROUP BY app_id, currency`,
+      rollupReady(db)
+        ? `SELECT app_id, currency, SUM(txn_count) AS n
+             FROM transaction_daily
+            WHERE currency <> ''
+            GROUP BY app_id, currency`
+        : `SELECT app_id, currency, COUNT(*) AS n
+             FROM transactions
+            WHERE currency <> ''
+            GROUP BY app_id, currency`,
     )
     .all() as Array<{ app_id: string; currency: string; n: number }>;
 

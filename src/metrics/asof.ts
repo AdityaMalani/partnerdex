@@ -1,4 +1,5 @@
 import type { Db } from '../db/index.js';
+import { appIdFilter, rollupReady, splitBuckets, splitCte, toHalfOpen } from './rollup.js';
 import type { Bucket } from './time.js';
 
 /**
@@ -279,29 +280,72 @@ export function onTrialSeries(
   return new Map(rows.map((row) => [row.idx, row.value]));
 }
 
+const USAGE_TYPE = 'AppUsageSale';
+
 /**
  * Metered usage revenue attributed to each bucket as a trailing-30-day rate, so
  * it is comparable with a monthly subscription figure. Usage is billed in
  * arrears and lumpy; reading it at a single instant would be meaningless.
+ *
+ * Twelve trailing-30-day windows over the raw ledger is twelve overlapping
+ * range scans of the largest table in the database, which is why MRR was the
+ * second most expensive metric on the dashboard despite the subscription half of
+ * it being a cheap read of a small table. The windows are served out of the
+ * daily rollup instead, with only their sub-day ends coming from the raw rows —
+ * twenty-nine or thirty of each window's thirty days are whole.
+ *
+ * The window is `(trailing_30, as_of]` rather than `[from, to)` like every other
+ * window here, and that asymmetry is preserved exactly: `toHalfOpen` shifts both
+ * ends by a millisecond, which selects the identical set of rows over
+ * millisecond-precision timestamps. See its comment.
  */
-export function usageSeries(db: Db, buckets: Bucket[], appIds: string[]): Map<number, number> {
-  const cte = bucketsCte(buckets);
-  const apps = appFilter(appIds, 't.app_id', 'uapp');
+export function usageSeries(
+  db: Db,
+  buckets: Bucket[],
+  appIds: string[],
+  timeZone: string,
+): Map<number, number> {
+  const ready = rollupReady(db);
+  const split = splitBuckets(
+    buckets.map((bucket, idx) => ({
+      idx,
+      ...toHalfOpen(new Date(bucket.end.getTime() - 30 * MS_PER_DAY), bucket.end),
+    })),
+    timeZone,
+    ready,
+  );
+  const cte = splitCte(split);
+  const rollupApps = appIdFilter(appIds, 'r.app_id', 'urapp');
+  const rawApps = appIdFilter(appIds, 't.app_id', 'uapp');
 
   const rows = db
     .prepare(
       `WITH ${cte.sql}
-       SELECT b.idx AS idx, COALESCE(SUM(t.gross_amount), 0) AS value
-       FROM buckets b
-       LEFT JOIN transactions t
-         ON t.type = 'AppUsageSale'
-        AND t.created_at <= b.as_of
-        AND t.created_at > b.trailing_30
-        ${apps.sql ? `AND ${apps.sql}` : ''}
-       GROUP BY b.idx
-       ORDER BY b.idx`,
+       SELECT idx, COALESCE(SUM(value), 0) AS value
+       FROM (
+         SELECT b.idx AS idx, r.gross_amount AS value
+         FROM rdays b
+         JOIN transaction_daily r
+           ON r.day >= b.day_from AND r.day < b.day_to
+          AND r.type = @usageType
+          ${rollupApps.sql ? `AND ${rollupApps.sql}` : ''}
+         UNION ALL
+         SELECT e.idx AS idx, t.gross_amount AS value
+         FROM redges e
+         JOIN transactions t
+           ON t.created_at >= e.lo AND t.created_at < e.hi
+          AND t.type = @usageType
+          ${rawApps.sql ? `AND ${rawApps.sql}` : ''}
+       )
+       GROUP BY idx
+       ORDER BY idx`,
     )
-    .all({ ...cte.params, ...apps.params }) as Array<{ idx: number; value: number }>;
+    .all({
+      ...cte.params,
+      ...rollupApps.params,
+      ...rawApps.params,
+      usageType: USAGE_TYPE,
+    }) as Array<{ idx: number; value: number }>;
 
   return new Map(rows.map((row) => [row.idx, row.value]));
 }

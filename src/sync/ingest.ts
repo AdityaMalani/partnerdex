@@ -1,5 +1,6 @@
 import type { Db } from '../db/index.js';
 import { toUtcIso } from '../metrics/time.js';
+import { markTransactionDays } from './rollup.js';
 
 /** `gid://partners/App/1234` -> `1234`. Bare ids pass through unchanged. */
 export function gidTail(gid: string | null | undefined): string {
@@ -104,6 +105,21 @@ export function insertTransactions(db: Db, nodes: TransactionNode[]): number {
 
   const run = db.transaction((batch: TransactionNode[]) => {
     let written = 0;
+    /*
+     * Days whose money changed, for the rollup to recompute.
+     *
+     * Collected per batch and written once rather than per row: a page of the
+     * transaction feed covers a handful of days, so this is a few INSERTs
+     * however many rows the page carries. UTC dates, because that is a `slice`
+     * on a string already in hand — see `transaction_daily_dirty` in the schema.
+     *
+     * Marked on every write, not only on the ones that changed a figure. An
+     * upsert here restates an existing row's amounts, and telling a restatement
+     * that moved money from one that did not would mean reading the old row
+     * back; recomputing a day that turned out to be unchanged costs
+     * milliseconds, and missing one that did change is wrong forever.
+     */
+    const touchedDays = new Set<string>();
     for (const node of batch) {
       if (!node.app) continue; // non-app transactions (tax, referral) are out of scope
       const appId = upsertApp(db, node.app);
@@ -111,6 +127,8 @@ export function insertTransactions(db: Db, nodes: TransactionNode[]): number {
       const gross = money(node.grossAmount);
       const net = money(node.netAmount);
       const fee = money(node.shopifyFee);
+      const createdAt = toUtcIso(node.createdAt);
+      touchedDays.add(createdAt.slice(0, 10));
 
       statement.run({
         id: node.id,
@@ -119,7 +137,7 @@ export function insertTransactions(db: Db, nodes: TransactionNode[]): number {
         shopId,
         chargeId: node.chargeId ?? '',
         chargeRef: gidTail(node.chargeId),
-        createdAt: toUtcIso(node.createdAt),
+        createdAt,
         billingInterval: node.billingInterval ?? null,
         grossAmount: gross.amount,
         netAmount: net.amount,
@@ -128,6 +146,7 @@ export function insertTransactions(db: Db, nodes: TransactionNode[]): number {
       });
       written += 1;
     }
+    markTransactionDays(db, touchedDays);
     return written;
   });
 

@@ -99,6 +99,62 @@ CREATE INDEX IF NOT EXISTS idx_tx_shop_time ON transactions (app_id, shop_id, cr
 CREATE INDEX IF NOT EXISTS idx_tx_shop_money
   ON transactions (app_id, shop_id, gross_amount, net_amount, currency);
 
+-- Daily money rollup, derived from \`transactions\` and rebuilt by the sync.
+--
+-- Every transaction-based metric used to re-read the raw feed once per bucket:
+-- gross earnings sums the whole ledger per bucket, the usage component of MRR
+-- LEFT JOINs it on a trailing-30-day range per bucket, and the currency profile
+-- scanned it outright. At millions of transactions that is a dozen passes over
+-- the largest table in the database for a series a dozen points long. One row
+-- per (day, type, app, currency) is four orders of magnitude smaller and answers
+-- all three.
+--
+-- \`day\` is a calendar date in REPORTING_TIMEZONE, not UTC, because the buckets
+-- these sums are read into are resolved in that zone. A UTC-keyed rollup summed
+-- into local-time buckets would be wrong by up to a day's revenue at every seam.
+-- The consequence is that the rollup belongs to one timezone setting:
+-- \`syncTransactionDaily\` records which one it was built under and rebuilds from
+-- scratch when that changes.
+--
+-- Money is stored the way the source stores it — one REAL per column — rather
+-- than as integer cents, so that a sum of days is the same arithmetic on the
+-- same values as a sum of rows and cannot introduce a unit conversion of its own.
+--
+-- Derived and disposable: \`DELETE FROM transaction_daily\` costs a rebuild and
+-- nothing else. It is never the only copy of anything.
+CREATE TABLE IF NOT EXISTS transaction_daily (
+  day          TEXT NOT NULL,
+  type         TEXT NOT NULL,
+  app_id       TEXT NOT NULL,
+  currency     TEXT NOT NULL DEFAULT '',
+  gross_amount REAL NOT NULL DEFAULT 0,
+  net_amount   REAL NOT NULL DEFAULT 0,
+  shopify_fee  REAL NOT NULL DEFAULT 0,
+  txn_count    INTEGER NOT NULL DEFAULT 0,
+  -- \`day\` leads because every read is a date range; \`type\` next because both
+  -- money reports filter on it. No secondary index: the whole table is small
+  -- enough that the currency profile can scan it.
+  PRIMARY KEY (day, type, app_id, currency)
+) WITHOUT ROWID;
+
+-- Which days the rollup owes a recomputation, in UTC dates.
+--
+-- Written by the ingest as transactions land, drained by the sync's rollup step.
+-- UTC rather than reporting-local on purpose: marking a day costs a \`substr\` on
+-- a string the ingest already holds, where the local date would cost an Intl
+-- lookup per row on a backfill of millions. A UTC date spans at most two local
+-- ones, so the drain widens each mark by a day on either side — recomputing a
+-- day that did not change is free, missing one that did is a silent permanent
+-- error in reported revenue.
+--
+-- This is what makes restatement safe. The Partner API re-serves and corrects
+-- rows that have already been ingested; an upsert that changes an amount marks
+-- its day here exactly as a first insert does, so the correction reaches the
+-- rollup on the next sync instead of being averaged away forever.
+CREATE TABLE IF NOT EXISTS transaction_daily_dirty (
+  day TEXT PRIMARY KEY
+) WITHOUT ROWID;
+
 -- One row per subscription charge, rebuilt from app_events + transactions.
 -- monthly_amount is the write-time normalized figure that MRR sums.
 CREATE TABLE IF NOT EXISTS subscriptions (

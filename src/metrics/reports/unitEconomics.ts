@@ -25,7 +25,7 @@ function gatherInputs(context: MetricContext): Inputs {
   const stock = stockSeries(context.db, buckets, context.asOf);
   const byIndex = new Map(stock.map((point) => [point.idx, point]));
   const usage = context.includeUsage
-    ? usageSeries(context.db, buckets, context.appIds)
+    ? usageSeries(context.db, buckets, context.appIds, context.window.timeZone)
     : new Map<number, number>();
 
   const mrr: number[] = [];

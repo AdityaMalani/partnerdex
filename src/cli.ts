@@ -144,7 +144,8 @@ async function main(): Promise<void> {
         `Rebuilt in ${Math.round((Date.now() - started) / 1000)}s: ` +
           `${result.subscriptions} subscription(s), ${result.installs} install interval(s), ` +
           `${result.customerEvents} customer event(s), ` +
-          `${result.reviewEvents} review event(s).`,
+          `${result.reviewEvents} review event(s), ` +
+          `${result.transactionDays} day(s) of transaction rollup.`,
       );
       break;
     }
