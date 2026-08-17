@@ -539,7 +539,13 @@ h3,
   min-width: 0;
 }
 
-.control label {
+/*
+ * The child combinator is load-bearing. A `.control` that holds a group of
+ * checkboxes holds labels of its own, and unscoped this rule sets those in
+ * 11px muted uppercase — the field-label treatment — so a checkbox's *name*
+ * reads as a second field label and the box floats above it.
+ */
+.control > label {
   font-size: 11px;
   font-weight: 600;
   letter-spacing: 0.04em;
@@ -1195,11 +1201,6 @@ thead th {
 
 /* --------------------------------------------------------- notifications */
 
-.channel-form .card-subtitle {
-  margin-bottom: 14px;
-  max-width: 62ch;
-}
-
 /*
  * Name, URL, and the button on one line, with the URL taking the slack. Slack
  * webhook URLs run to about 80 characters, and a field that shows half of one
@@ -1209,7 +1210,7 @@ thead th {
   display: flex;
   flex-wrap: wrap;
   align-items: flex-end;
-  gap: 12px;
+  gap: var(--space-3);
 }
 
 .control-grow {
@@ -1267,12 +1268,107 @@ button.primary:disabled,
   color: var(--delta-down);
 }
 
+/* ----------------------------------------------------------------- forms
+ *
+ * One rhythm for every form in the dashboard.
+ *
+ * A form is a card with rows dropped into it and no spacing of its own:
+ * `.field-row` carries no vertical margin — correct everywhere it appears
+ * once, inside something that already spaces it, and wrong the moment a form
+ * stacks six — so what air there is comes from whichever child happens to have
+ * a margin, and the same gap is written as 10, 12, 14 and 18 depending on the
+ * file. `.form-stack` exists because of exactly this, and it only covers the
+ * one form that hit it first.
+ *
+ * The form is a column with one gap between its parts, and the parts reset
+ * their own margins so the column owns the rhythm outright.
+ */
+.channel-form {
+  gap: var(--space-5);
+  padding: var(--space-5) var(--card-px);
+}
+
+.channel-form > * {
+  margin-top: 0;
+  margin-bottom: 0;
+}
+
+/* The subtitle belongs to the heading above it, not to the gap below it. */
+.channel-form > .card-label + .card-subtitle,
+.channel-form > .card-head + .card-subtitle {
+  margin-top: calc(var(--space-2) - var(--space-5));
+  max-width: 72ch;
+}
+
+/*
+ * Where a form ends. Separated by a rule and the section gap rather than
+ * sitting flush under the last field, so "submit" is visibly not one more
+ * thing to fill in.
+ */
+.channel-form > .channel-actions {
+  flex-wrap: wrap;
+  padding-top: var(--space-5);
+  border-top: 1px solid var(--rule);
+}
+
+/*
+ * A checkbox and its name.
+ *
+ * The box lines up with the FIRST LINE of the label, at any font size and
+ * whether the label runs to one line or three. `1lh` is one line of the
+ * label's own text — the input takes `font: inherit` so it resolves against
+ * the label rather than against the browser's form font — so the box centres
+ * itself in that line by arithmetic instead of by a hand-tuned nudge.
+ */
+.check {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+.check > input[type='checkbox'] {
+  flex: 0 0 auto;
+  width: 15px;
+  height: 15px;
+  /* `.control input` sets a 150px floor, written for text fields, and a
+     checkbox inside a `.control` inherits it: the box stays 15px and reserves
+     150, which is a gulf between the box and its name. A box states its own
+     size. */
+  min-width: 0;
+  margin: 0;
+  margin-block: calc((1lh - 15px) / 2);
+  font: inherit;
+  accent-color: var(--brand);
+  cursor: pointer;
+}
+
+.check > input[type='checkbox']:disabled {
+  cursor: default;
+}
+
+.check:has(input:disabled) {
+  color: var(--muted);
+  cursor: default;
+}
+
+/* Several of them. Wide enough apart that a box reads as belonging to the name
+   on its right rather than to the one on its left. */
+.check-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-5);
+}
+
 /* Used as a plain container by Notifications and as a real <ul> by App
    listings, so the list reset lives here rather than at either call site. */
 .channel-list {
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: var(--space-4);
   list-style: none;
   margin: 0;
   padding: 0;
@@ -1291,7 +1387,10 @@ button.primary:disabled,
   border: 1px solid var(--border);
   border-radius: 8px;
   box-shadow: var(--shadow-md);
-  padding: 18px 20px;
+  /* The same edge every card in the system keeps: a panel listed under a card
+     used to run 20px while the card above it ran 16, so two labels one level
+     apart never lined up. */
+  padding: var(--space-4) var(--card-px);
 }
 
 .channel-head {
@@ -1550,26 +1649,15 @@ button.primary:disabled,
   min-width: 0;
 }
 
+/* A `.check` with a place on the login card. The layout is the shared one. */
 .login-remember {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-top: 16px;
-  font-size: 13px;
-  color: var(--text-primary);
-  cursor: pointer;
+  margin-top: var(--space-4);
 }
 
-.login-remember input {
-  width: 15px;
-  height: 15px;
-  margin: 0;
-  accent-color: var(--brand);
-  cursor: pointer;
-}
-
+/* Indented to the label's own left edge — the box's width plus the gap — so
+   the note reads as belonging to the choice above it. */
 .login-note {
-  margin: 4px 0 0 23px;
+  margin: var(--space-1) 0 0 calc(15px + var(--space-2));
   color: var(--muted);
   font-size: 12px;
 }
@@ -2711,16 +2799,14 @@ button.primary:disabled,
 /*
  * A column of form rows with even spacing.
  *
- * `.field-row` carries no vertical margin because everywhere else it appears
- * exactly once, inside a list item that already spaces it. The BigQuery
- * connection form is the first place several of them stack, so the spacing
- * lives here rather than being added to `.field-row` and re-spacing every
- * existing form.
+ * The form's own column gap is the section gap; this is the tighter gap
+ * between fields *within* a section, which is why it survives now that
+ * `.channel-form` owns the rhythm.
  */
 .form-stack {
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: var(--space-4);
 }
 
 /* The stack owns the rhythm; the children's own margins would double it. */

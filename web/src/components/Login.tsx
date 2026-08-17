@@ -54,7 +54,7 @@ export function Login({ onAuthenticated }: { onAuthenticated: () => void }) {
           />
         </div>
 
-        <label className="login-remember">
+        <label className="check login-remember">
           <input
             type="checkbox"
             checked={remember}
