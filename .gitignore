@@ -7,6 +7,16 @@ data/
 .env
 .env.local
 fly.toml
+
+# Service-account keys and anything else local and credential-shaped.
+.secrets/
 .DS_Store
 *.log
 .claude/
+
+# Output of scripts/ga4-backfill.ts — a run artefact carrying shop domains and
+# ids, regenerable in a few minutes and not something to version.
+ga4-backfill.json
+
+# Local copy of the dashboard password
+.dashboard-password.txt
