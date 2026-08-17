@@ -114,40 +114,6 @@ function greeting(): { title: string; blurb: string } {
   };
 }
 
-function ThemeToggle({ theme, onToggle }: { theme: 'dark' | 'light'; onToggle: () => void }) {
-  const label = theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme';
-
-  return (
-    <button
-      type="button"
-      className="theme-toggle"
-      onClick={onToggle}
-      aria-label={label}
-      title={label}
-    >
-      {/* The icon shows the theme you would move to, not the one you are in. */}
-      <svg viewBox="0 0 22 22" aria-hidden="true" focusable="false">
-        {theme === 'dark' ? (
-          <>
-            <circle cx="11" cy="11" r="4" fill="none" strokeWidth="1.7" />
-            <path
-              d="M11 2v2M11 18v2M2 11h2M18 11h2M4.6 4.6l1.4 1.4M16 16l1.4 1.4M17.4 4.6L16 6M6 16l-1.4 1.4"
-              fill="none"
-              strokeWidth="1.7"
-            />
-          </>
-        ) : (
-          <path
-            d="M18 13.4A7.5 7.5 0 0 1 8.6 4a7.5 7.5 0 1 0 9.4 9.4z"
-            fill="none"
-            strokeWidth="1.7"
-          />
-        )}
-      </svg>
-    </button>
-  );
-}
-
 /**
  * Hash routing rather than a router: the page id lives in the URL so a report
  * can be linked and survives a reload, and the server's catch-all never has to
@@ -434,15 +400,21 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
 
   return (
     <div className={collapsed ? 'shell collapsed' : 'shell'}>
-      <Nav current={page.id} collapsed={collapsed} onToggle={toggleNav} onLogout={onLogout} />
+      <Nav
+        current={page.id}
+        collapsed={collapsed}
+        onToggle={toggleNav}
+        theme={theme}
+        onToggleTheme={toggleTheme}
+        onLogout={onLogout}
+      />
 
       <main className="main">
         <header className="masthead">
-          <div>
+          <div className="masthead-title">
             <h1>{heading.title}</h1>
             <p className="subtitle">{heading.blurb}</p>
           </div>
-          <ThemeToggle theme={theme} onToggle={toggleTheme} />
         </header>
 
         {/* Which filters a page shows is declared on the page, because they are
