@@ -55,11 +55,12 @@ export const ATTRIBUTION_LOOKBACK_DAYS = DEFAULT_LOOKBACK_DAYS;
 /**
  * How far back a first attribution run reaches when nothing is watermarked.
  *
- * A year. The scan is cheap — dry-run on the Stoq export puts the *entire*
- * multi-year history at 0.92 GB, inside BigQuery's monthly free tier — so this
- * is not a cost ceiling. It is a correctness one: referrals older than this came
- * out of the Mantle import as `source='imported'` facts, and re-deriving them
- * from GA4 would only produce claims that lose to those facts anyway (see
+ * A year. The scan is cheap — a dry run over an *entire* multi-year listing
+ * history measured under a gigabyte, inside BigQuery's monthly free tier — so
+ * this is not a cost ceiling. It is a correctness one: on a deployment that
+ * migrated an existing programme, referrals older than this arrived as
+ * `source='imported'` facts, and re-deriving them from the export would only
+ * produce claims that lose to those facts anyway (see
  * `persistAttribution`). Someone reconstructing genuinely old history should
  * run `full`, deliberately, rather than have every fresh install do it.
  */
@@ -295,8 +296,9 @@ interface HandleRow {
  * The handles that may claim an install on this app, and who they belong to.
  *
  * Only `enrolled` memberships. A pending applicant has not been let into the
- * program — Stoq requires approval and has applicants waiting — and crediting
- * them would create money owed to someone nobody has agreed to pay. The cost of
+ * program — a program that requires approval always has applicants waiting —
+ * and crediting them would create money owed to someone nobody has agreed to
+ * pay. The cost of
  * that strictness is that their clicks are invisible until approval, which is
  * why approving a membership clears this app's watermark (see
  * `admin.ts`): the next sync re-reads from the join date and picks them up.

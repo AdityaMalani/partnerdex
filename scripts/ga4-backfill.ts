@@ -30,7 +30,7 @@ import { connect, type Connected } from '../src/bigquery/client.js';
 import { BigQueryError, type BigQueryConnection } from '../src/bigquery/connection.js';
 import { runAttribution, type Attribution } from '../src/affiliates/ga4Attribution.js';
 import { readMantleExport } from '../src/affiliates/mantle.js';
-import { PROGRAM_APP_IDS, STOQ_PROGRAM_ID, FILEMONK_PROGRAM_ID } from '../src/affiliates/commissionRules.js';
+import { importedPrograms } from '../src/affiliates/commissionReplay.js';
 import {
   AUTOMATED_LAG_CEILING_DAYS,
   MANUAL_LAG_THRESHOLD_DAYS,
@@ -71,26 +71,75 @@ const outPath = flag('out', path.join(process.cwd(), 'ga4-backfill.json'));
 const reusePath = flag('reuse', '');
 
 /**
- * The two datasets, hard-coded with the app ids they belong to.
+ * Which apps to scan, and where each one's GA4 export lives.
  *
- * Not configurable, deliberately. The affiliate program covers exactly two
- * apps; the dataset ids come from Mantle's own BigQuery dialog and are recorded
- * in `mantle-migration/docs/bigquery-and-ga4.md`; and the app ids are the
- * Partner API's, which is how `transactions` and `shops` key a merchant. A flag
- * here would only be a way to point the analysis at the wrong property.
+ * Read out of the database rather than compiled in. `bigquery_app_sources` is
+ * where the operator already records a dataset per app for the live listing
+ * sync, and the affiliate programs are what say which apps have referrals worth
+ * back-crediting, so the intersection of the two is exactly the right scope and
+ * needs nobody to restate it. This was two named constants and two named
+ * environment variables, which was a way to point the analysis at the wrong
+ * property in a deployment with three apps.
+ *
+ * `--app <appId>:<dataset>[:<name>]`, repeatable, overrides the lot — for a
+ * dataset that is not registered yet, or to scan one app out of five.
  */
-const SOURCES = [
-  {
-    appId: PROGRAM_APP_IDS[STOQ_PROGRAM_ID] ?? '',
-    name: 'Stoq',
-    dataset: process.env.STOQ_GA4_DATASET ?? '',
-  },
-  {
-    appId: PROGRAM_APP_IDS[FILEMONK_PROGRAM_ID] ?? '',
-    name: 'Filemonk',
-    dataset: process.env.FILEMONK_GA4_DATASET ?? '',
-  },
-];
+interface BackfillSource {
+  appId: string;
+  name: string;
+  dataset: string;
+}
+
+function flagAll(name: string): string[] {
+  const values: string[] = [];
+  for (let index = 0; index < process.argv.length; index += 1) {
+    if (process.argv[index] === `--${name}`) {
+      const value = process.argv[index + 1];
+      if (value) values.push(value);
+    }
+  }
+  return values;
+}
+
+function sourcesFromFlags(): BackfillSource[] {
+  return flagAll('app').map((entry) => {
+    const [appId = '', dataset = '', name = ''] = entry.split(':');
+    if (!appId || !dataset) {
+      throw new BigQueryError(`--app "${entry}" must be <appId>:<dataset>[:<name>].`);
+    }
+    return { appId, dataset, name: name || appId };
+  });
+}
+
+function sourcesFromDatabase(): BackfillSource[] {
+  let db: Database.Database;
+  try {
+    db = new Database(databasePath, { readonly: true, fileMustExist: true });
+  } catch (error) {
+    throw new BigQueryError(
+      `Cannot read ${databasePath} to discover the apps to scan: ${(error as Error).message}. ` +
+        `Pass --app <appId>:<dataset> instead.`,
+    );
+  }
+  try {
+    return (
+      db
+        .prepare(
+          `SELECT DISTINCT p.app_id AS appId,
+                  COALESCE(NULLIF(a.name, ''), NULLIF(p.name, ''), p.app_id) AS name,
+                  COALESCE(s.dataset, '') AS dataset
+             FROM affiliate_programs p
+             LEFT JOIN apps a ON a.id = p.app_id
+             LEFT JOIN bigquery_app_sources s ON s.app_id = p.app_id
+            WHERE p.app_id <> ''
+            ORDER BY name`,
+        )
+        .all() as BackfillSource[]
+    ).filter((row) => row.dataset !== '');
+  } finally {
+    db.close();
+  }
+}
 
 /** The first day GA4 exported. Earlier than this there is nothing to read. */
 const EXPORT_STARTS = '2024-04-21';
@@ -144,10 +193,15 @@ async function openConnection(): Promise<Connected> {
   return connect(connection);
 }
 
-async function backfill(from: Date, to: Date, handles: string[]): Promise<Attribution[][]> {
+async function backfill(
+  from: Date,
+  to: Date,
+  handles: string[],
+  sources: BackfillSource[],
+): Promise<Attribution[][]> {
   const connected = await openConnection();
   const chunks: Attribution[][] = [];
-  for (const source of SOURCES) {
+  for (const source of sources) {
     for (const window of monthChunks(from, to)) {
       const found = await runAttribution(
         connected,
@@ -174,11 +228,11 @@ async function backfill(from: Date, to: Date, handles: string[]): Promise<Attrib
  * missed it" count by exactly the referrals it did not miss.
  *
  * The handle comes from the membership, keyed on affiliate *and* program: two
- * affiliates hold memberships in both Stoq and Filemonk, and while the handles
+ * affiliates hold memberships in more than one program, and while the handles
  * happen to be equal today, keying on the affiliate alone would be a bug
  * waiting for the first affiliate who joins the second program later.
  */
-function loadMantleReferrals(): ClassifiedReferral[] {
+function loadMantleReferrals(appIdByProgram: Map<string, string>): ClassifiedReferral[] {
   const { attributions, affiliates } = readMantleExport(exportsDir);
   const reconciliation = JSON.parse(
     fs.readFileSync(path.join(exportsDir, 'normalized/reconciliation.json'), 'utf8'),
@@ -201,7 +255,7 @@ function loadMantleReferrals(): ClassifiedReferral[] {
       affiliateId: row.affiliateId,
       affiliateName: nameById.get(row.affiliateId) ?? null,
       programId: row.affiliateProgramId,
-      appId: PROGRAM_APP_IDS[row.affiliateProgramId] ?? '',
+      appId: appIdByProgram.get(row.affiliateProgramId) ?? '',
       handle: handleByMembership.get(`${row.affiliateId} ${row.affiliateProgramId}`) ?? '',
       shopId: row.appInstallation?.platformId ? String(row.appInstallation.platformId) : null,
       shopDomain: row.appInstallation?.myshopifyDomain ?? null,
@@ -291,7 +345,8 @@ async function main(): Promise<void> {
   let from = parseDate(flag('from', EXPORT_STARTS), '--from');
   let to = parseDate(flag('to', new Date().toISOString().slice(0, 10)), '--to');
 
-  const mantle = loadMantleReferrals();
+  const { appIdByProgram } = importedPrograms(databasePath);
+  const mantle = loadMantleReferrals(appIdByProgram);
   // The real handle list, not the shape test. Without it an eight-character
   // `utm_source` — a campaign name, a partner site — passes for an affiliate
   // and can take first touch away from the affiliate who earned it.
@@ -317,11 +372,20 @@ async function main(): Promise<void> {
     if (cached.report?.window?.from) from = new Date(cached.report.window.from);
     if (cached.report?.window?.to) to = new Date(cached.report.window.to);
   } else {
+    const flagged = sourcesFromFlags();
+    const sources = flagged.length > 0 ? flagged : sourcesFromDatabase();
+    if (sources.length === 0) {
+      throw new BigQueryError(
+        'No apps to scan. Every affiliate program either has no app id or no GA4 dataset ' +
+          'registered in bigquery_app_sources. Pass --app <appId>:<dataset> to name one.',
+      );
+    }
     process.stderr.write(
       `Backfilling ${from.toISOString().slice(0, 10)} .. ${to.toISOString().slice(0, 10)} ` +
-        `over ${allHandles.length} known handles\n`,
+        `over ${allHandles.length} known handles, ` +
+        `${sources.map((source) => source.name).join(', ')}\n`,
     );
-    chunks = await backfill(from, to, allHandles);
+    chunks = await backfill(from, to, allHandles, sources);
   }
 
   const merged = mergeAttributionChunks(chunks);

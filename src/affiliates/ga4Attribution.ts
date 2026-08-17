@@ -65,13 +65,13 @@ export const REFERRAL_WINDOW_DAYS = 30;
  * shape test they do not merely add noise, they *win*: first touch takes the
  * earliest qualifying click, and a junk click that lands before the real
  * affiliate click would take the attribution away from the affiliate who
- * earned it. Measured on the Stoq export for June–August 2026, filtering only
- * after the first-touch pick attributed noticeably fewer installs than filtering
- * before it did.
+ * earned it. Measured on a real listing export, filtering only after the
+ * first-touch pick attributed noticeably fewer installs than filtering before
+ * it did.
  *
  * The shape test is a fallback, not the right answer. It cannot tell an
- * affiliate handle from an eight-character campaign name — `utm_source=filemonk`
- * passes it — which is what `handles` on the options below is for: once the
+ * affiliate handle from an eight-character campaign name — a campaign called
+ * `showcase` passes it — which is what `handles` on the options below is for: once the
  * affiliate table exists, pass the real handles and this regex stops being
  * load-bearing.
  */
@@ -375,9 +375,9 @@ export function attributionQuery(
     /*
      * Every event carrying the parameter counts as the click, not just
      * \`page_view\`. GA4 stamps \`page_location\` onto whatever else fires in the
-     * same view — \`user_engagement\`, \`view_item\`, \`add_to_cart\` — and on the
-     * Stoq export there are merchants whose only surviving referral URL is on
-     * one of those. Restricting to \`page_view\` was measured to lose real
+     * same view — \`user_engagement\`, \`view_item\`, \`add_to_cart\` — and on a real
+     * export there are merchants whose only surviving referral URL is on one of
+     * those. Restricting to \`page_view\` was measured to lose real
      * attributions for no gain in precision: the parameter is the same
      * parameter whichever event carried it.
      *
@@ -388,9 +388,9 @@ export function attributionQuery(
      * The hostname check is the one filter here that is a trust boundary rather
      * than a narrowing. A GA4 measurement id is a public string in the page
      * source, and any site that copies it emits events into this property —
-     * over 2026-07-01..2026-08-12 the Stoq dataset carries three events from
-     * \`hqproductreviews.com\`, a site that appears to have mirrored the listing
-     * page along with its tag. Those three change nothing today. But this query
+     * over one six-week window a real dataset carried three events from an
+     * unrelated third-party site that appears to have mirrored the listing page
+     * along with its tag. Those three change nothing today. But this query
      * decides who gets paid, and without the check, any site carrying a copied
      * tag can emit a \`page_view\` with an arbitrary \`?mref=\` and assign itself
      * commissions. It costs nothing and closes that.

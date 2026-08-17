@@ -13,6 +13,8 @@ import {
   unassignAttribution,
   type AffiliateSort,
 } from '../affiliates/admin.js';
+import { createProgram, getProgram, updateProgram } from '../affiliates/programAdmin.js';
+import { REVENUE_COMPONENTS } from '../affiliates/commission.js';
 import { getPayout, listPayouts } from '../affiliates/payouts.js';
 // Attribution claims. Kept as its own import block so a merge that lands two
 // features on this file is a mechanical one.
@@ -140,10 +142,81 @@ export function affiliatesAdminRouter(): express.Router {
     }
   });
 
-  /** Programs and their terms, for the pickers the pages need. */
+  /**
+   * Programs and their terms.
+   *
+   * `revenueComponents` names the vocabulary a program's terms may draw on, so
+   * a settings form can offer the list rather than a free-text box that only
+   * fails on save. It is a constant of this build, not of the data.
+   */
   router.get('/programs', (_request, response) => {
     try {
-      response.json({ programs: listPrograms(getDb()) });
+      response.json({ programs: listPrograms(getDb()), revenueComponents: REVENUE_COMPONENTS });
+    } catch (error) {
+      fail(response, error);
+    }
+  });
+
+  /**
+   * Create a program.
+   *
+   * The endpoint that turns this from a migration into a feature. Before it,
+   * every program existed because an importer had written one, and an operator
+   * standing up their own had no supported way to get a row into
+   * `affiliate_programs` — which meant no memberships, no referral links, no
+   * attribution and no commissions. Nothing downstream needed to change: the
+   * engine has always read its rules from that table.
+   *
+   * Body: `{ name, commissionRate, appId?, listingUrl?, revenueComponents?,
+   * durationMonths?, unassignAfterUninstallDays?, requireApproval?, status? }`.
+   * Terms are validated in `programAdmin.ts`; a rejected write says which field
+   * and why.
+   */
+  router.post('/programs', (request, response) => {
+    try {
+      response.status(201).json({ program: createProgram((request.body ?? {}) as never, getDb()) });
+    } catch (error) {
+      fail(response, error);
+    }
+  });
+
+  /** One program, for the settings screen that edits it. */
+  router.get('/programs/:programId', (request, response) => {
+    try {
+      const program = getProgram(request.params.programId, getDb());
+      if (!program) {
+        response.status(404).json({ error: `No program with id ${request.params.programId}.` });
+        return;
+      }
+      response.json({ program });
+    } catch (error) {
+      fail(response, error);
+    }
+  });
+
+  /**
+   * Edit a program's terms.
+   *
+   * A partial update: only the fields present in the body change, so a form
+   * that does not render a field cannot reset it. `null` clears a duration cap
+   * or an uninstall grace period, and is told apart from absent.
+   *
+   * Commissions are recomputed inline and returned. That is not a convenience —
+   * the terms are inputs to a pure derivation with no memory of what a
+   * commission was originally computed under, so changing a rate restates every
+   * commission on this program's referrals, retroactively and immediately. The
+   * person changing it is entitled to see that in the same response rather than
+   * discover it on the next sync. Payments are untouched; the recompute has no
+   * code path that writes one.
+   */
+  router.patch('/programs/:programId', (request, response) => {
+    try {
+      const program = updateProgram(
+        request.params.programId,
+        (request.body ?? {}) as never,
+        getDb(),
+      );
+      response.json({ program, commissions: recomputeCommissions(getDb()) });
     } catch (error) {
       fail(response, error);
     }
@@ -327,7 +400,7 @@ export function affiliatesAdminRouter(): express.Router {
     }
   });
 
-  /** The approval queue. Stoq requires approval; Filemonk does not. */
+  /** The approval queue, across every program whose `require_approval` is set. */
   router.get('/memberships/pending', (_request, response) => {
     try {
       response.json({ memberships: listPendingMemberships(getDb()) });

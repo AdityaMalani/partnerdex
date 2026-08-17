@@ -1,8 +1,15 @@
 import { getDb, type Db } from '../db/index.js';
 import {
+  REVENUE_COMPONENTS,
+  allRuleVersions,
   computeCommissions,
+  isPayoutBasis,
+  isRecurrence,
+  isRevenueComponent,
   type CommissionAttribution,
   type CommissionTransaction,
+  type EffectiveRules,
+  type ProgramRuleTimeline,
   type ProgramRules,
   type RevenueComponent,
 } from './commission.js';
@@ -21,6 +28,25 @@ import { upsertCommission } from './store.js';
  * Commission **amounts** are a derivation. They are recomputed from scratch on
  * every sync and rewritten in place, because a rule change, a corrected
  * referral date or a late transaction all have to be able to change them.
+ *
+ * Stated precisely, now that a programme's terms are versioned:
+ *
+ * > **An amount is what the rules in force when the charge occurred say.**
+ *
+ * That is the same invariant, sharpened rather than weakened. It used to read
+ * "what the rules say", which was indistinguishable from this one while a
+ * programme's terms could only be changed by editing a row by hand — and stops
+ * being so the moment an operator can edit a rate from a dashboard. Under the
+ * old reading, every rate edit re-priced every commission the programme had
+ * ever earned, including paid ones, and filled the reconciliation report with
+ * differences that were not real. Under this one, editing a rate writes a new
+ * version effective from now and nothing historical moves, because every
+ * historical charge still resolves against the version it was priced under.
+ *
+ * What still moves a paid commission's amount, and must: a corrected referral
+ * date, a late transaction, an unassignment, an approved claim. Those change
+ * what was truly earned. The distinction is between changing what the rules
+ * were and changing what happened.
  *
  * Commission **payments** are not a derivation and can never become one.
  * `paid_at`, `paid_amount`, `payment_reference` and `payment_note` record that
@@ -91,6 +117,17 @@ interface ProgramRow {
   revenue_components: string;
   duration_months: number | null;
   unassign_after_uninstall_days: number | null;
+  payout_basis?: string;
+  flat_amount?: number;
+  flat_currency?: string;
+  recurrence?: string;
+  enforce_unassign_after_uninstall?: number;
+}
+
+/** One row of `affiliate_program_terms`, plus the program it belongs to. */
+interface ProgramTermsRow extends ProgramRow {
+  program_id: string;
+  effective_from: string;
 }
 
 interface AttributionRow {
@@ -104,6 +141,66 @@ interface AttributionRow {
 }
 
 /**
+ * Which Partner API transaction types carry which revenue stream.
+ *
+ * The seam between a platform's spelling and this system's vocabulary, and the
+ * only place the two are allowed to meet. `revenue_components` was decorative
+ * until this map existed: the recompute read subscription sales and nothing
+ * else, then labelled every row it read `subscription`, so a program set to
+ * `["usage"]` was handed no usage charges to pay on and earned nothing — with
+ * no error, no skip reason, and a settings screen still showing `usage`.
+ *
+ * `AppSaleAdjustment` and `AppSaleCredit` are deliberately absent. They are
+ * corrections to an earlier charge rather than a revenue stream anyone can
+ * enrol in, they arrive negative, and the engine already declines to write a
+ * negative commission — including them would only produce skips.
+ */
+const TRANSACTION_TYPE_BY_COMPONENT: Record<RevenueComponent, string> = {
+  subscription: 'AppSubscriptionSale',
+  usage: 'AppUsageSale',
+  one_time: 'AppOneTimeSale',
+};
+
+const COMPONENT_BY_TRANSACTION_TYPE = new Map<string, RevenueComponent>(
+  (Object.entries(TRANSACTION_TYPE_BY_COMPONENT) as Array<[RevenueComponent, string]>).map(
+    ([component, type]) => [type, component],
+  ),
+);
+
+/**
+ * A program row's components, checked against the vocabulary.
+ *
+ * Three failure modes, three different answers, none of them silent:
+ * unparseable JSON and an empty list both fall back to subscription-only —
+ * which is what a program with a broken settings column was almost certainly
+ * paying on — while an entry outside the vocabulary is dropped and logged with
+ * the program id, because that one is a live money bug and the operator is the
+ * only person who can fix it. Writes go through `programAdmin.ts`, which
+ * refuses such a value outright; anything reaching here predates that check.
+ */
+function componentsOf(row: ProgramRow): RevenueComponent[] {
+  let raw: unknown[] = [];
+  try {
+    const parsed = JSON.parse(row.revenue_components) as unknown;
+    if (Array.isArray(parsed)) raw = parsed;
+  } catch {
+    // Handled by the empty-list fallback below.
+  }
+  if (raw.length === 0) return ['subscription'];
+
+  const known = raw.filter(isRevenueComponent);
+  const unknown = raw.filter((entry) => !isRevenueComponent(entry));
+  if (unknown.length > 0) {
+    console.warn(
+      `[partnerdex] program ${row.id} lists revenue component(s) ` +
+        `${unknown.map((entry) => JSON.stringify(entry)).join(', ')}, which nothing pays on. ` +
+        `Known components: ${REVENUE_COMPONENTS.join(', ')}.`,
+    );
+  }
+  return known.length > 0 ? known : ['subscription'];
+}
+
+/**
  * Program rows as engine rules.
  *
  * Two conversions happen here and nowhere else. The schema stores the rate as a
@@ -112,34 +209,87 @@ interface AttributionRow {
  * what the validation harness compares against. And `revenue_components` is
  * JSON in the column, since nothing queries inside it.
  *
- * `enforceUnassignAfterUninstall` is on. That is not a default — it is a
- * finding: almost all of the soft-deleted referrals whose merchant had
- * uninstalled were removed just past the 30-day mark, every one stamped at the
- * same time of day. That is a daily cron, so the rule was live, and reproducing
- * the platform we are replacing means enforcing it.
+ * `enforceUnassignAfterUninstall` is a column now, and it used to be the
+ * literal `true` on the line below. A grace period after an uninstall is only a
+ * rule if something enforces it, and a program that stores one and never
+ * applies it keeps paying on a merchant nobody referred any more — so the
+ * behaviour is right and it is kept. What was wrong is that it was not a
+ * choice: `ProgramRules` documents the flag as defaulting *off* so that "a
+ * program that never says so does not silently acquire the behaviour", and the
+ * only production caller then passed `true` for every program ever created. The
+ * migration seeds the column to 1 for exactly that reason — from the behaviour,
+ * not from the documentation.
+ *
+ * Unknown components are dropped and reported, never obeyed. See
+ * `REVENUE_COMPONENTS` in `commission.ts` for why silence would be the
+ * expensive choice here.
  */
 export function rulesFromPrograms(rows: ProgramRow[]): Map<string, ProgramRules> {
   const rules = new Map<string, ProgramRules>();
-  for (const row of rows) {
-    let components: RevenueComponent[] = ['subscription'];
-    try {
-      const parsed = JSON.parse(row.revenue_components) as unknown;
-      if (Array.isArray(parsed) && parsed.length > 0) components = parsed as RevenueComponent[];
-    } catch {
-      // A column that will not parse falls back to subscription-only, which is
-      // what every imported commission was earned on. Widening it by
-      // accident would pay on revenue no program has ever paid on.
+  for (const row of rows) rules.set(row.id, rulesFromRow(row.id, row));
+  return rules;
+}
+
+/** One row — a program or one of its versions — as engine rules. */
+function rulesFromRow(id: string, row: ProgramRow): ProgramRules {
+  return {
+    id,
+    payoutBasis: isPayoutBasis(row.payout_basis) ? row.payout_basis : 'percent_of_gross',
+    percentCommission: row.commission_rate * 100,
+    flatAmount: row.flat_amount ?? 0,
+    flatCurrency: row.flat_currency ?? '',
+    recurrence: isRecurrence(row.recurrence) ? row.recurrence : 'recurring',
+    revenueComponents: componentsOf(row),
+    durationMonths: row.duration_months,
+    unassignAfterUninstallDays: row.unassign_after_uninstall_days,
+    // Absent means a database whose migration has not run, which can only be
+    // one that has always had the behaviour. Defaulting to true here is the
+    // same reading of the same evidence as the migration's own default.
+    enforceUnassignAfterUninstall: (row.enforce_unassign_after_uninstall ?? 1) !== 0,
+  };
+}
+
+/**
+ * Every program's terms over time, ready for the engine.
+ *
+ * A program with no versions falls back to its own columns as a single
+ * timeless rule. That is not a defensive crouch: the migration gives every
+ * existing program a version, but a program created by an importer that has not
+ * been taught about versions yet would otherwise price at zero — which is the
+ * one failure mode worth spending a branch on, because it is silent and it is
+ * money.
+ */
+export function timelinesFromPrograms(
+  programs: ProgramRow[],
+  terms: ProgramTermsRow[],
+): Map<string, ProgramRuleTimeline> {
+  const byProgram = new Map<string, EffectiveRules[]>();
+  for (const row of terms) {
+    const version: EffectiveRules = {
+      ...rulesFromRow(row.program_id, row),
+      effectiveFrom: row.effective_from,
+    };
+    const list = byProgram.get(row.program_id);
+    if (list) list.push(version);
+    else byProgram.set(row.program_id, [version]);
+  }
+
+  const timelines = new Map<string, ProgramRuleTimeline>();
+  for (const program of programs) {
+    const versions = byProgram.get(program.id);
+    if (versions && versions.length > 0) {
+      // `rulesAt` walks forwards and stops at the first version past the
+      // instant, so the order is load-bearing rather than cosmetic.
+      versions.sort((a, b) => a.effectiveFrom.localeCompare(b.effectiveFrom));
+      timelines.set(program.id, { id: program.id, versions });
+      continue;
     }
-    rules.set(row.id, {
-      id: row.id,
-      percentCommission: row.commission_rate * 100,
-      revenueComponents: components,
-      durationMonths: row.duration_months,
-      unassignAfterUninstallDays: row.unassign_after_uninstall_days,
-      enforceUnassignAfterUninstall: true,
+    timelines.set(program.id, {
+      id: program.id,
+      versions: [{ ...rulesFromRow(program.id, program), effectiveFrom: '' }],
     });
   }
-  return rules;
+  return timelines;
 }
 
 /**
@@ -220,13 +370,25 @@ export function recomputeCommissions(db: Db = getDb()): CommissionRecomputeResul
   const programs = db
     .prepare(
       `SELECT id, app_id, commission_rate, revenue_components, duration_months,
-              unassign_after_uninstall_days
+              unassign_after_uninstall_days, payout_basis, flat_amount, flat_currency,
+              recurrence, enforce_unassign_after_uninstall
          FROM affiliate_programs`,
     )
     .all() as ProgramRow[];
   if (programs.length === 0) return EMPTY;
 
-  const rules = rulesFromPrograms(programs);
+  const terms = db
+    .prepare(
+      `SELECT program_id, program_id AS id, '' AS app_id, effective_from, commission_rate,
+              revenue_components, duration_months, unassign_after_uninstall_days,
+              payout_basis, flat_amount, flat_currency, recurrence,
+              enforce_unassign_after_uninstall
+         FROM affiliate_program_terms
+        ORDER BY program_id, effective_from`,
+    )
+    .all() as ProgramTermsRow[];
+
+  const rules = timelinesFromPrograms(programs, terms);
   const appOfProgram = new Map(programs.map((row) => [row.id, row.app_id]));
 
   const rows = db
@@ -274,19 +436,42 @@ export function recomputeCommissions(db: Db = getDb()): CommissionRecomputeResul
 
   /*
    * Charges are pulled per referred merchant rather than by scanning the
-   * transaction table. There are 1.5M transactions in a real install and a few
-   * hundred referred shops; the engine would discard everything else anyway.
+   * transaction table. There are millions of transactions in a mature install
+   * and a few hundred referred shops; the engine would discard everything else
+   * anyway.
    *
-   * Only subscription sales. Every one of Mantle's imported commissions was a
-   * `subscription_sale` and neither program pays on usage or one-time charges,
-   * so anything else read here would be handed to the engine only to be skipped
-   * as `component_excluded`.
+   * Which *types* are read is decided by the programs, not by this file. The
+   * union across every program's `revenue_components` is what gets loaded, so a
+   * program that pays on usage is handed usage charges and a deployment where
+   * no program pays on usage never reads a usage row. Narrowing here rather
+   * than letting the engine skip them matters at this scale: usage sales
+   * routinely outnumber subscription sales by an order of magnitude, and
+   * loading them to throw them away would be the most expensive thing the
+   * recompute does.
    */
+  const wanted = new Set<string>();
+  for (const timeline of rules.values()) {
+    // The union across every *version*, not just the current one. A program
+    // that paid on usage last year and does not now still has last year's
+    // usage charges to price, and narrowing to today's components would drop
+    // them from the load and cancel commissions that were genuinely earned.
+    for (const rule of allRuleVersions(timeline)) {
+      for (const component of rule.revenueComponents) {
+        const type = TRANSACTION_TYPE_BY_COMPONENT[component];
+        if (type) wanted.add(type);
+      }
+    }
+  }
+  if (wanted.size === 0) {
+    return { ...EMPTY, attributions: attributions.length, unresolvedAttributions: unresolved };
+  }
   const query = db.prepare(
-    `SELECT id, app_id, shop_id, created_at, gross_amount, currency
+    `SELECT id, app_id, shop_id, type, created_at, gross_amount, currency
        FROM transactions
-      WHERE app_id = ? AND shop_id = ? AND type = 'AppSubscriptionSale'`,
+      WHERE app_id = ? AND shop_id = ?
+        AND type IN (${[...wanted].map(() => '?').join(', ')})`,
   );
+  const wantedTypes = [...wanted];
   const transactions: CommissionTransaction[] = [];
   const seenTransaction = new Set<string>();
   const seenShop = new Set<string>();
@@ -299,21 +484,28 @@ export function recomputeCommissions(db: Db = getDb()): CommissionRecomputeResul
     if (seenShop.has(key)) continue;
     seenShop.add(key);
 
-    for (const row of query.all(attribution.appId, attribution.shopId) as Array<{
+    for (const row of query.all(attribution.appId, attribution.shopId, ...wantedTypes) as Array<{
       id: string;
       app_id: string;
       shop_id: string;
+      type: string;
       created_at: string;
       gross_amount: number;
       currency: string;
     }>) {
       if (seenTransaction.has(row.id)) continue;
       seenTransaction.add(row.id);
+      // The type is only in `wanted` because some program asked for it, so the
+      // lookup cannot miss. Skipping rather than defaulting is still the right
+      // shape: a default here would be the same silent mislabelling this map
+      // was added to remove.
+      const component = COMPONENT_BY_TRANSACTION_TYPE.get(row.type);
+      if (!component) continue;
       transactions.push({
         id: row.id,
         appId: row.app_id,
         shopId: row.shop_id,
-        component: 'subscription',
+        component,
         occurredAt: new Date(row.created_at).toISOString(),
         grossAmount: row.gross_amount,
         currency: row.currency,
@@ -367,7 +559,11 @@ export function recomputeCommissions(db: Db = getDb()): CommissionRecomputeResul
 
     for (const commission of run.commissions) {
       earned.add(`${commission.attributionId} ${commission.transactionId}`);
-      const rate = rules.get(commission.programId)?.percentCommission ?? null;
+      // The rate the engine actually priced this charge at, not the program's
+      // current one. Those were the same number until terms became versioned,
+      // and reading the current one now would stamp every historical row with
+      // today's rate beside an amount computed from a different one.
+      const rate = commission.rate;
       let rowId = (
         existing.get(commission.attributionId, commission.transactionId) as
           | { id: string }

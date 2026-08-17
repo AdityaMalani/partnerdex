@@ -27,7 +27,7 @@ import {
  *   tsx src/affiliates/attributeCli.ts \
  *     --project=<your-bigquery-project> \
  *     --credentials=/path/to/service-account.json \
- *     --app=stoq:analytics_<ga4-property-id> --app=filemonk:analytics_<ga4-property-id> \
+ *     --app=<app-id>:analytics_<ga4-property-id> \
  *     --from=2026-06-01 --to=2026-08-13 \
  *     [--handles=handles.json] [--window=30] [--json]
  *

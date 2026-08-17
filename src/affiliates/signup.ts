@@ -13,8 +13,9 @@ import { upsertAffiliate, upsertMembership, type MembershipStatus } from './stor
  * The rules it holds to, each of which has a way of being quietly wrong:
  *
  *   1. **Approval is read from the program, never assumed.** `require_approval`
- *      is true for Stoq and false for Filemonk today, and the difference is not
- *      cosmetic: a Stoq applicant becomes `pending` and gets no working link,
+ *      is a per-program column, and the difference is not cosmetic: an
+ *      applicant to a program that requires approval becomes `pending` and gets
+ *      no working link,
  *      because the attribution pipeline credits only `enrolled` memberships. An
  *      applicant handed a link they cannot earn from would promote it, send us
  *      real installs, and be paid nothing — a failure that is silent on both
@@ -62,7 +63,14 @@ export class SignupError extends Error {
  */
 const MAX_NAME_LENGTH = 120;
 const MAX_EMAIL_LENGTH = 254; // The longest address SMTP will carry.
-const MAX_PROGRAMS_PER_APPLICATION = 8;
+/**
+ * A loop bound, not a policy. Each program named costs a handle allocation, and
+ * the ids are attacker-controlled. Set well above any plausible number of
+ * programs one deployment runs, because the cost of it biting a real applicant
+ * is an application lost in silence and the cost of it being generous is a few
+ * more rows read.
+ */
+const MAX_PROGRAMS_PER_APPLICATION = 32;
 
 /**
  * What counts as a plausible address.
@@ -127,8 +135,8 @@ function randomHandle(): string {
  *
  * Uniqueness is per program and **not** global, which is what the unique index
  * `(program_id, handle)` says and what the imported data requires: two affiliates
- * legitimately hold the same handle in both Stoq and Filemonk, and a global
- * constraint would have rejected them at import. So this checks the pair.
+ * can legitimately hold the same handle in two different programs, and a global
+ * constraint would reject them. So this checks the pair.
  *
  * The read-then-write is safe here for a reason worth stating rather than
  * assuming, because "check then insert" is usually a race: `better-sqlite3` is
@@ -296,8 +304,9 @@ export function validateSignup(input: SignupInput): {
     : [];
   if (programIds.length === 0) throw new SignupError('Choose at least one program to join.');
   if (programIds.length > MAX_PROGRAMS_PER_APPLICATION) {
-    // Bounds the loop below, which does a handle allocation per program. There
-    // are two programs; anything near this ceiling is a script, not a partner.
+    // Anything near this ceiling is a script rather than a partner. Ids that
+    // name no active program are discarded downstream regardless, so this is
+    // only ever bounding work.
     throw new SignupError('Choose fewer programs.');
   }
 
@@ -416,7 +425,7 @@ export function applyForSignup(
           // membership started earning, which is the question anyone reading it
           // is actually asking; leaving it null on the half of memberships
           // nobody has to approve would make "enrolled with no approval date"
-          // look like a data fault rather than the normal Filemonk case.
+          // look like a data fault rather than the normal open-program case.
           approvedAt: status === 'enrolled' ? now : null,
         },
         db,

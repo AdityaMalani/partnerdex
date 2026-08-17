@@ -36,6 +36,7 @@ Usage:
   partnerdex onboard-affiliates [--dry-run] [--limit=N] [--resend] [--spacing-ms=N]
                                  Email set-password links to affiliates who have none
   partnerdex import-affiliates --exports=<dir> [--dry-run] [--app=<mantleAppId>=<appId>]
+                                 [--listing=<mantleProgramId>=<listingUrl>]
                                  Import the Mantle affiliate export into the ledger
   partnerdex query <metric> [--period=last_12_months] [--interval=month] [--asOf=YYYY-MM-DD]
 
@@ -361,6 +362,7 @@ async function main(): Promise<void> {
           exportsDir: flags.exports ?? '',
           dryRun: flags['dry-run'] === 'true',
           appIds: parseAppIds(flags.app),
+          listingUrls: parseAppIds(flags.listing),
           onProgress: (message) => console.log(message),
         });
         console.log(formatImportReport(report, flags['dry-run'] === 'true'));
@@ -369,7 +371,7 @@ async function main(): Promise<void> {
         console.error(error.message);
         console.error(
           'Usage: partnerdex import-affiliates --exports=<dir> [--dry-run] ' +
-            '[--app=<mantleAppId>=<appId>]',
+            '[--app=<mantleAppId>=<appId>] [--listing=<mantleProgramId>=<listingUrl>]',
         );
         process.exitCode = 1;
       }

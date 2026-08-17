@@ -5,7 +5,6 @@ import type {
   MantleExport,
   MantleProgram,
 } from './mantle.js';
-import { knownListingUrl } from './listings.js';
 import {
   claimStatus,
   linkClaimsToAttributions,
@@ -226,11 +225,25 @@ export interface ImportOptions {
   db?: Db;
   /** Mantle app UUID → local `apps.id`, for a program whose app cannot be named. */
   appIds?: Record<string, string>;
+  /**
+   * Mantle program UUID → the App Store listing its referral links point at.
+   *
+   * Supplied by the operator, because Mantle carries no App Store URL of its
+   * own: its `slug` is its internal handle for the app, not the listing's, and
+   * following it sends every click to a page that does not exist. This was a
+   * compiled-in table of two slugs matched against program names, which is a
+   * guess with a silent failure mode — see `listings.ts`.
+   *
+   * Absent is fine and is not a broken import: `app_listings` covers a program
+   * whose app has synced, and the program can be edited afterwards.
+   */
+  listingUrls?: Record<string, string>;
 }
 
 export function importMantleExport(data: MantleExport, options: ImportOptions = {}): ImportReport {
   const db = options.db ?? getDb();
   const overrides = options.appIds ?? {};
+  const listingUrls = options.listingUrls ?? {};
 
   const shopByDomain = new Map<string, string>();
   for (const row of db
@@ -290,10 +303,9 @@ export function importMantleExport(data: MantleExport, options: ImportOptions = 
           appId,
           name,
           // Stored on the program so a referral link works before the app has
-          // synced and `app_listings` has anything to say. Mantle carries no App
-          // Store URL of its own — see `knownListingUrl` for why its `slug` is
-          // not one — so this is resolved from the app's name.
-          listingUrl: knownListingUrl(name),
+          // synced and `app_listings` has anything to say. Never inferred — see
+          // `ImportOptions.listingUrls`.
+          listingUrl: listingUrls[externalId] ?? '',
           commissionRate: rate,
           revenueComponents: program.rules?.revenueComponents ?? ['subscription'],
           durationMonths,

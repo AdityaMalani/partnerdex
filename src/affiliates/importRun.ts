@@ -33,6 +33,8 @@ export interface RunImportOptions {
   dryRun?: boolean;
   /** Mantle app UUID → local `apps.id`, for a program whose app cannot be named. */
   appIds?: Record<string, string>;
+  /** Mantle program UUID → App Store listing URL. See `ImportOptions`. */
+  listingUrls?: Record<string, string>;
   db?: Db;
   onProgress?: (message: string) => void;
 }
@@ -90,12 +92,20 @@ export function runMantleImport(options: RunImportOptions): {
   );
 
   if (!options.dryRun) {
-    return { report: importMantleExport(data, { db, appIds: options.appIds ?? {} }), exportsDir };
+    return { report: importMantleExport(data, {
+        db,
+        appIds: options.appIds ?? {},
+        listingUrls: options.listingUrls ?? {},
+      }), exportsDir };
   }
 
   db.exec('BEGIN');
   try {
-    return { report: importMantleExport(data, { db, appIds: options.appIds ?? {} }), exportsDir };
+    return { report: importMantleExport(data, {
+        db,
+        appIds: options.appIds ?? {},
+        listingUrls: options.listingUrls ?? {},
+      }), exportsDir };
   } finally {
     db.exec('ROLLBACK');
   }
@@ -236,13 +246,20 @@ export function formatImportReport(report: ImportReport, dryRun: boolean): strin
   return lines.join('\n');
 }
 
-/** `--app=<mantle-app-uuid>=<partnerdex-app-id>`, repeatable via commas. */
+/**
+ * `--app=<mantle-app-uuid>=<partnerdex-app-id>`, repeatable via commas.
+ *
+ * Also parses `--listing=<mantle-program-uuid>=<url>`, which has the same
+ * shape. Split on the *first* `=` only, because a listing URL contains query
+ * parameters and splitting on every one of them loses the tail.
+ */
 export function parseAppIds(raw: string | undefined): Record<string, string> {
   if (!raw) return {};
-  return Object.fromEntries(
-    raw
-      .split(',')
-      .map((pair) => pair.split('='))
-      .filter((parts): parts is [string, string] => parts.length === 2),
-  );
+  const pairs: Array<[string, string]> = [];
+  for (const entry of raw.split(',')) {
+    const at = entry.indexOf('=');
+    if (at <= 0) continue;
+    pairs.push([entry.slice(0, at), entry.slice(at + 1)]);
+  }
+  return Object.fromEntries(pairs);
 }

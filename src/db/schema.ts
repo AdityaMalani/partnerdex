@@ -983,6 +983,28 @@ CREATE TABLE IF NOT EXISTS affiliate_programs (
   require_approval              INTEGER NOT NULL DEFAULT 0,
   -- 'active' | 'closed'
   status                        TEXT NOT NULL DEFAULT 'active',
+  -- 'percent_of_gross' | 'flat_per_referral'. A flat bounty is paid once, on a
+  -- referral's first qualifying charge, and carries its own currency because a
+  -- typed amount cannot inherit one from a charge the way a percentage can.
+  payout_basis                  TEXT NOT NULL DEFAULT 'percent_of_gross',
+  flat_amount                   REAL NOT NULL DEFAULT 0,
+  flat_currency                 TEXT NOT NULL DEFAULT '',
+  -- 'recurring' | 'first_charge_only'
+  recurrence                    TEXT NOT NULL DEFAULT 'recurring',
+  -- Whether the grace period above is actually applied. Defaults ON, which is
+  -- what the engine has always done: \`rulesFromPrograms\` passed \`true\`
+  -- unconditionally, so every program already had this behaviour and there was
+  -- no column to turn it off. Defaulting to 0 here would have been reading the
+  -- documentation instead of the code, and would have changed what every
+  -- existing affiliate earns.
+  enforce_unassign_after_uninstall INTEGER NOT NULL DEFAULT 1,
+  -- Displayed, never enforced. Nothing in this system moves money, so a floor
+  -- cannot gate a payment; it changes what the owed view and the portal say.
+  minimum_payout                REAL NOT NULL DEFAULT 0,
+  -- The terms a new applicant to THIS program accepts. Was a single
+  -- instance-wide environment variable, which cannot be right for two programs
+  -- on one instance.
+  terms_url                     TEXT NOT NULL DEFAULT '',
   external_id                   TEXT NOT NULL DEFAULT '',
   created_at                    TEXT NOT NULL,
   updated_at                    TEXT NOT NULL
@@ -991,6 +1013,92 @@ CREATE TABLE IF NOT EXISTS affiliate_programs (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_aff_programs_external
   ON affiliate_programs (external_id) WHERE external_id <> '';
 CREATE INDEX IF NOT EXISTS idx_aff_programs_app ON affiliate_programs (app_id);
+
+-- One version of one program's money terms, effective from an instant.
+--
+-- The columns above on \`affiliate_programs\` are the *current* version, kept
+-- there because six readers already select them and a change that moves storage
+-- and every reader at once cannot be verified in halves. This table is the
+-- record of what they were, and it is what the engine prices against.
+--
+-- Why it exists: commission amounts are a derivation and are rewritten in place
+-- on every sync, which is correct and is the documented model (see the header
+-- of \`commissionRun.ts\`). While terms could only be changed by editing a row by
+-- hand that was invisible. Making them editable from a dashboard would have
+-- meant every rate correction re-pricing every commission the program had ever
+-- earned, paid ones included — so the engine resolves a charge against the
+-- version in force when the charge occurred, and a rate edit moves nothing
+-- behind it.
+--
+-- Only money terms live here. A program's name, its app, its listing URL and
+-- whether it requires approval are not versioned: nobody asks what a program
+-- was called when a commission was earned.
+CREATE TABLE IF NOT EXISTS affiliate_program_terms (
+  id                            TEXT PRIMARY KEY,
+  program_id                    TEXT NOT NULL REFERENCES affiliate_programs (id) ON DELETE CASCADE,
+  -- ISO-8601. This version prices every charge at or after it, until the next.
+  effective_from                TEXT NOT NULL,
+  payout_basis                  TEXT NOT NULL DEFAULT 'percent_of_gross',
+  -- A fraction, like the column it mirrors. 0.2 is twenty percent.
+  commission_rate               REAL NOT NULL DEFAULT 0,
+  flat_amount                   REAL NOT NULL DEFAULT 0,
+  flat_currency                 TEXT NOT NULL DEFAULT '',
+  revenue_components            TEXT NOT NULL DEFAULT '["subscription"]',
+  recurrence                    TEXT NOT NULL DEFAULT 'recurring',
+  duration_months               INTEGER,
+  unassign_after_uninstall_days INTEGER,
+  enforce_unassign_after_uninstall INTEGER NOT NULL DEFAULT 1,
+  minimum_payout                REAL NOT NULL DEFAULT 0,
+  terms_url                     TEXT NOT NULL DEFAULT '',
+  -- Why this version exists, in the operator's own words. Free text, and there
+  -- is deliberately no author column: the dashboard authenticates with one
+  -- shared password and has no user table, so recording who would be inventing
+  -- a person. Recording why is achievable.
+  note                          TEXT NOT NULL DEFAULT '',
+  created_at                    TEXT NOT NULL
+) WITHOUT ROWID;
+
+-- Unique rather than plain: two versions of one program sharing an instant have
+-- no defined order, and "which rate applied" would then depend on row order.
+-- Refusing the collision is the only answer that stays reconcilable.
+--
+-- Created in \`migrate()\` as well, unconditionally — see the migration-ordering
+-- note in architecture.md. It is named here so a fresh database gets it from
+-- the schema block.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_aff_program_terms_effective
+  ON affiliate_program_terms (program_id, effective_from);
+
+-- How a click becomes a referral. One row, id 1.
+--
+-- Instance-wide rather than per program, and that is a decision rather than
+-- laziness: a click is a URL on a listing page, and which program it belongs to
+-- is only known *after* the handle resolves. Two programs can share an app, so
+-- a per-program window would mean two programs disagreeing about one click with
+-- no principled tie-break. The parameter names and the host allowlist are
+-- properties of the tracking setup, not of anybody's terms.
+--
+-- Every default here is exactly the constant it replaced, so a database that
+-- has never opened this screen behaves identically to one from before it
+-- existed.
+CREATE TABLE IF NOT EXISTS affiliate_attribution_settings (
+  id              INTEGER PRIMARY KEY CHECK (id = 1),
+  -- 'first' | 'last'. First touch is a policy this deployment happens to have,
+  -- not a law; a program whose affiliates close rather than discover wants the
+  -- other one. Both keep the same tie-break, so either stays reconcilable.
+  touch           TEXT NOT NULL DEFAULT 'first',
+  window_days     INTEGER NOT NULL DEFAULT 30,
+  -- JSON array, in precedence order. A URL carrying both an affiliate code and
+  -- a campaign must read the affiliate code, so order is the rule.
+  parameters      TEXT NOT NULL DEFAULT '["mref","utm_source","ref"]',
+  -- JSON array. A trust boundary, not a filter: a GA4 measurement id is public,
+  -- and a third-party site mirroring a listing page and its tag can otherwise
+  -- self-assign commissions with a made-up code.
+  click_hosts     TEXT NOT NULL DEFAULT '["apps.shopify.com"]',
+  -- 'manual_review' only, today. The field exists so a second policy has
+  -- somewhere to go; the UI states the value rather than offering a menu of one.
+  conflict_policy TEXT NOT NULL DEFAULT 'manual_review',
+  updated_at      TEXT NOT NULL
+);
 
 -- An affiliate's enrolment in one program, and the link code that carries it.
 --

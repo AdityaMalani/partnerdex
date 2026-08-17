@@ -386,9 +386,9 @@ export interface MembershipDecision {
 /**
  * Approve or reject an application.
  *
- * Stoq requires approval and carries applicants waiting and others already
- * turned down, so both halves of this are live paths rather than a form of the same
- * one. A rejection is recorded rather than deleted: without the row the same
+ * A program that requires approval accumulates applicants waiting and others
+ * already turned down, so both halves of this are live paths rather than a form
+ * of the same one. A rejection is recorded rather than deleted: without the row the same
  * applicant reappears as new next week and the decision has to be made again
  * from nothing.
  *

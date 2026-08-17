@@ -1,7 +1,7 @@
 import { formatFullDate } from '../format';
 import type { Program } from './api';
 import { ReferralLink, safeUrl } from './ReferralLink';
-import { SHARED_TERMS, statusCopy, termsFor } from './terms';
+import { sharedTerms, statusCopy, termsFor } from './terms';
 
 /**
  * What each program pays, in values an affiliate can check their own statement
@@ -111,7 +111,7 @@ export function Programs({ programs }: { programs: Program[] }) {
       ))}
 
       <ul className="portal-terms">
-        {SHARED_TERMS.map((line) => (
+        {sharedTerms(programs).map((line) => (
           <li key={line}>{line}</li>
         ))}
       </ul>

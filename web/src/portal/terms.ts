@@ -66,19 +66,24 @@ export function formatRate(rate: number): string {
   return `${new Intl.NumberFormat(undefined, { maximumFractionDigits: 2 }).format(rate * 100)}%`;
 }
 
-/**
- * The uninstall rule used to be the one term here not carried in the API
- * response: `unassign_after_uninstall_days` is a per-program column that no
- * endpoint returned, so it was a constant. `/portal/api/programs` returns it
- * now.
+/*
+ * There is deliberately no `UNASSIGN_AFTER_UNINSTALL_DAYS` constant here.
  *
- * The constant survives as a fallback for one caller — `fetchPrograms`
- * degrades to `/me` when the newer endpoint is not deployed, and `/me` does
- * not carry the field. It is 30 for both programs today, so the fallback and
- * the data agree, which is exactly the condition under which a hardcoded copy
- * later goes wrong in silence.
+ * There was one, set to 30, surviving as a fallback for the caller that
+ * degrades to `/me` when `/portal/api/programs` is not deployed. A hardcoded
+ * copy of a per-program column is only ever right by coincidence — it was
+ * right for the deployment it was written in and wrong for every other — and a
+ * number shown to the person being paid is not a place to be right by
+ * coincidence. When the value does not arrive, the claim is not made: see
+ * `sharedTerms`, which states only what every program in front of the reader
+ * agrees on.
  */
-export const UNASSIGN_AFTER_UNINSTALL_DAYS = 30;
+
+/** `subscription` → `Subscription`, `one_time` → `One-off`. */
+function componentLabel(component: string): string {
+  if (component === 'one_time') return 'one-off';
+  return component;
+}
 
 /**
  * The per-program terms, as cells rather than sentences.
@@ -105,30 +110,74 @@ export interface ProgramTerms {
 }
 
 export function termsFor(program: Program): ProgramTerms {
-  const components = program.revenueComponents?.length
-    ? program.revenueComponents.join(', ')
-    : 'subscription';
+  // Every component this program pays on, named. Previously `subscription` was
+  // compared as a string and anything else was printed verbatim, which put the
+  // raw column value in front of an affiliate and — worse — sat beside a shared
+  // bullet asserting that usage charges earn nothing, which stopped being true
+  // the moment a program could be set up to pay on them.
+  const components = (
+    program.revenueComponents?.length ? program.revenueComponents : ['subscription']
+  ).map(componentLabel);
+  const listed =
+    components.length === 1
+      ? `${components[0]} charges only`
+      : `${components.slice(0, -1).join(', ')} and ${components[components.length - 1]} charges`;
 
   return {
     rate: `${formatRate(program.commissionRate)} of gross`,
-    earnsOn:
-      components === 'subscription'
-        ? 'Subscription charges only'
-        : components.replace(/^./, (first) => first.toUpperCase()),
+    earnsOn: listed.replace(/^./, (first) => first.toUpperCase()),
     duration: program.durationMonths ? `${program.durationMonths} months` : 'No cut-off',
     durationFrom: program.durationMonths ? 'from your first commission' : null,
   };
 }
 
 /**
- * The terms that are not per-program: they hold for every program today, and
- * every one of them reduces what gets paid. Kept where an affiliate predicting
- * their earnings will see them, and worded short rather than softened.
+ * The terms below the table, derived from the programs actually shown.
+ *
+ * A function rather than a constant, because two of these sentences are claims
+ * about a *program* and were being asserted over all of them. "Usage and
+ * one-off charges earn nothing" is false for a program set up to pay on usage,
+ * and the release window is a per-program column that was being printed from a
+ * hardcoded 30. Both are money claims shown to the person being paid, so both
+ * are now read from the programs in front of them, and a claim that does not
+ * hold for every program on the page is not made at all.
  */
-export const SHARED_TERMS: string[] = [
-  'Gross means the full charge, before Shopify’s cut and before ours.',
-  'Usage and one-off charges earn nothing.',
-  `A referral is released ${UNASSIGN_AFTER_UNINSTALL_DAYS} days after the merchant uninstalls and stops earning; reinstalling inside those ${UNASSIGN_AFTER_UNINSTALL_DAYS} days keeps it yours.`,
-  'If a charge is refunded, the commission on it is withdrawn.',
-  'Rates are the same for everyone on a program, and are worked out automatically from the charges Shopify reports. There is nothing to submit.',
-];
+export function sharedTerms(programs: Program[]): string[] {
+  const lines = ['Gross means the full charge, before Shopify’s cut and before ours.'];
+
+  const releaseDays = new Set(
+    programs.map((program) =>
+      typeof program.unassignAfterUninstallDays === 'number'
+        ? program.unassignAfterUninstallDays
+        : null,
+    ),
+  );
+  if (releaseDays.size === 1) {
+    const days = [...releaseDays][0];
+    if (typeof days === 'number') {
+      lines.push(
+        `A referral is released ${days} days after the merchant uninstalls and stops earning; ` +
+          `reinstalling inside those ${days} days keeps it yours.`,
+      );
+    }
+  }
+
+  /*
+   * This line used to read "If a charge is refunded, the commission on it is
+   * withdrawn." It was false, and it was false in the direction that matters:
+   * the engine declines to write a negative commission at all — refunds and
+   * downgrade adjustments arrive as sales with a negative gross and are skipped
+   * as `non_positive_gross` — because the platform this replaced never wrote
+   * one, and introducing a clawback would be a policy change rather than a fix.
+   *
+   * So the system promised a clawback it does not perform, on the page where it
+   * tells people what they will be paid. Replaced with what actually happens.
+   */
+  lines.push(
+    'A refunded or credited charge earns no commission. It does not reduce one you have ' +
+      'already earned.',
+    'Rates are the same for everyone on a program, and are worked out automatically from the ' +
+      'charges Shopify reports. There is nothing to submit.',
+  );
+  return lines;
+}

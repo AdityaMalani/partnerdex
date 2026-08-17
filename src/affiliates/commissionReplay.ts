@@ -34,7 +34,71 @@ import {
   type ProgramRules,
 } from './commission.js';
 import { diffAgainstLedger, type CommissionDiff, type LedgerCommission } from './commissionValidation.js';
-import { PROGRAM_APP_IDS, defaultProgramRules } from './commissionRules.js';
+import { rulesFromPrograms } from './commissionRun.js';
+
+/**
+ * The imported programs, as this harness needs to see them.
+ *
+ * Both maps are keyed by the *source platform's* program id, because that is
+ * the only id the export files carry. The local ledger keys on ids of our own,
+ * and `affiliate_programs.external_id` is the one column that joins the two.
+ *
+ * This used to be a pair of compiled-in constants — two program uuids, two rule
+ * literals, and two app ids read from named environment variables — which meant
+ * the harness could only ever validate the migration it was written for. The
+ * import already writes every one of those values into `affiliate_programs`, so
+ * reading them back is both shorter and correct for any export.
+ */
+export interface ImportedPrograms {
+  /** Engine rules, keyed by the source platform's program id. */
+  rules: Map<string, ProgramRules>;
+  /** Partner API app id, keyed by the source platform's program id. */
+  appIdByProgram: Map<string, string>;
+}
+
+interface ProgramExternalRow {
+  id: string;
+  external_id: string;
+  app_id: string;
+  commission_rate: number;
+  revenue_components: string;
+  duration_months: number | null;
+  unassign_after_uninstall_days: number | null;
+}
+
+/**
+ * Load the imported programs out of the local ledger.
+ *
+ * Opened read-only, like every other read here. A program with no
+ * `external_id` was created in place rather than imported and has nothing on
+ * the export's side of the diff, so it is skipped rather than keyed by an id
+ * the export has never heard of.
+ */
+export function importedPrograms(databasePath: string): ImportedPrograms {
+  const db = new Database(databasePath, { readonly: true, fileMustExist: true });
+  try {
+    const rows = db
+      .prepare(
+        `SELECT id, external_id, app_id, commission_rate, revenue_components,
+                duration_months, unassign_after_uninstall_days
+           FROM affiliate_programs
+          WHERE external_id <> ''`,
+      )
+      .all() as ProgramExternalRow[];
+
+    return {
+      // Re-keyed onto the external id before the rules are built, so the
+      // `ProgramRules.id` an engine skip reports is the id the export uses and
+      // a disagreement can be looked up in the source files directly.
+      rules: rulesFromPrograms(rows.map((row) => ({ ...row, id: row.external_id }))),
+      appIdByProgram: new Map(
+        rows.filter((row) => row.app_id !== '').map((row) => [row.external_id, row.app_id]),
+      ),
+    };
+  } finally {
+    db.close();
+  }
+}
 
 export interface ReplaySources {
   /** Mantle's dashboard export: `exports/dashboard/commissions.json`. */
@@ -53,7 +117,11 @@ export interface ReplaySources {
   recoveredAttributionsPath?: string;
   /** PartnerDex SQLite file. Opened read-only; the sync may hold it. */
   databasePath: string;
-  rules?: Map<string, ProgramRules>;
+  /**
+   * Overrides the programs read from `databasePath`. A test seam, and the way
+   * to replay against terms the ledger no longer holds.
+   */
+  programs?: ImportedPrograms;
 }
 
 export interface UninstallEvidence {
@@ -206,7 +274,10 @@ function toLedgerCommission(row: MantleCommissionRow): LedgerCommission {
  * either side of the diff, and inventing shop ids for them would only add join
  * risk to a pass whose entire value is having no join.
  */
-function attributionsFromLedger(rows: MantleCommissionRow[]): CommissionAttribution[] {
+function attributionsFromLedger(
+  rows: MantleCommissionRow[],
+  appIdByProgram: Map<string, string>,
+): CommissionAttribution[] {
   const seen = new Map<string, CommissionAttribution>();
   for (const row of rows) {
     const attribution = row.affiliateAttribution;
@@ -218,7 +289,7 @@ function attributionsFromLedger(rows: MantleCommissionRow[]): CommissionAttribut
       // The formula pass never touches the database, so app and shop are only
       // grouping keys. Keying the shop by attribution keeps two referrals of
       // the same merchant on different programs from cross-contaminating.
-      appId: PROGRAM_APP_IDS[row.affiliateProgramId] ?? row.affiliateProgramId,
+      appId: appIdByProgram.get(row.affiliateProgramId) ?? row.affiliateProgramId,
       shopId: attribution.id,
       referredAt: attribution.date,
       uninstalledAt: attribution.appInstallation?.uninstalledAt ?? null,
@@ -228,7 +299,10 @@ function attributionsFromLedger(rows: MantleCommissionRow[]): CommissionAttribut
   return [...seen.values()];
 }
 
-function transactionsFromLedger(rows: MantleCommissionRow[]): CommissionTransaction[] {
+function transactionsFromLedger(
+  rows: MantleCommissionRow[],
+  appIdByProgram: Map<string, string>,
+): CommissionTransaction[] {
   const seen = new Set<string>();
   const transactions: CommissionTransaction[] = [];
   for (const row of rows) {
@@ -243,7 +317,7 @@ function transactionsFromLedger(rows: MantleCommissionRow[]): CommissionTransact
     seen.add(dedupe);
     transactions.push({
       id: transaction.id,
-      appId: PROGRAM_APP_IDS[row.affiliateProgramId] ?? row.affiliateProgramId,
+      appId: appIdByProgram.get(row.affiliateProgramId) ?? row.affiliateProgramId,
       shopId: attribution.id,
       component: componentOf(transaction.type),
       occurredAt: transaction.date,
@@ -390,6 +464,7 @@ function partnerPass(
   ledger: MantleCommissionRow[],
   recovered: MantleAttribution[],
   rules: Map<string, ProgramRules>,
+  appIdByProgram: Map<string, string>,
 ): PartnerPass | { unavailable: string } {
   let db: Database.Database;
   try {
@@ -471,7 +546,7 @@ function partnerPass(
     const joinedIds = new Set<string>();
     let unjoined = 0;
     for (const referral of referrals) {
-      const appId = PROGRAM_APP_IDS[referral.affiliateProgramId];
+      const appId = appIdByProgram.get(referral.affiliateProgramId);
       const shopId = resolveShop(referral.shopifyShopId, referral.myshopifyDomain);
       if (!appId || !shopId) {
         unjoined += 1;
@@ -559,18 +634,26 @@ function partnerPass(
 }
 
 export function replayCommissions(sources: ReplaySources): ReplayReport {
-  const rules = sources.rules ?? defaultProgramRules();
+  const programs = sources.programs ?? importedPrograms(sources.databasePath);
+  const { rules, appIdByProgram } = programs;
+  if (rules.size === 0) {
+    throw new Error(
+      'No imported programs found in the ledger. Run the import before validating: ' +
+        'the rules being validated are the ones it wrote, and replaying against none ' +
+        'would report every commission as unreproducible and blame the engine.',
+    );
+  }
   const ledger = loadLedger(sources.commissionsPath);
   const recovered = loadRecovered(sources.recoveredAttributionsPath);
 
   const formulaRun = computeCommissions(
-    transactionsFromLedger(ledger),
-    attributionsFromLedger(ledger),
+    transactionsFromLedger(ledger, appIdByProgram),
+    attributionsFromLedger(ledger, appIdByProgram),
     rules,
   );
   const formula = diffAgainstLedger(formulaRun.commissions, ledger.map(toLedgerCommission));
 
-  const partner = partnerPass(sources, ledger, recovered, rules);
+  const partner = partnerPass(sources, ledger, recovered, rules, appIdByProgram);
   const partnerFailed = 'unavailable' in partner;
 
   return {

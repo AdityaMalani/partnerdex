@@ -6,31 +6,59 @@
  * commissions. Nothing here reads the database, and nothing here knows the
  * affiliate tables exist. That matters because commission amounts are a
  * *derivation* — they must be recomputable at any time, from scratch, against
- * two years of Mantle history as easily as against next month's charges. A
- * function that reaches for a connection cannot be replayed like that.
+ * years of a previous platform's history as easily as against next month's
+ * charges. A function that reaches for a connection cannot be replayed like
+ * that.
  *
- * The rules were not taken from Mantle's settings screen, which was misleading.
- * They were re-derived from every real commission row and its source
- * transactions:
+ * Every rule here is a value on `ProgramRules`, which is a row in
+ * `affiliate_program_terms` — one row per *version* of a programme's terms,
+ * with `affiliate_programs` holding the programme's identity and a copy of its
+ * current version. There are no rates, no component lists and no windows
+ * compiled into this file, and there is nowhere in the system a program's terms
+ * can be set except those tables.
  *
- *     commission = 20% of GROSS, on subscription sales only
- *
- * Every one of those rows is `subscription_sale`, none are usage or one-time, and every
- * single row sits within half a cent of 20% of gross. See
- * `commissionValidation.ts` for the harness that keeps proving that.
+ * The rules that apply to a charge are the rules in force **when that charge
+ * occurred** — see `rulesAt`. That is the difference between an operator
+ * changing a rate and an operator restating two years of payments. An operator moving an existing programme onto
+ * this code can therefore answer "would this have paid the same people the same
+ * money" *before* the first recompute writes anything — see
+ * `commissionValidation.ts`, which is the harness for exactly that question.
  */
 
-/** Which revenue streams a program pays on. Mantle called these components. */
-export type RevenueComponent = 'subscription' | 'usage' | 'one_time';
+/**
+ * Which revenue streams a program pays on — the whole vocabulary, in one place.
+ *
+ * This list is the contract. `affiliate_programs.revenue_components` is a JSON
+ * array of these strings and nothing else: a write that names anything outside
+ * this list is rejected where it is written, and a stored value outside it is
+ * reported rather than obeyed. That is deliberate and it is a money decision.
+ * An unrecognised component cannot match a transaction, so a program carrying
+ * one silently earns nothing on that stream — the worst kind of defect, because
+ * the settings screen shows the operator exactly what they typed and the ledger
+ * shows zero with no explanation joining the two.
+ *
+ * Adding a stream means adding it here *and* teaching the ingest to normalise
+ * some platform string onto it. A component nothing normalises to is a label,
+ * not a rule.
+ */
+export const REVENUE_COMPONENTS = ['subscription', 'usage', 'one_time'] as const;
+
+/** Which revenue streams a program pays on. */
+export type RevenueComponent = (typeof REVENUE_COMPONENTS)[number];
+
+export function isRevenueComponent(value: unknown): value is RevenueComponent {
+  return typeof value === 'string' && (REVENUE_COMPONENTS as readonly string[]).includes(value);
+}
 
 /**
  * The engine's own transaction shape.
  *
- * `type` is the *normalized* component rather than a platform string, because
- * the two sources we reconcile spell the same event differently — the Partner
- * API says `AppSubscriptionSale`, Mantle's ledger says `subscription_sale`.
- * Normalizing at the edge keeps the one rule that matters ("subscription only")
- * from turning into a list of vendor spellings inside the calculation.
+ * `component` is the *normalized* revenue stream rather than a platform string,
+ * because two sources spell the same event differently — the Partner API says
+ * `AppSubscriptionSale`, an affiliate platform's own ledger might say
+ * `subscription_sale`. Normalizing at the edge keeps a program's rule from
+ * turning into a list of vendor spellings inside the calculation. See
+ * `REVENUE_COMPONENTS` above and the type map in `commissionRun.ts`.
  */
 export interface CommissionTransaction {
   id: string;
@@ -49,8 +77,8 @@ export interface CommissionTransaction {
  *
  * Deliberately not the storage row. The engine needs six fields; the durable
  * attribution record has more, and coupling to it would make the engine
- * un-replayable against Mantle's export, which is the only dataset large enough
- * to prove the engine correct.
+ * un-replayable against a previous platform's export — which is the only kind
+ * of dataset large enough to prove the engine correct before it is trusted.
  */
 export interface CommissionAttribution {
   id: string;
@@ -64,60 +92,203 @@ export interface CommissionAttribution {
   uninstalledAt?: string | null;
   /**
    * ISO-8601 instant the referral stopped belonging to this affiliate, if it
-   * ever did. Mantle expressed this as a soft delete on the attribution row.
+   * ever did. Stored as a soft delete on the attribution row.
    *
    * It is a separate field from `uninstalledAt` because it has two causes: the
-   * automatic 30-day sweep after an uninstall, and an admin (or a cross-program
-   * reassignment) removing the referral outright. Some unassigned referrals in
-   * the export had no uninstall at all, so deriving this from the uninstall
-   * alone would keep paying them forever.
+   * automatic sweep after an uninstall, and an admin (or a cross-program
+   * reassignment) removing the referral outright. Referrals unassigned by hand
+   * have no uninstall at all, so deriving this from the uninstall alone would
+   * keep paying them forever.
    */
   unassignedAt?: string | null;
 }
 
+/** How a program turns a qualifying charge into money. */
+export const PAYOUT_BASES = ['percent_of_gross', 'flat_per_referral'] as const;
+export type PayoutBasis = (typeof PAYOUT_BASES)[number];
+
+/** Whether every qualifying charge earns, or only a referral's first. */
+export const RECURRENCES = ['recurring', 'first_charge_only'] as const;
+export type Recurrence = (typeof RECURRENCES)[number];
+
+export function isPayoutBasis(value: unknown): value is PayoutBasis {
+  return typeof value === 'string' && (PAYOUT_BASES as readonly string[]).includes(value);
+}
+
+export function isRecurrence(value: unknown): value is Recurrence {
+  return typeof value === 'string' && (RECURRENCES as readonly string[]).includes(value);
+}
+
+/**
+ * Every rule added after the first version of this engine is **optional**, and
+ * absent always means the behaviour that existed before it.
+ *
+ * That is not politeness towards old call sites. These values decide money, and
+ * a required field would have been satisfied at each call site by whatever the
+ * author guessed, silently, in four places. Optional-with-a-stated-default
+ * means there is exactly one place the default lives (`resolved()` below) and
+ * one place to read to find out what a programme that says nothing pays.
+ */
 export interface ProgramRules {
   id: string;
-  /** 20 means 20%. Percent, not fraction — it is what the Mantle export stores. */
+  /**
+   * What a qualifying charge earns. Defaults to `percent_of_gross`.
+   *
+   * `percent_of_gross` is the common case and the only one this system had for
+   * its first two years. `flat_per_referral` pays a fixed amount **once**, on a
+   * referral's first qualifying charge — a bounty for producing a customer
+   * rather than a share of what that customer spends.
+   */
+  payoutBasis?: PayoutBasis;
+  /** 20 means 20%. Percent here; the column stores the fraction. */
   percentCommission: number;
+  /**
+   * The bounty, when `payoutBasis` is `flat_per_referral`. Ignored otherwise.
+   *
+   * It carries its own currency because it cannot inherit one: a percentage is
+   * a share of a charge and is denominated by that charge, while a flat amount
+   * is a number somebody typed and means nothing without saying what of. There
+   * is no FX anywhere in this system, so a bounty paid against a charge in
+   * another currency is *not* converted — it is written in `flatCurrency` and
+   * both currencies land in `CommissionRun.currencies`, which is the existing
+   * signal for "these totals are adding unlike units".
+   */
+  flatAmount?: number;
+  flatCurrency?: string;
+  /**
+   * Whether every qualifying charge earns, or only the first on a referral.
+   * Defaults to `recurring`.
+   *
+   * `flat_per_referral` is once-only by construction, so this is the setting
+   * that lets a *percentage* programme pay on the first charge alone.
+   */
+  recurrence?: Recurrence;
   revenueComponents: RevenueComponent[];
   /**
    * How long a referral keeps earning, in months. `null` is lifetime.
    *
-   * UNVERIFIED AGAINST OUR OWN DATA: the window starts at the date of the FIRST
-   * COMMISSION, not the referral date. That is stated as a MUST twice in the
-   * previous platform's own specification, and it is implemented here on that
-   * authority alone.
-   * Our own ledger cannot confirm or refute it: no referral has yet run long
-   * enough to reach the 24-month cap. The distinction is not academic — the
-   * lag from referral to first commission is routinely weeks and can exceed a
-   * year, so starting the clock at the referral instead would silently shorten
-   * every window by that lag.
+   * The window starts at the date of the FIRST COMMISSION, not the referral
+   * date. If a programme promises something else, this is the line to change.
+   * A ledger cannot easily confirm or refute which convention produced it,
+   * because a capped window only bites once a referral has run the full term.
+   * The distinction is not
+   * academic even so: the lag from referral to first commission is routinely
+   * weeks and can exceed a year, so starting the clock at the referral instead
+   * would silently shorten every window by that lag — and shorten it most for
+   * the affiliates who referred the slowest-converting merchants.
    */
   durationMonths: number | null;
   /**
-   * Mantle's `removeOnUninstallDays`, 30 for both our programs.
+   * How long after an uninstall a referral keeps earning. `null` is "never
+   * released".
    *
-   * This was expected to be decorative — a schema field with no documented job
-   * behind it — and the commission ledger alone cannot tell you either way,
-   * since no commission in the whole ledger is dated more than a couple of
-   * weeks after its merchant uninstalled. That is not evidence of a rule;
-   * uninstalling cancels the Shopify subscription, so the charges stop on their
-   * own long before a 30-day grace period could ever bind.
+   * The commission ledger alone cannot tell you whether such a rule is live,
+   * and this is worth knowing before anybody concludes the column is
+   * decorative: uninstalling cancels the merchant's subscription, so the
+   * charges stop on their own long before a grace period of any normal length
+   * could bind. The evidence for the rule is in *unassignments* rather than in
+   * commissions — a daily sweep releasing referrals a fixed number of days
+   * after their merchant left is what the column describes.
    *
-   * The job is real, and the proof is in the *deleted* attributions rather than
-   * the commissions. Of the soft-deleted referrals in the export, most belong to
-   * a merchant who uninstalled, and almost all of those were deleted just past
-   * the 30-day mark — every one of them stamped at the same time of day, which
-   * is a daily cron sweeping anything past the threshold. The remainder were
-   * deleted long before their merchant uninstalled, so they are manual
-   * removals.
-   *
-   * Enforcement is therefore on by default. Note what the job actually did: it
-   * unassigned the referral, it did not cancel commissions already earned.
+   * Note what such a sweep does and does not do: it releases the referral, it
+   * does not cancel commissions already earned. This implements the same.
    */
   unassignAfterUninstallDays: number | null;
   /** Switch for the rule above. Defaults to off when omitted; see the note. */
   enforceUnassignAfterUninstall?: boolean;
+}
+
+/**
+ * One programme's terms as they stood from an instant onwards.
+ *
+ * `effectiveFrom` is an ISO-8601 instant, and a version applies to every charge
+ * at or after it until the next version begins.
+ */
+export interface EffectiveRules extends ProgramRules {
+  effectiveFrom: string;
+}
+
+/**
+ * A programme's terms over time.
+ *
+ * The engine used to be handed one `ProgramRules` per programme, which encoded
+ * an assumption nobody stated: that a programme's terms are a property of *now*
+ * rather than of the charge being priced. That was true while terms could only
+ * be changed by editing a row by hand, and it stops being true the moment an
+ * operator can edit a rate from a dashboard — every historical commission would
+ * then re-price itself on the next sync, and the reconciliation report, whose
+ * whole job is to surface a handful of real discrepancies, would fill with
+ * differences that are not real.
+ *
+ * So a programme is a *timeline*, and the rule that applies to a charge is the
+ * one in force when that charge occurred.
+ */
+export interface ProgramRuleTimeline {
+  id: string;
+  /** At least one, ordered oldest first. */
+  versions: EffectiveRules[];
+}
+
+/**
+ * What the engine accepts per programme: a timeline, or a single set of rules.
+ *
+ * Both, deliberately. A single `ProgramRules` means "these terms, for all
+ * time", which is exactly right for the two callers that are replaying history
+ * against a fixed rule — `commissionReplay.ts` proving the engine against the
+ * migrated ledger, and every unit test that is testing arithmetic rather than
+ * versioning. Forcing those to wrap a one-element array would add ceremony to
+ * the places that most need to stay readable.
+ */
+export type ProgramRuleEntry = ProgramRules | ProgramRuleTimeline;
+
+function isTimeline(entry: ProgramRuleEntry): entry is ProgramRuleTimeline {
+  return Array.isArray((entry as ProgramRuleTimeline).versions);
+}
+
+/**
+ * The terms in force at an instant.
+ *
+ * A charge **earlier than the first version** resolves to that first version
+ * rather than to nothing. There is no such thing as an unpriced commission: a
+ * charge that fell before any recorded terms is a gap in the *records*, not
+ * evidence that the programme paid zero that day, and returning null here would
+ * turn it into a silent skip with no reason attached. The migration seeds every
+ * existing programme's first version at its `created_at`, so this branch only
+ * fires for a charge that predates the programme itself.
+ */
+export function rulesAt(entry: ProgramRuleEntry, instant: string): ProgramRules {
+  if (!isTimeline(entry)) return entry;
+  // A timeline with no versions is a construction error, not a data state:
+  // `timelinesFromPrograms` synthesises one from the program's own columns
+  // rather than emit an empty list, precisely so this cannot happen. Refusing
+  // loudly beats pricing a charge at zero and calling it a commission.
+  let chosen = entry.versions[0];
+  if (!chosen) throw new Error(`Program ${entry.id} has no terms to price against.`);
+  for (const version of entry.versions) {
+    if (version.effectiveFrom <= instant) chosen = version;
+    else break;
+  }
+  return chosen;
+}
+
+/** Every rule a programme could apply, for callers deciding what to load. */
+export function allRuleVersions(entry: ProgramRuleEntry): ProgramRules[] {
+  return isTimeline(entry) ? entry.versions : [entry];
+}
+
+/** The optional rules, with their documented defaults applied exactly once. */
+function resolved(rules: ProgramRules): {
+  payoutBasis: PayoutBasis;
+  recurrence: Recurrence;
+  flatAmount: number;
+  flatCurrency: string;
+} {
+  return {
+    payoutBasis: rules.payoutBasis ?? 'percent_of_gross',
+    recurrence: rules.recurrence ?? 'recurring',
+    flatAmount: rules.flatAmount ?? 0,
+    flatCurrency: rules.flatCurrency ?? '',
+  };
 }
 
 export interface ComputedCommission {
@@ -127,18 +298,31 @@ export interface ComputedCommission {
   transactionId: string;
   appId: string;
   shopId: string;
-  /** Rounded to cents. Mantle stored raw floats; see `roundToCents`. */
+  /** Rounded to cents. See `roundToCents`. */
   amount: number;
   /** Carried through so a diff can report what a commission was earned on. */
   grossAmount: number;
+  /**
+   * The currency the commission is *in*, which is the charge's for a percentage
+   * and the bounty's for a flat amount. Not always the charge's currency.
+   */
   currency: string;
+  /**
+   * The percentage this was priced at, or null for a flat bounty.
+   *
+   * Emitted by the engine rather than looked up by the writer. The writer used
+   * to read the rate off the programme's *current* rules while the amount came
+   * from the engine — harmless while a programme had one set of terms forever,
+   * and a row that contradicts itself the moment terms are versioned.
+   */
+  rate: number | null;
   occurredAt: string;
 }
 
 /**
  * Why a transaction earned nothing. Kept as data rather than dropped silently,
- * because "we paid less than Mantle did" is only answerable if the engine can
- * say which gate closed.
+ * because "this paid less than the platform it replaced" is only answerable if
+ * the engine can say which gate closed.
  */
 export type SkipReason =
   | 'unattributed'
@@ -147,7 +331,16 @@ export type SkipReason =
   | 'before_referral'
   | 'after_duration_window'
   | 'after_uninstall_grace'
-  | 'after_unassignment';
+  | 'after_unassignment'
+  /**
+   * The referral has already earned, and this programme pays once.
+   *
+   * Distinct from `after_duration_window` on purpose, even though both mean
+   * "too late": a duration window is a date somebody can argue about, and this
+   * is the programme's shape. An affiliate asking why a second charge earned
+   * nothing deserves the second answer, not the first.
+   */
+  | 'after_first_charge';
 
 export interface SkippedTransaction {
   transactionId: string;
@@ -173,11 +366,10 @@ const MS_PER_DAY = 86_400_000;
 /**
  * Money is decided in cents and only then expressed as a float.
  *
- * Mantle's export carries values like `251.8000000000001`, which is what
- * happens when a rate is applied in binary floating point and stored raw. We
- * are not going to reproduce that noise, and we are not going to let it count
- * as disagreement either — the validation harness compares with a cent
- * tolerance for exactly this reason.
+ * A ledger built by applying a rate in binary floating point and storing the
+ * result raw carries values like `251.8000000000001`. That noise is not
+ * reproduced here, and it is not allowed to count as disagreement either — the
+ * validation harness compares with a cent tolerance for exactly this reason.
  */
 export function roundToCents(amount: number): number {
   return Math.round(amount * 100) / 100;
@@ -232,7 +424,7 @@ function attributionKey(appId: string, shopId: string): string {
 export function computeCommissions(
   transactions: CommissionTransaction[],
   attributions: CommissionAttribution[],
-  rulesByProgram: Map<string, ProgramRules>,
+  rulesByProgram: Map<string, ProgramRuleEntry>,
 ): CommissionRun {
   const byShop = new Map<string, CommissionAttribution[]>();
   for (const attribution of attributions) {
@@ -265,8 +457,13 @@ export function computeCommissions(
     }
 
     for (const attribution of candidates) {
-      const rules = rulesByProgram.get(attribution.programId);
-      if (!rules) continue;
+      const entry = rulesByProgram.get(attribution.programId);
+      if (!entry) continue;
+
+      // The terms in force when this charge happened, not the terms in force
+      // now. This one line is what stops an edited rate restating history.
+      const rules = rulesAt(entry, transaction.occurredAt);
+      const { payoutBasis, recurrence, flatAmount, flatCurrency } = resolved(rules);
 
       const skip = (reason: SkipReason): void => {
         skipped.push({
@@ -283,10 +480,10 @@ export function computeCommissions(
         continue;
       }
 
-      // Credits and downgrade adjustments arrive as subscription sales with a
-      // negative gross. Mantle never wrote a negative commission — the smallest
-      // across the whole ledger is $0.38 — so a clawback would be a change in policy, not
-      // a fix. We follow the ledger and let them pass without earning.
+      // Credits and downgrade adjustments arrive as sales with a negative
+      // gross. A negative commission takes money back from somebody who has
+      // usually already been paid it, so a clawback is a change in policy
+      // rather than a fix. They pass without earning.
       if (transaction.grossAmount <= 0) {
         skip('non_positive_gross');
         continue;
@@ -334,11 +531,36 @@ export function computeCommissions(
           }
         }
       }
+      /*
+       * A programme that pays once has now been paid, if it ever was.
+       *
+       * Checked after every other gate for the same reason the duration gate
+       * is: a charge that fails an earlier test must not be able to consume a
+       * referral's one payment. A usage charge on a subscription-only bounty
+       * programme would otherwise spend the bounty and earn nothing with it.
+       *
+       * `windowStart` already records the first *earning* instant per referral,
+       * because the duration cap needs it, so "has this referral earned yet" is
+       * a question the engine could already answer.
+       */
+      const earnsOnlyOnce = payoutBasis === 'flat_per_referral' || recurrence === 'first_charge_only';
+      if (earnsOnlyOnce && windowStart.has(attribution.id)) {
+        skip('after_first_charge');
+        continue;
+      }
+
       if (!windowStart.has(attribution.id)) {
         windowStart.set(attribution.id, transaction.occurredAt);
       }
 
-      currencies.add(transaction.currency);
+      // A percentage is denominated by the charge it is a share of; a bounty is
+      // denominated by whoever typed it. Both land in `currencies`, so a
+      // programme paying a dollar bounty on a euro charge shows up as the
+      // two-currency total it is rather than being quietly added together.
+      const flat = payoutBasis === 'flat_per_referral';
+      const currency = flat ? flatCurrency || transaction.currency : transaction.currency;
+      currencies.add(currency);
+
       commissions.push({
         attributionId: attribution.id,
         affiliateId: attribution.affiliateId,
@@ -346,9 +568,12 @@ export function computeCommissions(
         transactionId: transaction.id,
         appId: transaction.appId,
         shopId: transaction.shopId,
-        amount: commissionAmount(transaction.grossAmount, rules.percentCommission),
+        amount: flat
+          ? roundToCents(flatAmount)
+          : commissionAmount(transaction.grossAmount, rules.percentCommission),
         grossAmount: transaction.grossAmount,
-        currency: transaction.currency,
+        currency,
+        rate: flat ? null : rules.percentCommission,
         occurredAt: transaction.occurredAt,
       });
     }

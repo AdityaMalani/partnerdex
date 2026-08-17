@@ -1,5 +1,6 @@
 import Database from 'better-sqlite3';
 import fs from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { getConfig, primaryEnvOrg } from '../config.js';
 import { ADD_APP_CLICK_EVENT, LISTING_VIEW_EVENT } from '../bigquery/events.js';
@@ -321,6 +322,151 @@ function migrate(db: Db): void {
   const programs = columns('affiliate_programs');
   if (programs.size > 0 && !programs.has('listing_url')) {
     db.exec(`ALTER TABLE affiliate_programs ADD COLUMN listing_url TEXT NOT NULL DEFAULT ''`);
+  }
+
+  /*
+   * Programs learned the terms they could not previously express, and learned
+   * to remember the terms they used to have.
+   *
+   * Two halves, and the second is the one that decides money.
+   *
+   * The columns are ordinary additive migration. Every default is the
+   * behaviour that already existed, so a database that never opens the new
+   * screen computes exactly what it computed yesterday. One of them deserves
+   * its own sentence:
+   *
+   *   `enforce_unassign_after_uninstall` defaults to **1**, because that is
+   *   what the code does. `rulesFromPrograms()` passed
+   *   `enforceUnassignAfterUninstall: true` unconditionally, so every program
+   *   in every database already releases referrals after the grace period,
+   *   whatever `ProgramRules` documents about the flag defaulting off. Seeding
+   *   this to 0 would have been reading the documentation instead of the
+   *   behaviour, and would have quietly kept paying on merchants who left —
+   *   changing what every affiliate earns, on a column nobody knew existed.
+   */
+  if (programs.size > 0) {
+    const addProgramColumn = (name: string, definition: string): void => {
+      if (!programs.has(name)) {
+        db.exec(`ALTER TABLE affiliate_programs ADD COLUMN ${name} ${definition}`);
+      }
+    };
+    addProgramColumn('payout_basis', `TEXT NOT NULL DEFAULT 'percent_of_gross'`);
+    addProgramColumn('flat_amount', 'REAL NOT NULL DEFAULT 0');
+    addProgramColumn('flat_currency', `TEXT NOT NULL DEFAULT ''`);
+    addProgramColumn('recurrence', `TEXT NOT NULL DEFAULT 'recurring'`);
+    addProgramColumn('enforce_unassign_after_uninstall', 'INTEGER NOT NULL DEFAULT 1');
+    addProgramColumn('minimum_payout', 'REAL NOT NULL DEFAULT 0');
+    addProgramColumn('terms_url', `TEXT NOT NULL DEFAULT ''`);
+  }
+
+  /*
+   * The terms table itself, and the index that orders it.
+   *
+   * Both unconditional and idempotent, and the index is deliberately not left
+   * to the schema block alone: the schema block runs first and would name
+   * `affiliate_program_terms` before this ran on a database that has it, which
+   * is harmless, but the reverse — an index created only inside a "table is
+   * missing" branch — leaves a *new* database without it forever. Same trap as
+   * `idx_aff_comm_payout` above, same shape of answer.
+   */
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS affiliate_program_terms (
+      id                            TEXT PRIMARY KEY,
+      program_id                    TEXT NOT NULL REFERENCES affiliate_programs (id) ON DELETE CASCADE,
+      effective_from                TEXT NOT NULL,
+      payout_basis                  TEXT NOT NULL DEFAULT 'percent_of_gross',
+      commission_rate               REAL NOT NULL DEFAULT 0,
+      flat_amount                   REAL NOT NULL DEFAULT 0,
+      flat_currency                 TEXT NOT NULL DEFAULT '',
+      revenue_components            TEXT NOT NULL DEFAULT '["subscription"]',
+      recurrence                    TEXT NOT NULL DEFAULT 'recurring',
+      duration_months               INTEGER,
+      unassign_after_uninstall_days INTEGER,
+      enforce_unassign_after_uninstall INTEGER NOT NULL DEFAULT 1,
+      minimum_payout                REAL NOT NULL DEFAULT 0,
+      terms_url                     TEXT NOT NULL DEFAULT '',
+      note                          TEXT NOT NULL DEFAULT '',
+      created_at                    TEXT NOT NULL
+    ) WITHOUT ROWID
+  `);
+  db.exec(
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_aff_program_terms_effective
+       ON affiliate_program_terms (program_id, effective_from)`,
+  );
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS affiliate_attribution_settings (
+      id              INTEGER PRIMARY KEY CHECK (id = 1),
+      touch           TEXT NOT NULL DEFAULT 'first',
+      window_days     INTEGER NOT NULL DEFAULT 30,
+      parameters      TEXT NOT NULL DEFAULT '["mref","utm_source","ref"]',
+      click_hosts     TEXT NOT NULL DEFAULT '["apps.shopify.com"]',
+      conflict_policy TEXT NOT NULL DEFAULT 'manual_review',
+      updated_at      TEXT NOT NULL
+    )
+  `);
+
+  /*
+   * Every existing program gets its first version, carrying exactly what it
+   * pays today.
+   *
+   * `effective_from` is the program's own `created_at`, not now: a version
+   * stamped today would leave every charge before today resolving to the
+   * "earlier than the first version" branch in `rulesAt`, which works but
+   * records the wrong story. Backdating to creation says what is true — these
+   * were the terms for the whole life of the program.
+   *
+   * Guarded on the program having no versions at all rather than on a schema
+   * shape, so it is idempotent, it self-heals for a program created between two
+   * releases, and it never overwrites an operator's edit.
+   */
+  const programsNeedingTerms = db
+    .prepare(
+      `SELECT id, commission_rate, revenue_components, duration_months,
+              unassign_after_uninstall_days, created_at
+         FROM affiliate_programs
+        WHERE NOT EXISTS (
+          SELECT 1 FROM affiliate_program_terms t WHERE t.program_id = affiliate_programs.id
+        )`,
+    )
+    .all() as Array<{
+    id: string;
+    commission_rate: number;
+    revenue_components: string;
+    duration_months: number | null;
+    unassign_after_uninstall_days: number | null;
+    created_at: string;
+  }>;
+
+  if (programsNeedingTerms.length > 0) {
+    const insert = db.prepare(
+      `INSERT INTO affiliate_program_terms
+         (id, program_id, effective_from, payout_basis, commission_rate, flat_amount,
+          flat_currency, revenue_components, recurrence, duration_months,
+          unassign_after_uninstall_days, enforce_unassign_after_uninstall,
+          minimum_payout, terms_url, note, created_at)
+       VALUES
+         (@id, @programId, @effectiveFrom, 'percent_of_gross', @rate, 0,
+          '', @components, 'recurring', @durationMonths,
+          @unassignDays, 1,
+          0, '', @note, @createdAt)`,
+    );
+    const now = new Date().toISOString();
+    db.transaction(() => {
+      for (const program of programsNeedingTerms) {
+        insert.run({
+          id: randomUUID(),
+          programId: program.id,
+          effectiveFrom: program.created_at,
+          rate: program.commission_rate,
+          components: program.revenue_components,
+          durationMonths: program.duration_months,
+          unassignDays: program.unassign_after_uninstall_days,
+          note: 'Terms as they stood when versioning was introduced.',
+          createdAt: now,
+        });
+      }
+    })();
   }
 
   /*

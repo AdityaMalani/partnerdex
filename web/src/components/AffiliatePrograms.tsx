@@ -122,7 +122,12 @@ function ProgramCard({
                     : `${program.unassignAfterUninstallDays} days`
               }
             />
-            <Term label="Refunds" value="Commission on a refunded charge is withdrawn" />
+            {/* Said as what the engine does, not as what a programme sounds
+                like it should do. A refund arrives as a sale with negative
+                gross and is skipped; no negative commission is ever written,
+                and no earned commission is reversed. The previous wording
+                promised a clawback this system deliberately does not perform. */}
+            <Term label="Refunds" value="Earn nothing; earned commission is not reversed" />
             <Term
               label="Listing"
               value={

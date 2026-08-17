@@ -76,8 +76,8 @@ export interface ClaimSummary {
    *
    * Null when the merchant is credited to nobody, when the claim names no
    * domain, or when the claim's program differs from the live referral's — a
-   * merchant can be credited on Stoq and unclaimed on Filemonk, and those are
-   * separate facts.
+   * merchant can be credited on one program and unclaimed on another, and those
+   * are separate facts.
    */
   attributedAffiliateId: string | null;
   attributedAffiliateName: string | null;
@@ -656,9 +656,9 @@ export interface SubmittedClaim {
  *   3. a merchant already attributed to a *different* affiliate.
  *
  * If case 3 answered differently from case 1, this becomes a lookup service for
- * "which of these stores uses Stoq, and which partner owns them" — competitive
- * intelligence about our merchants and our partners, extractable at one request
- * per store by anybody we approved as an affiliate.
+ * "which of these stores runs this app, and which partner owns them" —
+ * competitive intelligence about the operator's merchants and partners,
+ * extractable at one request per store by anybody approved as an affiliate.
  *
  * How that is guaranteed, structurally rather than by care:
  *

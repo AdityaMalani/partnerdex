@@ -1,7 +1,6 @@
 import express from 'express';
 import { getDb, type Db } from '../db/index.js';
 import { HANDLE_SHAPE } from '../affiliates/ga4Attribution.js';
-import { knownListingUrl } from '../affiliates/listings.js';
 
 /**
  * `GET /r/:handle` — the affiliate link itself.
@@ -71,36 +70,30 @@ export function resetRateLimit(): void {
  * Which listing a program points at, in decreasing order of who said so.
  *
  * `app_listings` first: that is the operator's own mapping, entered on the App
- * listings page, and it outranks anything inferred. Then the program's own
- * `listing_url`, written by the import — which is how a program whose app has
- * not synced yet still has a link, since `app_listings` is keyed on an app id it
- * does not have. Then the compiled-in floor, which is two slugs.
+ * listings page, and it outranks anything else. Then the program's own
+ * `listing_url`, which is how a program whose app has not synced yet still has
+ * a link, since `app_listings` is keyed on an app id it does not have.
+ *
+ * There is no third source, and that is the point. A slug inferred from a
+ * program's name sends a visitor to a page that may not exist, or to somebody
+ * else's app, and does it silently — the click is spent, the install is
+ * credited to the wrong program, and nothing anywhere says so. Null is the
+ * honest answer, and the route decides what to do with it.
  */
 export function listingUrlForProgram(db: Db, programId: string): string | null {
   const program = db
     .prepare(
-      `SELECT p.app_id AS appId, p.name AS programName, p.listing_url AS programListingUrl,
-              COALESCE(app.name, '') AS appName,
+      `SELECT p.listing_url AS programListingUrl,
               (SELECT url FROM app_listings WHERE app_id = p.app_id) AS listingUrl
          FROM affiliate_programs p
-         LEFT JOIN apps app ON app.id = p.app_id
         WHERE p.id = ?`,
     )
     .get(programId) as
-    | {
-        appId: string;
-        programName: string;
-        programListingUrl: string;
-        appName: string;
-        listingUrl: string | null;
-      }
+    | { programListingUrl: string; listingUrl: string | null }
     | undefined;
   if (!program) return null;
 
-  if (program.listingUrl) return program.listingUrl;
-  if (program.programListingUrl) return program.programListingUrl;
-
-  return knownListingUrl(`${program.programName} ${program.appName}`) || null;
+  return program.listingUrl || program.programListingUrl || null;
 }
 
 /**
@@ -156,12 +149,12 @@ export function destinationFor(
    * Unknown, or known with no listing mapped anywhere.
    *
    * The click is still real, so it is worth serving — but only if there is one
-   * possible answer. With two listings mapped there is no way to tell whether a
-   * legacy Stoq code or a legacy Filemonk code just arrived, and guessing sends
-   * a visitor to install the wrong app: a worse outcome than the 404, and one
-   * that would go on to attribute an install nobody asked for. So a single
-   * mapped listing is followed and an ambiguous one is refused — after the log
-   * line, which is what actually preserves the referral for reattribution.
+   * possible answer. With a second listing mapped there is no way to tell which
+   * app a legacy code belonged to, and guessing sends a visitor to install the
+   * wrong one: a worse outcome than the 404, and one that would go on to
+   * attribute an install nobody asked for. So a single mapped listing is
+   * followed and anything more is refused — after the log line, which is what
+   * actually preserves the referral for reattribution.
    */
   const listings = db.prepare('SELECT url FROM app_listings ORDER BY app_id LIMIT 2').all() as
     | Array<{ url: string }>;
