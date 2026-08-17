@@ -1,8 +1,4 @@
-/**
- * The App Store's host. Local for now; the attribution reader takes ownership
- * of it once it exists, since that is where it is load-bearing.
- */
-const LISTING_HOST = 'apps.shopify.com';
+import { LISTING_HOST } from './ga4Attribution.js';
 
 /**
  * Which App Store page each program's links point at, when nobody has said.
