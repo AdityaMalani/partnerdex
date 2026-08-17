@@ -126,7 +126,7 @@ export interface PartnerOrg {
 }
 
 /** The one place the endpoint URL template exists. */
-function endpointFor(organizationId: string, apiVersion: string): string {
+export function endpointFor(organizationId: string, apiVersion: string): string {
   return `https://partners.shopify.com/${organizationId}/api/${apiVersion}/graphql.json`;
 }
 
@@ -139,7 +139,20 @@ function apiVersion(): string {
 }
 
 /**
- * Every configured organization, in priority order. Never empty.
+ * Every organization named by the environment, in priority order. May be empty.
+ *
+ * This list is the **seed**, not the answer. Organizations live in the
+ * `organizations` table now; `getDb()` inserts anything here that the table does
+ * not already have, and the table wins from then on — see
+ * `seedOrganizationsFromEnv`. Everything that opens a Partner endpoint reads
+ * `activeOrgs()`, never this.
+ *
+ * Empty is legal, and that is the change an existing deployment cannot see but a
+ * new one depends on: an install with no secrets set has to boot far enough to
+ * serve the page you add an organization on. The old refusal — "Missing required
+ * environment variable PARTNER_ORGANIZATION_ID" at `getConfig()` — has moved to
+ * where the question can actually be answered, which is after the table has been
+ * consulted. `requireOrgs()` in the sync raises it there, with the same advice.
  *
  * Two forms, and they **combine** rather than override, because the combination
  * is the migration path:
@@ -227,10 +240,6 @@ function partnerOrgs(version: string): PartnerOrg[] {
     );
   }
 
-  // The original message, unchanged, for the original mistake: an instance with
-  // no organization at all.
-  if (orgs.length === 0) required('PARTNER_ORGANIZATION_ID');
-
   return orgs;
 }
 
@@ -292,13 +301,15 @@ export interface Config {
   partner: {
     apiVersion: string;
     /**
-     * Every configured organization. Never empty; `orgs[0]` is the primary.
+     * The organizations the *environment* names, which is the bootstrap path
+     * and nothing more. May be empty. The live set is `activeOrgs()`, read from
+     * the `organizations` table.
      *
-     * There is deliberately no `organizationId`/`token`/`endpoint` beside this
-     * any more. A convenience "default org" on the config object is exactly the
-     * silent fallback this whole change exists to remove: a caller that forgot
-     * to say which org it meant would keep compiling and write one org's data
-     * under the other org's app.
+     * There is deliberately no `organizationId`/`token`/`endpoint` beside this.
+     * A convenience "default org" on the config object is exactly the silent
+     * fallback this whole change exists to remove: a caller that forgot to say
+     * which org it meant would keep compiling and write one org's data under
+     * the other org's app.
      */
     orgs: PartnerOrg[];
   };
@@ -408,23 +419,29 @@ export function getConfig(): Config {
 }
 
 /**
- * The primary organization — `orgs[0]`.
+ * The primary environment organization — `orgs[0]` — or null when the
+ * environment names none.
  *
  * Exactly one thing is allowed to use this: the `apps.org_id` backfill, which
  * is answering "which org did the rows in this database, synced when only one
  * org could be configured, come from?". It is not a default for API calls. Use
- * `getOrg` when you have an id, and take a `PartnerOrg` parameter otherwise.
+ * `activeOrg` when you have an id, and take a `PartnerOrg` parameter otherwise.
+ *
+ * Null is a real answer now that the environment is optional, and the backfill
+ * handles it by leaving the column blank rather than guessing — see `migrate()`.
  */
+export function primaryEnvOrg(): PartnerOrg | null {
+  return getConfig().partner.orgs[0] ?? null;
+}
+
+/** The same, for callers that treat "no environment organization" as an error. */
 export function getPrimaryOrg(): PartnerOrg {
-  const [first] = getConfig().partner.orgs;
-  // `partnerOrgs` refuses to return an empty list, so this is unreachable — it
-  // exists because `noUncheckedIndexedAccess` is on and a non-null assertion
-  // here would be the one place a config bug turned into `undefined.token`.
+  const first = primaryEnvOrg();
   if (!first) throw new ConfigError('No Shopify Partner organization is configured.');
   return first;
 }
 
-/** Credentials for a known organization id, refused rather than guessed. */
+/** Credentials for a known *environment* organization id, refused rather than guessed. */
 export function getOrg(organizationId: string): PartnerOrg {
   const match = getConfig().partner.orgs.find(
     (org) => org.organizationId === organizationId,

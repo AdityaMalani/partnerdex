@@ -10,6 +10,7 @@ import {
   getConfig,
   getOrg,
   getPrimaryOrg,
+  primaryEnvOrg,
   resetConfig,
   type PartnerOrg,
 } from '../src/config.js';
@@ -128,16 +129,25 @@ describe('configuring organizations', () => {
     });
   });
 
-  /** The original error for the original mistake, unchanged. */
-  it('refuses to start with no organization at all', () => {
+  /**
+   * An environment that names no organization is legal now, and that is the
+   * change: organizations live in a table, and an install has to boot far
+   * enough to serve the page you add one on. The refusal has not gone — it has
+   * moved to where the question can be answered, which is after the table has
+   * been read. See `test/organizations.test.ts`, "an instance with nothing
+   * configured".
+   */
+  it('allows an environment that names no organization', () => {
     resetEnvironment();
     delete process.env.PARTNER_ORGANIZATION_ID;
+    delete process.env.PARTNER_API_TOKEN;
     resetConfig();
-    assert.throws(() => getConfig(), (error: unknown) => {
-      assert.ok(error instanceof ConfigError);
-      assert.match(error.message, /PARTNER_ORGANIZATION_ID/);
-      return true;
-    });
+
+    assert.deepEqual(getConfig().partner.orgs, []);
+    // And the primary is null rather than a throw, which is what lets the
+    // `apps.org_id` backfill decline to guess.
+    assert.equal(primaryEnvOrg(), null);
+    assert.throws(() => getPrimaryOrg(), ConfigError);
   });
 
   /**

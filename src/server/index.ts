@@ -24,6 +24,7 @@ import { sendError } from './errors.js';
 import { notificationsRouter } from './notifications.js';
 import { listingsRouter } from './listings.js';
 import { bigqueryRouter } from './bigquery.js';
+import { organizationsRouter } from './organizations.js';
 import { listAppSources } from '../bigquery/connection.js';
 import { funnelReport } from '../metrics/reports/funnel.js';
 
@@ -39,6 +40,7 @@ function queryOf(request: express.Request): RawMetricQuery {
     end: pick('end'),
     interval: pick('interval'),
     appIds: pick('appIds'),
+    orgId: pick('orgId'),
     includeAnnual: pick('includeAnnual'),
     includeUsage: pick('includeUsage'),
     includeTrials: pick('includeTrials'),
@@ -48,9 +50,32 @@ function queryOf(request: express.Request): RawMetricQuery {
   };
 }
 
+/**
+ * The organization a request is scoped to, or undefined for all of them.
+ *
+ * One reading of the parameter, shared by every route that resolves its own app
+ * scope, so `?orgId=` cannot mean one thing on the customer list and another on
+ * the funnel. Empty is normalized to undefined here rather than downstream:
+ * `resolveScopedAppIds(db, '')` would ask for the apps of an organization whose
+ * id is the empty string, which is a different question from "every app".
+ */
+function orgOf(request: express.Request): string | undefined {
+  const value = request.query.orgId;
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
 export function createApp(): express.Express {
   const app = express();
   app.disable('x-powered-by');
+
+  /*
+   * An organization as a list of app ids, for the routes that take an app list
+   * rather than a metric query. An empty list means "every app" to all of them,
+   * which is exactly what an absent organization should mean — so this returns
+   * one, and only narrows when an organization really was named.
+   */
+  const orgScope = (orgId: string | undefined): string[] =>
+    orgId === undefined ? [] : resolveScopedAppIds(getDb(), orgId);
 
   // Behind a TLS-terminating proxy the request arrives as plain HTTP, so
   // `request.protocol` reads "http" and the session cookie would ship without
@@ -83,6 +108,12 @@ export function createApp(): express.Express {
   app.use('/api/notifications', notificationsRouter());
   app.use('/api/listings', listingsRouter());
   app.use('/api/bigquery', bigqueryRouter());
+  /*
+   * Organization management, inside the same gate and for a stronger reason
+   * than most of what is in here: it holds live Partner API credentials, and a
+   * request that reached it could point one at an organization of its choosing.
+   */
+  app.use('/api/organizations', organizationsRouter());
 
   /**
    * The install funnel.
@@ -103,10 +134,10 @@ export function createApp(): express.Express {
    * entry, because summing across apps puts one app's visitors above several
    * apps' installs and produces a conversion rate over 100%.
    */
-  app.get('/api/funnel/apps', (_request, response) => {
+  app.get('/api/funnel/apps', (request, response) => {
     try {
       const db = getDb();
-      const apps = listAppSources(resolveScopedAppIds(db), db)
+      const apps = listAppSources(resolveScopedAppIds(db, orgOf(request)), db)
         .filter((source) => source.dataset !== null)
         .map((source) => ({
           id: source.appId,
@@ -133,7 +164,10 @@ export function createApp(): express.Express {
           start: pick('start'),
           end: pick('end'),
           granularity: pick('granularity'),
-          appIds: pick('appIds'),
+          // The funnel is always about one app, so the organization only ever
+          // narrows the list the picker offered — it cannot change the answer
+          // for an app that was named explicitly.
+          appIds: pick('appIds') || orgScope(orgOf(request)).join(','),
           nocache: pick('nocache'),
         }),
       );
@@ -157,10 +191,10 @@ export function createApp(): express.Express {
    * `orgId` rides along so the UI can *label* an app's organization without
    * anything being scoped by it.
    */
-  app.get('/api/apps', (_request, response) => {
+  app.get('/api/apps', (request, response) => {
     try {
       const db = getDb();
-      const scoped = resolveScopedAppIds(db);
+      const scoped = resolveScopedAppIds(db, orgOf(request));
       if (scoped.length === 0) {
         response.json({ apps: [] });
         return;
@@ -307,7 +341,12 @@ export function createApp(): express.Express {
           sort: (pick('sort') ?? 'mrr') as CustomerSort,
           limit: Number.isFinite(limit) ? limit : undefined,
           offset: Number.isFinite(offset) ? offset : undefined,
-          appIds: appIds ? appIds.split(',').filter(Boolean) : [],
+          // An explicit app list wins; otherwise the organization, if one was
+          // named; otherwise every app, which is the behaviour this route has
+          // always had and the one an untouched dashboard still gets.
+          appIds: appIds
+            ? appIds.split(',').filter(Boolean)
+            : orgScope(orgOf(request)),
         }),
       );
     } catch (error) {
@@ -319,7 +358,7 @@ export function createApp(): express.Express {
     try {
       const appIds = typeof request.query.appIds === 'string' ? request.query.appIds : '';
       const detail = getCustomer(request.params.shopId, {
-        appIds: appIds ? appIds.split(',').filter(Boolean) : [],
+        appIds: appIds ? appIds.split(',').filter(Boolean) : orgScope(orgOf(request)),
       });
       if (!detail) {
         response.status(404).json({ error: `No customer with shop id ${request.params.shopId}.` });
@@ -349,7 +388,7 @@ export function createApp(): express.Express {
       response.json(
         listReviews({
           search: pick('q') ?? '',
-          appIds: appIds ? appIds.split(',').filter(Boolean) : [],
+          appIds: appIds ? appIds.split(',').filter(Boolean) : orgScope(orgOf(request)),
           rating: Number.isInteger(rating) && rating >= 1 && rating <= 5 ? rating : null,
           status: (pick('status') ?? 'all') as ReviewStatusFilter,
           linked: (pick('linked') ?? 'all') as ReviewLinkFilter,

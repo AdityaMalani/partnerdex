@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { ConfigError, getConfig } from './config.js';
 import { getDb } from './db/index.js';
+import { activeOrgs } from './orgs/registry.js';
 import { partnerQuery, PartnerApiError } from './partner/client.js';
 import { HEALTHCHECK_QUERY } from './partner/queries.js';
 import { dispatchPending } from './notifications/dispatch.js';
@@ -38,9 +39,17 @@ function parseFlags(argv: string[]): Record<string, string> {
 
 async function doctor(): Promise<void> {
   const config = getConfig();
+  // Opened before the organizations are read, because opening is what seeds the
+  // table from the environment. `doctor` reporting a different list from the one
+  // the sync would use is exactly the confusion it exists to prevent.
+  const store = getDb();
+  const orgs = activeOrgs(store);
   console.log('Configuration');
   console.log(`  Partner API version   ${config.partner.apiVersion}`);
-  for (const org of config.partner.orgs) {
+  if (orgs.length === 0) {
+    console.log('  Organization          none configured');
+  }
+  for (const org of orgs) {
     const label = org.label === org.organizationId ? '' : ` (${org.label})`;
     console.log(`  Organization          ${org.organizationId}${label}`);
   }
@@ -64,7 +73,7 @@ async function doctor(): Promise<void> {
    */
   console.log('\nPartner API reachability');
   let unreachable = 0;
-  for (const org of config.partner.orgs) {
+  for (const org of orgs) {
     process.stdout.write(`  ${org.label.padEnd(22)}`);
     try {
       await partnerQuery(org, HEALTHCHECK_QUERY);
@@ -75,7 +84,7 @@ async function doctor(): Promise<void> {
     }
   }
 
-  const db = getDb();
+  const db = store;
   const counts = db
     .prepare(
       `SELECT

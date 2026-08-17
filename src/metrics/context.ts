@@ -20,6 +20,21 @@ export interface RawMetricQuery {
   end?: string;
   interval?: string;
   appIds?: string;
+  /**
+   * Narrow every figure to one Shopify Partner organization.
+   *
+   * Absent or empty means every organization this instance covers, which is
+   * what `resolveScopedAppIds` has always answered and what every reader —
+   * dashboard, metrics, funnel, notifier, affiliate ledger — depends on. A
+   * reader who never touches the selector sees exactly the figures they saw
+   * before it existed.
+   *
+   * It resolves to a set of app ids and then leaves, which is what keeps it
+   * cheap and correct: the whole metric layer already filters on app ids, and
+   * the cache key is built from the resolved list, so two ways of asking the
+   * same question share one cached answer.
+   */
+  orgId?: string;
   includeAnnual?: string;
   includeUsage?: string;
   includeTrials?: string;
@@ -205,7 +220,13 @@ export function buildContext(query: RawMetricQuery, now?: Date): MetricContext {
   const db = getDb();
   const { runtime, scope, reporting } = getConfig();
 
-  const inScope = resolveScopedAppIds(db);
+  // `resolveScopedAppIds` takes the organization or takes nothing; nothing is
+  // still "everything this instance covers". An organization with no apps
+  // resolves to an empty scope, which reads as zero rather than as everything —
+  // correct, and the reason the empty string is normalized away here rather
+  // than passed through.
+  const orgId = query.orgId?.trim() || undefined;
+  const inScope = resolveScopedAppIds(db, orgId);
   let appIds = inScope;
 
   if (query.appIds) {
@@ -218,7 +239,8 @@ export function buildContext(query: RawMetricQuery, now?: Date): MetricContext {
     const outside = requested.filter((id) => !inScope.includes(id));
     if (outside.length > 0) {
       throw new MetricRequestError(
-        `Requested app id(s) outside the configured reporting scope: ${outside.join(', ')}.`,
+        `Requested app id(s) outside the configured reporting scope: ${outside.join(', ')}.` +
+          (orgId ? ` Scope is organization ${orgId}.` : ''),
         403,
       );
     }

@@ -1,5 +1,6 @@
 import { getConfig, type PartnerOrg } from '../config.js';
 import { getDb, readSyncState, writeSyncState, type Db } from '../db/index.js';
+import { activeOrgs } from '../orgs/registry.js';
 import { paginate, partnerQuery } from '../partner/client.js';
 import {
   APP_EVENTS_QUERY,
@@ -453,8 +454,21 @@ export async function runSync(options: SyncOptions = {}): Promise<SyncResult> {
 
 async function runSyncReported(options: SyncOptions, reporter: SyncReporter): Promise<SyncResult> {
   const db = getDb();
-  const { partner, scope } = getConfig();
-  const orgs = partner.orgs;
+  const { scope } = getConfig();
+
+  /*
+   * The organizations to visit, read from the table rather than the
+   * environment. `getDb()` has already seeded it from `PARTNER_ORG_<n>_*`, so a
+   * deployment that has never opened the dashboard sees exactly the list it
+   * always did.
+   *
+   * An empty list is a state, not a failure: an install that has not been given
+   * an organization yet still has reviews, listing traffic and a rebuild to run,
+   * and taking the whole pass down would leave the
+   * dashboard with nothing on it *and* no way to fix that from the dashboard.
+   * It is said once, on the progress channel, and the run carries on.
+   */
+  const orgs = activeOrgs(db);
 
   /*
    * Every step below is handed the reporter's own callback rather than the
@@ -480,6 +494,13 @@ async function runSyncReported(options: SyncOptions, reporter: SyncReporter): Pr
    * and still backs off.
    */
   const failures: Array<{ org: PartnerOrg; error: Error }> = [];
+
+  if (orgs.length === 0) {
+    onProgress(
+      'No Shopify Partner organization is configured. Add one under Settings → ' +
+        'Organizations, or set PARTNER_ORG_1_ID and PARTNER_ORG_1_TOKEN.',
+    );
+  }
 
   for (const org of orgs) {
     onProgress(`Organization ${org.label} (${org.organizationId})...`);

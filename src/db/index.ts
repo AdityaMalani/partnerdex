@@ -1,8 +1,9 @@
 import Database from 'better-sqlite3';
 import fs from 'node:fs';
 import path from 'node:path';
-import { getConfig, getPrimaryOrg } from '../config.js';
+import { getConfig, primaryEnvOrg } from '../config.js';
 import { ADD_APP_CLICK_EVENT, LISTING_VIEW_EVENT } from '../bigquery/events.js';
+import { seedOrganizationsFromEnv } from '../orgs/store.js';
 import { SCHEMA_SQL } from './schema.js';
 
 export type Db = Database.Database;
@@ -21,9 +22,50 @@ export function getDb(): Db {
   db.pragma('busy_timeout = 5000');
   db.exec(SCHEMA_SQL);
   migrate(db);
+  /*
+   * The environment's organizations, inserted if the table does not have them.
+   *
+   * Here rather than in `migrate()` because it is not a migration: it runs on
+   * every open, and it has to, or an organization added to `fly secrets` after
+   * the first boot would never arrive. It is an insert-if-absent and nothing
+   * else — the table wins on every field of a row it already holds, including
+   * the token, and a removed organization stays removed. `store.ts` states the
+   * rule and why it points that way.
+   */
+  seedOrganizationsFromEnv(db, getConfig().partner.orgs);
+  // After the schema, not before: `journal_mode = WAL` in the schema block is
+  // what creates the `-wal` and `-shm` sidecars, and they hold the same data.
+  restrictFileMode(runtime.databasePath);
 
   handle = db;
   return db;
+}
+
+/**
+ * Take the group and world bits off the database and its WAL sidecars.
+ *
+ * SQLite creates these with the process umask, which on a default system means
+ * 0644 — readable by every local account. What is in the file now includes live
+ * Partner API tokens, one per organization, and the plaintext BigQuery
+ * service-account key. On a single-tenant machine that is a local-only
+ * exposure, but `chmod` costs nothing and the same file gets copied onto
+ * laptops for debugging, where "every local account" is a much bigger set.
+ *
+ * Best effort on purpose. A volume mounted from a filesystem that does not
+ * carry Unix modes must not stop the process starting over a hardening
+ * measure — refusing to boot is a worse failure than a mode of 0644.
+ */
+function restrictFileMode(databasePath: string): void {
+  if (databasePath === ':memory:') return;
+  // The sidecars are created by SQLite when WAL mode engages, so they may not
+  // exist yet on the first call and are re-checked on every open.
+  for (const file of [databasePath, `${databasePath}-wal`, `${databasePath}-shm`]) {
+    try {
+      if (fs.existsSync(file)) fs.chmodSync(file, 0o600);
+    } catch {
+      // Nothing actionable, and nothing worth failing a boot over.
+    }
+  }
 }
 
 /**
@@ -92,13 +134,52 @@ function migrate(db: Db): void {
    * between them would leave a database with the column and un-namespaced keys,
    * which reads as "never synced".
    */
+  /*
+   * The backfill needs an organization to attribute existing rows to, and the
+   * environment is the only place that can supply one at this point — the
+   * `organizations` table is seeded from it a moment later, and on the database
+   * this branch exists for it is empty anyway.
+   *
+   * Null is possible now that the environment is optional. It means an old
+   * database opened by a process that has been given no credentials at all, and
+   * the honest response is to add the column and leave it blank rather than
+   * attribute 8.6M rows to a guess. Blank reads as "organization unknown":
+   * unscoped reports still count every row, and the apps join no organization's
+   * sync until somebody says which one they belong to.
+   */
+  const primaryOrgId = primaryEnvOrg()?.organizationId ?? '';
+
   const apps = columns('apps');
   if (!apps.has('org_id')) {
-    const primaryOrgId = getPrimaryOrg().organizationId;
     db.transaction(() => {
       db.exec(`ALTER TABLE apps ADD COLUMN org_id TEXT NOT NULL DEFAULT ''`);
-      db.prepare(`UPDATE apps SET org_id = ? WHERE org_id = ''`).run(primaryOrgId);
+      if (primaryOrgId) {
+        db.prepare(`UPDATE apps SET org_id = ? WHERE org_id = ''`).run(primaryOrgId);
+      }
+    })();
+  }
 
+  /*
+   * The watermark rename, on its own guard rather than inside the one above.
+   *
+   * It used to share that branch, which was right while an organization was
+   * always available and wrong the moment it stopped being: a database whose
+   * column was added by a process with no credentials would have taken its one
+   * chance at the rename and skipped it, stranding hours of backfill under keys
+   * nothing reads. Keyed on the legacy rows still being there instead, it is
+   * idempotent, it self-heals on the next open once an organization exists, and
+   * it does nothing at all on the overwhelmingly common path where there are no
+   * such rows.
+   */
+  const legacyKeys = db
+    .prepare(
+      `SELECT COUNT(*) AS n FROM sync_state
+        WHERE key LIKE 'transactions:%' OR key LIKE 'events:%'`,
+    )
+    .get() as { n: number };
+
+  if (legacyKeys.n > 0 && primaryOrgId) {
+    db.transaction(() => {
       // Defensive, and cheap: a legacy key whose namespaced counterpart somehow
       // already exists would make the UPDATE below a primary-key collision and
       // take the boot down. The namespaced row is the newer of the two, so the
