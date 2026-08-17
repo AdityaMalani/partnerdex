@@ -493,7 +493,7 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
   // The overview greets; every other page names itself.
   const heading = page.id === 'overview' ? greeting() : { title: page.title, blurb: page.blurb };
 
-  const hasData =(status?.subscriptions ?? 0) > 0 || (status?.transactions ?? 0) > 0;
+  const hasData = status?.hasData === true;
   const fixedRange = isFunnel && query.granularity === 'previous_7_days';
 
   return (

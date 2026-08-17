@@ -193,14 +193,33 @@ export function createApp(): express.Express {
     try {
       const db = getDb();
 
-      // Always cheap: this is the whole of what the dashboard shell reads, and
-      // it polls this route on every page.
+      // Always cheap, and polled on every page.
       const lastSyncAt = (
         db.prepare('SELECT MAX(updated_at) AS lastSyncAt FROM sync_state').get() as {
           lastSyncAt: string | null;
         }
       ).lastSyncAt;
-      const base = { lastSyncAt, sync: syncStatus() };
+
+      /*
+       * Whether the store holds anything, which the shell needs and used to work
+       * out from the row counts above. Making those opt-in would otherwise take
+       * the answer away with them: the counts stop arriving, `?? 0` reads the
+       * absence as zero, and a store holding millions of rows reports itself
+       * empty and tells its operator to run a sync.
+       *
+       * So the question is answered here instead of reconstructed from figures
+       * that happened to be nearby. `LIMIT 1` stops at the first row, which is
+       * what lets it stay on the cheap path beside a `COUNT(*)` that could not.
+       *
+       * Both tables, because either alone is too narrow: a store can hold
+       * subscriptions rebuilt from events that carried no sale yet, and it is
+       * not empty — it has figures to show.
+       */
+      const hasData =
+        db.prepare('SELECT 1 AS present FROM transactions LIMIT 1').get() !== undefined ||
+        db.prepare('SELECT 1 AS present FROM subscriptions LIMIT 1').get() !== undefined;
+
+      const base = { lastSyncAt, hasData, sync: syncStatus() };
 
       // The counts are opt-in. Callers that want them ask; the shell does not,
       // and used to pay for them on every navigation regardless.

@@ -71,13 +71,20 @@ export interface SyncStatus {
 }
 
 export interface Status {
-  apps: number;
-  shops: number;
-  events: number;
-  transactions: number;
-  subscriptions: number;
-  customerEvents: number;
+  /*
+   * The row counts, present only when `?counts=1` was asked for. Optional in the
+   * type because they are optional on the wire — declaring them required is how
+   * a reader ends up treating an absent count as a zero.
+   */
+  apps?: number;
+  shops?: number;
+  events?: number;
+  transactions?: number;
+  subscriptions?: number;
+  customerEvents?: number;
   lastSyncAt: string | null;
+  /** Whether the store holds anything. Always sent, and cheap. */
+  hasData: boolean;
   sync: SyncStatus;
 }
 
