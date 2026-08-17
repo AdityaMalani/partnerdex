@@ -34,10 +34,59 @@ export interface SyncProgress {
 
 const noop: SyncProgress = () => {};
 
-function windowStart(db: Db, key: string, syncStartDate: string): string {
-  const { syncedThrough } = readSyncState(db, key);
+function windowStart(syncedThrough: string | null, syncStartDate: string): string {
   if (!syncedThrough) return toUtcIso(`${syncStartDate}T00:00:00Z`);
   return toUtcIso(addDays(new Date(syncedThrough), -OVERLAP_DAYS));
+}
+
+/**
+ * Where one pass resumes: its stored cursor, but only if that cursor was made
+ * for the window this pass is about to ask for.
+ *
+ * A Relay cursor is an opaque position inside the result set of the query that
+ * produced it. Handed to a query with different arguments it does not mean
+ * "the same place in the new window" — it means whatever the server decides,
+ * and the honest reading of an offset-backed connection is "carry on with the
+ * old walk". A pass that does that reads history it has no reason to read, at
+ * the cost of the rows it was actually started for: reproduced against a fake
+ * Partner API in `scripts/window-probe.ts`, where a cursor from a full-history
+ * pass makes a three-day window walk tens of thousands of rows instead of
+ * hundreds, and never reaches the newest ones.
+ *
+ * A cursor with no recorded window — every cursor written before the column
+ * existed — counts as a mismatch. Re-walking one window once is the cheap
+ * mistake; trusting a cursor whose provenance is unknown is the expensive one.
+ */
+function resumeCursor(state: { cursor: string | null; cursorWindow: string | null }, window: string): string | null {
+  if (!state.cursor) return null;
+  return state.cursorWindow === window ? state.cursor : null;
+}
+
+/**
+ * The watermark a pass leaves behind: the newest row anyone has seen, never
+ * older than what is already recorded.
+ *
+ * Two ways the old code could move it backwards, both of which put the sync
+ * permanently behind its own data — the window is derived from this value, so
+ * a watermark that regresses is re-read forever and a watermark that overshoots
+ * skips rows that are never asked for again.
+ *
+ * The first is a pass that does not reach the newest row. It cannot: the rows
+ * it saw are all it knows, and `max` over them is smaller than the recorded
+ * mark. Seeding from the recorded mark rather than from the window makes the
+ * comparison the right one.
+ *
+ * The second is a pass that returns no rows, which used to stamp the wall clock
+ * — a watermark no row supports, and forward of the data rather than behind it.
+ * On an install whose first pass finds nothing (a scope not yet configured, an
+ * org whose token is not live yet) that writes "synced through now" over history
+ * nobody has read, and everything before it minus the overlap is never fetched.
+ * An empty pass learns nothing, so it now records nothing.
+ */
+function advanceWatermark(recorded: string | null, seen: string | null): string | null {
+  if (!seen) return recorded;
+  if (!recorded) return seen;
+  return seen > recorded ? seen : recorded;
 }
 
 export interface SyncOptions {
@@ -98,20 +147,23 @@ async function syncTransactionsFor(
   const onProgress = options.onProgress ?? noop;
   const key = appId ? `transactions:${appId}` : 'transactions:all';
 
-  if (options.full) writeSyncState(db, key, { cursor: null, syncedThrough: null });
+  if (options.full) {
+    writeSyncState(db, key, { cursor: null, cursorWindow: null, syncedThrough: null });
+  }
 
-  const createdAtMin = windowStart(db, key, scope.syncStartDate);
-  const { cursor } = readSyncState(db, key);
-  const startedAt = new Date().toISOString();
+  const state = readSyncState(db, key);
+  const createdAtMin = windowStart(state.syncedThrough, scope.syncStartDate);
 
   let total = 0;
-  let latest = createdAtMin;
+  // Seeded from the recorded watermark, not from the window, so a pass that
+  // stops short of the newest row leaves the mark where it found it.
+  let latest: string | null = null;
 
   const pages = paginate<TransactionNode>(
     TRANSACTIONS_QUERY,
     transactionVariables(appId, createdAtMin, SALE_TRANSACTION_TYPES),
     (data) => data?.transactions,
-    cursor,
+    resumeCursor(state, createdAtMin),
     { signal },
   );
 
@@ -119,14 +171,20 @@ async function syncTransactionsFor(
     total += insertTransactions(db, page.nodes);
     for (const node of page.nodes) {
       const at = toUtcIso(node.createdAt);
-      if (at > latest) latest = at;
+      if (!latest || at > latest) latest = at;
     }
-    writeSyncState(db, key, { cursor: page.endCursor });
+    // The window travels with the cursor, so the next pass can tell whether the
+    // two still belong together.
+    writeSyncState(db, key, { cursor: page.endCursor, cursorWindow: createdAtMin });
     onProgress(`  transactions: ${total} rows`);
   }
 
   // Cursor cleared only after a clean pass, so an interrupted run resumes.
-  writeSyncState(db, key, { cursor: null, syncedThrough: total > 0 ? latest : startedAt });
+  writeSyncState(db, key, {
+    cursor: null,
+    cursorWindow: null,
+    syncedThrough: advanceWatermark(state.syncedThrough, latest),
+  });
   return total;
 }
 
@@ -140,14 +198,15 @@ async function syncEventsFor(
   const onProgress = options.onProgress ?? noop;
   const key = `events:${appId}`;
 
-  if (options.full) writeSyncState(db, key, { cursor: null, syncedThrough: null });
+  if (options.full) {
+    writeSyncState(db, key, { cursor: null, cursorWindow: null, syncedThrough: null });
+  }
 
-  const occurredAtMin = windowStart(db, key, scope.syncStartDate);
-  const { cursor } = readSyncState(db, key);
-  const startedAt = new Date().toISOString();
+  const state = readSyncState(db, key);
+  const occurredAtMin = windowStart(state.syncedThrough, scope.syncStartDate);
 
   let total = 0;
-  let latest = occurredAtMin;
+  let latest: string | null = null;
 
   const pages = paginate<AppEventNode>(
     APP_EVENTS_QUERY,
@@ -157,7 +216,7 @@ async function syncEventsFor(
       types: SYNCED_EVENT_TYPES,
     },
     (data) => data?.app?.events,
-    cursor,
+    resumeCursor(state, occurredAtMin),
     { signal },
   );
 
@@ -165,13 +224,17 @@ async function syncEventsFor(
     total += insertAppEvents(db, appId, page.nodes);
     for (const node of page.nodes) {
       const at = toUtcIso(node.occurredAt);
-      if (at > latest) latest = at;
+      if (!latest || at > latest) latest = at;
     }
-    writeSyncState(db, key, { cursor: page.endCursor });
+    writeSyncState(db, key, { cursor: page.endCursor, cursorWindow: occurredAtMin });
     onProgress(`  events: ${total} rows`);
   }
 
-  writeSyncState(db, key, { cursor: null, syncedThrough: total > 0 ? latest : startedAt });
+  writeSyncState(db, key, {
+    cursor: null,
+    cursorWindow: null,
+    syncedThrough: advanceWatermark(state.syncedThrough, latest),
+  });
   return total;
 }
 

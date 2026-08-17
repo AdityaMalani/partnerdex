@@ -445,9 +445,15 @@ CREATE INDEX IF NOT EXISTS idx_listing_events_step
 CREATE INDEX IF NOT EXISTS idx_listing_events_visitor
   ON listing_events (anonymous_id, occurred_at);
 
+-- \`cursor_window\` is the window \`cursor\` was produced under — the
+-- \`createdAtMin\`/\`occurredAtMin\` of the query that issued it. A Relay cursor is
+-- a position inside one query's result set and means nothing inside another, so
+-- a resumed pass compares the two and drops a cursor whose window has moved.
+-- Added by the migration too, for databases that predate it.
 CREATE TABLE IF NOT EXISTS sync_state (
   key            TEXT PRIMARY KEY,
   cursor         TEXT,
+  cursor_window  TEXT,
   synced_through TEXT,
   updated_at     TEXT NOT NULL
 ) WITHOUT ROWID;
