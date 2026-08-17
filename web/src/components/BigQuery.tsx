@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   checkBigQuery,
   checkBigQueryApp,
@@ -87,6 +87,20 @@ function Account({
 
   const { busy, error, note, setError, setNote, run } = useAction();
 
+  /**
+   * The job watcher below is a loop, not an interval, so nothing unsubscribes
+   * it. Without this it keeps asking the server every two seconds — and keeps
+   * writing to state through `onChanged` — for the rest of the tab's life if
+   * the operator navigates away mid-ingest, which is a multi-minute window.
+   */
+  const mounted = useRef(true);
+  useEffect(
+    () => () => {
+      mounted.current = false;
+    },
+    [],
+  );
+
   const save = () =>
     run('save', async () => {
       onChanged(
@@ -134,7 +148,9 @@ function Account({
 
       for (;;) {
         await new Promise((resolve) => setTimeout(resolve, 2_000));
+        if (!mounted.current) return;
         const next = await fetchBigQuery();
+        if (!mounted.current) return;
         onChanged(next);
         if (next.job.running) continue;
         if (next.job.error) {

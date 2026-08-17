@@ -649,6 +649,61 @@ h3,
   margin-top: auto;
 }
 
+/*
+ * Cards arrive one at a time, so the ones that have not arrived still have to
+ * hold their shape. The placeholder is the height the plot will take, which is
+ * what stops a grid filling itself in from shunting the cards below it down the
+ * page as each figure lands.
+ */
+.card-placeholder {
+  margin-top: auto;
+}
+
+.card-value-empty {
+  color: var(--muted);
+}
+
+/* Muted rather than loud: a card still computing is the normal case on a large
+   account, not a fault, and a grid of them should read as calm. */
+.card-pending {
+  border-style: dashed;
+}
+
+.card-failed {
+  border-color: var(--delta-down);
+}
+
+.card-note {
+  margin: 3px 0 10px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+/* Carries the reason in words as well as in colour. */
+.card-note-failed {
+  color: var(--delta-down);
+}
+
+/*
+ * A retry that sits inside the sentence explaining what failed, rather than as
+ * a button below it: the card has a fixed height to keep and one clause reads
+ * faster than a control on its own line.
+ */
+.card-note-retry {
+  border: 0;
+  padding: 0;
+  background: none;
+  font: inherit;
+  color: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.card-failed .card-toggle {
+  align-self: flex-start;
+  margin-bottom: 10px;
+}
+
 .card-toggle {
   flex: 0 0 auto;
   border: 1px solid var(--border);
