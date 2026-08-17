@@ -224,7 +224,13 @@ export function listCustomers(options: {
   const search = (options.search ?? '').trim();
   const limit = Math.min(Math.max(options.limit ?? 50, 1), 200);
   const offset = Math.max(options.offset ?? 0, 0);
-  const sort = ORDER_BY[options.sort ?? 'mrr'] ? (options.sort ?? 'mrr') : 'mrr';
+  // `hasOwnProperty`, not a truthiness check: `sort=constructor` resolves
+  // through Object.prototype, so the old test passed and a function's source
+  // text was interpolated into the ORDER BY — a 500 on every such request.
+  const asked = options.sort ?? 'mrr';
+  const sort: CustomerSort = Object.prototype.hasOwnProperty.call(ORDER_BY, asked)
+    ? asked
+    : 'mrr';
 
   const built = summarySql(appIds, search.length > 0);
   const params: Record<string, unknown> = {

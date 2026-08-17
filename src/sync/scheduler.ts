@@ -1,7 +1,6 @@
-import { fork } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
 import { getConfig } from '../config.js';
 import { getDb } from '../db/index.js';
+import { runInWorker, workerEntry } from './fork.js';
 import { type SyncResult } from './index.js';
 
 /**
@@ -68,72 +67,20 @@ let started = false;
 let runner: () => Promise<SyncResult> = () => runSyncInWorker();
 
 /**
- * Which file the child runs, which differs between the two ways this process is
- * started.
- *
- * Compiled, this module is `dist/sync/scheduler.js` and its sibling is
- * `worker.js`. Under `tsx watch` it is `src/sync/scheduler.ts` and the sibling
- * is `worker.ts`; asking for `./worker.js` there points at a file that was
- * never emitted, and the loop's first tick dies on `Cannot find module`.
- * Reading this module's own extension keeps one code path correct in both,
- * rather than a NODE_ENV flag that dev and prod can disagree about.
- */
-function workerEntry(): string {
-  const sibling = import.meta.url.endsWith('.ts') ? './worker.ts' : './worker.js';
-  return fileURLToPath(new URL(sibling, import.meta.url));
-}
-
-/**
  * Run one sync in a child process and resolve with its result.
  *
  * The sync is synchronous SQLite work from the moment the Partner API pages
  * land, and `rebuildDerivedTables` is a single multi-second block. Running it
  * in-process stops the server answering anything at all — see `worker.ts` for
- * why it has to be somewhere else, and why that somewhere is a child process
- * rather than a worker thread.
+ * why it has to be somewhere else, and `fork.ts` for why that somewhere is a
+ * child process rather than a worker thread.
  *
  * A child per run, rather than one long-lived child: runs are minutes apart, so
  * startup is a rounding error against the sync itself, and an exited process
  * cannot leak a SQLite handle or a half-applied write into the next run.
  */
 function runSyncInWorker(): Promise<SyncResult> {
-  return new Promise((resolve, reject) => {
-    const child = fork(workerEntry());
-    let settled = false;
-
-    const finish = (act: () => void): void => {
-      if (settled) return;
-      settled = true;
-      act();
-      if (child.connected) child.kill();
-    };
-
-    child.on('message', (message: { ok: boolean; result?: SyncResult; message?: string; stack?: string }) => {
-      finish(() => {
-        if (message.ok && message.result) {
-          resolve(message.result);
-          return;
-        }
-        const error = new Error(message.message ?? 'sync worker failed without a message');
-        if (message.stack) error.stack = message.stack;
-        reject(error);
-      });
-    });
-
-    child.on('error', (cause) => finish(() => reject(cause)));
-
-    // A child that dies without reporting — an OOM kill, a native crash — must
-    // still settle the run, or the loop would never schedule another.
-    child.on('exit', (code, signal) => {
-      finish(() =>
-        reject(
-          new Error(
-            `sync worker exited (code ${code}, signal ${signal}) before reporting a result`,
-          ),
-        ),
-      );
-    });
-  });
+  return runInWorker<SyncResult>(workerEntry(import.meta.url, 'worker'));
 }
 
 /** Test seam: drive the loop with something other than a live Partner API. */

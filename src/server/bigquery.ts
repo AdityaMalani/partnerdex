@@ -9,7 +9,8 @@ import {
   saveAppSource,
   saveConnection,
 } from '../bigquery/connection.js';
-import { checkAppSource, checkConnection, syncListingEvents } from '../bigquery/ingest.js';
+import { checkAppSource, checkConnection } from '../bigquery/ingest.js';
+import { bigquerySyncJob, startBigquerySync } from '../sync/bigquerySyncJob.js';
 import { resolveScopedAppIds } from '../sync/index.js';
 import { sendError } from './errors.js';
 
@@ -51,6 +52,10 @@ export function bigqueryRouter(): express.Router {
       connection: connection ? describe(connection) : null,
       sources: listAppSources(scoped, db),
       stats,
+      // The manual ingest is a background job now, so its progress has to be
+      // readable from the surface that already polls — otherwise a 202 is the
+      // last thing anyone ever hears about the run they started.
+      job: bigquerySyncJob(),
     };
   };
 
@@ -143,18 +148,39 @@ export function bigqueryRouter(): express.Router {
   });
 
   /**
-   * Pulls listing traffic now rather than waiting for the sync loop.
+   * Starts a pull of listing traffic rather than waiting for the sync loop.
    *
    * `full` re-reads from the backfill floor, which is what a partner wants
    * immediately after fixing a dataset or a handle: the watermark from the
    * broken configuration would otherwise skip everything it already walked past.
+   *
+   * Accepts a *job* rather than performing the ingest, because performing it
+   * here is what took the production machine out of the load balancer: up to
+   * millions of synchronous SQLite inserts on the thread that answers the health
+   * probe. `startBigquerySync` forks the same kind of child the scheduler has
+   * always used, and refuses to start a second run alongside one already going —
+   * two ingests would advance the same watermarks against a single-writer
+   * database.
+   *
+   * 202 rather than 200 because the work has not happened yet, and the response
+   * body says so: poll `GET /api/bigquery` and read `job`.
    */
   router.post('/sync', (request, response) => {
-    const db = getDb();
-    const full = request.query.full === '1' || request.query.full === 'true';
-    syncListingEvents(db, resolveScopedAppIds(db), { full })
-      .then((result) => response.json({ result, ...payload() }))
-      .catch((error: unknown) => sendError(response, error));
+    try {
+      const full = request.query.full === '1' || request.query.full === 'true';
+      const { accepted } = startBigquerySync({ full });
+      if (!accepted) {
+        // `payload()` carries the same job, so it is not repeated here.
+        response.status(409).json({
+          error: 'A BigQuery sync is already running. Wait for it to finish.',
+          ...payload(),
+        });
+        return;
+      }
+      response.status(202).json({ accepted: true, ...payload() });
+    } catch (error) {
+      sendError(response, error);
+    }
   });
 
   return router;

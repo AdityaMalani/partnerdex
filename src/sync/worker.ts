@@ -1,4 +1,5 @@
 import { closeDb } from '../db/index.js';
+import { reportAndExit } from './fork.js';
 import { runSync } from './index.js';
 
 /**
@@ -22,24 +23,16 @@ import { runSync } from './index.js';
  * stays invisible until it commits rather than exposing half-rebuilt tables.
  */
 
-const send = process.send?.bind(process);
-if (!send) throw new Error('sync worker must be started as a forked child process');
-
-/** Exit only once the IPC message has flushed, or the result is lost. */
-const report = (payload: unknown): void => {
-  send(payload, () => process.exit(0));
-};
-
 runSync().then(
   (result) => {
     closeDb();
-    report({ ok: true, result });
+    reportAndExit({ ok: true, result });
   },
   (cause: unknown) => {
     closeDb();
     const error = cause instanceof Error ? cause : new Error(String(cause));
     // An Error does not survive the IPC boundary with its stack intact, so the
     // parts worth keeping are sent as plain data and reassembled by the parent.
-    report({ ok: false, message: error.message, stack: error.stack });
+    reportAndExit({ ok: false, message: error.message, stack: error.stack });
   },
 );
