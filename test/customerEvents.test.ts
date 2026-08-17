@@ -5,7 +5,8 @@ import { closeDb } from '../src/db/index.js';
 import { getCustomer, listCustomers } from '../src/customers/index.js';
 import { runMetric } from '../src/metrics/registry.js';
 import { rebuildDerivedTables } from '../src/sync/derive.js';
-import { APP_ID, resetEnvironment, seed } from './helpers.js';
+import { insertTransactions, type TransactionNode } from '../src/sync/ingest.js';
+import { APP_GID, APP_ID, resetEnvironment, seed } from './helpers.js';
 
 /**
  * The acceptance scenarios from the customer-events spec, plus the invariant
@@ -506,6 +507,24 @@ describe('the customer read model', () => {
     assert.equal(found.customers[0]!.shopId, '8');
   });
 
+  /**
+   * The page and its total come from one statement now (`COUNT(*) OVER ()`),
+   * which is only safe if the total still counts the whole matching set rather
+   * than the page — and if a page past the end still reports it.
+   */
+  it('reports the full total on every page, including one past the end', () => {
+    const all = listCustomers({ limit: 200 });
+    assert.ok(all.total >= 2, `expected at least two merchants, got ${all.total}`);
+
+    const firstPage = listCustomers({ limit: 1, offset: 0 });
+    assert.equal(firstPage.customers.length, 1);
+    assert.equal(firstPage.total, all.total);
+
+    const past = listCustomers({ limit: 1, offset: all.total + 10 });
+    assert.equal(past.customers.length, 0);
+    assert.equal(past.total, all.total);
+  });
+
   it('separates a paying merchant from one who left', () => {
     const paying = listCustomers({ search: 's7.example' }).customers[0]!;
     assert.equal(paying.status, 'paying');
@@ -582,5 +601,187 @@ describe('the customer read model', () => {
     // The stamp itself is left alone: the day is all anyone ever knew.
     const review = getCustomer('20')!.events.find((event) => event.type === 'review_posted')!;
     assert.equal(review.occurredAt, '2024-05-10T00:00:00.000Z');
+  });
+});
+
+/**
+ * The payment half of the table is compiled incrementally: one row per
+ * transaction is millions of rows, and rewriting all of them on every sync was
+ * what put the rebuild beyond a 2 GB machine. These are the properties that
+ * makes safe — the output has to be identical to the wholesale rebuild it
+ * replaces, and a correction still has to reach a row that was compiled before.
+ */
+describe('customer events: compiling payments without rewriting them', () => {
+  before(() => resetEnvironment());
+  after(() => closeDb());
+
+  /** The compiled payment event for one transaction id. */
+  function paymentEvent(transactionId: string): { type: string; detail: string | null } | undefined {
+    return getDb()
+      .prepare('SELECT type, detail FROM customer_events WHERE event_id = ?')
+      .get(`tx|${transactionId}`) as { type: string; detail: string | null } | undefined;
+  }
+
+  /** A settled sale, dated whenever the test needs it. */
+  function sale(id: string, at: string, gross: number): TransactionNode {
+    return {
+      id: `gid://partners/AppSubscriptionSale/${id}`,
+      createdAt: at,
+      __typename: 'AppSubscriptionSale',
+      app: { id: APP_GID, name: 'Test App' },
+      shop: { id: 'gid://partners/Shop/40', name: 'Shop 40', myshopifyDomain: 's40.example' },
+      chargeId: 'gid://shopify/AppSubscription/c40',
+      billingInterval: 'EVERY_30_DAYS',
+      grossAmount: { amount: String(gross), currencyCode: 'USD' },
+      netAmount: { amount: String(gross * 0.85), currencyCode: 'USD' },
+      shopifyFee: { amount: String(gross * 0.15), currencyCode: 'USD' },
+    };
+  }
+
+  const seedOne = () => {
+    resetEnvironment();
+    seed([
+      {
+        chargeRef: 'c40',
+        shopId: '40',
+        amount: 20,
+        activatedAt: '2024-03-01T00:00:00Z',
+        firstSaleAt: '2024-03-01T00:00:00Z',
+      },
+    ]);
+  };
+
+  it('leaves an already-compiled payment alone, and recompiles it on a full rebuild', () => {
+    seedOne();
+    const id = 'gid://partners/AppSubscriptionSale/c40-0';
+    assert.equal(paymentEvent(id)?.type, 'payment');
+
+    // A sentinel the compiler would never write. Surviving an incremental
+    // rebuild is the proof that the row was not rewritten; being replaced by a
+    // full one is the proof that `full` still means full.
+    getDb()
+      .prepare(`UPDATE customer_events SET detail = 'sentinel' WHERE event_id = ?`)
+      .run(`tx|${id}`);
+
+    rebuildDerivedTables(getDb());
+    assert.equal(paymentEvent(id)?.detail, 'sentinel');
+
+    rebuildDerivedTables(getDb(), { full: true });
+    assert.equal(
+      paymentEvent(id)?.detail,
+      JSON.stringify({ source: 'AppSubscriptionSale', netAmount: 17 }),
+    );
+  });
+
+  it('compiles a transaction that arrives after the first rebuild', () => {
+    seedOne();
+    const later = 'gid://partners/AppSubscriptionSale/c40-late';
+    assert.equal(paymentEvent(later), undefined);
+
+    insertTransactions(getDb(), [sale('c40-late', '2024-04-01T00:00:00Z', 20)]);
+    rebuildDerivedTables(getDb());
+
+    assert.equal(paymentEvent(later)?.type, 'payment');
+  });
+
+  /**
+   * The sync re-reads three days behind its watermark and updates the amounts
+   * in place, so a transaction inside that window is not final. The recheck
+   * window is what carries the correction into the event compiled from it.
+   */
+  it('recompiles a transaction corrected inside the recheck window', () => {
+    seedOne();
+    const id = 'gid://partners/AppSubscriptionSale/c40-fresh';
+    const today = new Date().toISOString();
+
+    insertTransactions(getDb(), [sale('c40-fresh', today, 20)]);
+    rebuildDerivedTables(getDb());
+    assert.equal(paymentEvent(id)?.type, 'payment');
+
+    // The Partner API restates it as a reversal, exactly as `insertTransactions`
+    // would on the next overlapping pass.
+    insertTransactions(getDb(), [sale('c40-fresh', today, -20)]);
+    rebuildDerivedTables(getDb());
+
+    assert.equal(paymentEvent(id)?.type, 'refund');
+  });
+
+  /** The lifecycle half is still replaced wholesale, every time. */
+  it('rebuilds lifecycle events wholesale even on an incremental pass', () => {
+    seedOne();
+    getDb()
+      .prepare(`UPDATE customer_events SET detail = 'sentinel' WHERE type = 'subscribed'`)
+      .run();
+
+    rebuildDerivedTables(getDb());
+
+    const row = getDb()
+      .prepare(`SELECT detail FROM customer_events WHERE type = 'subscribed'`)
+      .get() as { detail: string | null };
+    assert.notEqual(row.detail, 'sentinel');
+  });
+});
+
+describe('a corrected transaction moves the money on its compiled event', () => {
+  before(() => resetEnvironment());
+  after(() => closeDb());
+
+  /*
+   * Regression. The upsert refreshed the event's type and net_change but not
+   * its amount or currency, which was invisible for as long as the table was
+   * emptied before every insert — nothing conflicted, so the clause never ran.
+   * Chunking the rebuild let payment rows survive between passes, making this
+   * the only path a restated transaction can take: the row would keep the old
+   * figure while looking freshly written.
+   */
+  it('updates the amount when the Partner API restates a sale', () => {
+    resetEnvironment();
+    seed([
+      {
+        chargeRef: 'c77',
+        shopId: '77',
+        amount: 20,
+        activatedAt: '2024-05-01T00:00:00Z',
+        firstSaleAt: '2024-05-01T00:00:00Z',
+      },
+    ]);
+
+    const restate = (gross: number): TransactionNode => ({
+      id: 'gid://partners/AppSubscriptionSale/c77-restated',
+      // Dated now, so the incremental pass treats it as still moving and
+      // recompiles it. An older sale is settled and deliberately left alone,
+      // which is the behaviour the neighbouring suite pins.
+      createdAt: new Date().toISOString(),
+      __typename: 'AppSubscriptionSale',
+      app: { id: APP_GID, name: 'Test App' },
+      shop: { id: 'gid://partners/Shop/77', name: 'Shop 77', myshopifyDomain: 's77.example' },
+      chargeId: 'gid://shopify/AppSubscription/c77',
+      billingInterval: 'EVERY_30_DAYS',
+      grossAmount: { amount: String(gross), currencyCode: 'USD' },
+      netAmount: { amount: String(gross), currencyCode: 'USD' },
+      shopifyFee: { amount: '0', currencyCode: 'USD' },
+    });
+
+    const amountOf = () =>
+      (
+        getDb()
+          .prepare(
+            `SELECT amount, currency FROM customer_events
+              WHERE event_id = 'tx|gid://partners/AppSubscriptionSale/c77-restated'`,
+          )
+          .get() as { amount: number | null; currency: string | null } | undefined
+      );
+
+    insertTransactions(getDb(), [restate(50)]);
+    rebuildDerivedTables(getDb());
+    assert.equal(amountOf()?.amount, 50, 'the first compile carries the original figure');
+
+    // Same transaction id, restated by the Partner API at a lower gross. The
+    // event already exists, so this goes through ON CONFLICT rather than INSERT.
+    insertTransactions(getDb(), [restate(35)]);
+    rebuildDerivedTables(getDb());
+
+    assert.equal(amountOf()?.amount, 35, 'the compiled event must carry the corrected figure');
+    assert.equal(amountOf()?.currency, 'USD');
   });
 });

@@ -137,7 +137,9 @@ async function main(): Promise<void> {
      */
     case 'rebuild': {
       const started = Date.now();
-      const result = rebuildDerivedTables(getDb());
+      // `rebuild` exists to distrust what is stored, so it recompiles every
+      // payment event rather than only the ones the sync has not seen yet.
+      const result = rebuildDerivedTables(getDb(), { full: true });
       console.log(
         `Rebuilt in ${Math.round((Date.now() - started) / 1000)}s: ` +
           `${result.subscriptions} subscription(s), ${result.installs} install interval(s), ` +

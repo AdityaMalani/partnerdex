@@ -274,3 +274,72 @@ export function runMetric(
   if (!bypass) writeCache(context.db, key, response);
   return response;
 }
+
+/**
+ * Everything the dashboard renders, so one request paints the whole page.
+ *
+ * Lives here rather than beside the route because the sync warms these on the
+ * way out — see `warmDashboardMetrics` — and two lists that must agree are one
+ * list waiting to disagree.
+ */
+export const HEADLINE_METRICS = [
+  'mrr',
+  'arr',
+  'gross_earnings',
+  'mrr_growth',
+  'mrr_by_app',
+  'arpu',
+  'ltv',
+  'trials',
+  'on_trial',
+  'trial_conversion_rate',
+  'active_subscriptions',
+  'subscribers',
+  'new_subscriptions',
+  'subscription_growth',
+  'active_installs',
+  'churn',
+  'revenue_churn',
+  'subscription_churn',
+  'logo_churn',
+  'reviews_posted',
+  'reviews_live',
+  'reviews_average_rating',
+  'reviews_removed',
+];
+
+/**
+ * The query the dashboard opens on (`web/src/App.tsx`): every app in scope, the
+ * last twelve months. Warming anything else would be guessing.
+ */
+const DASHBOARD_DEFAULT_QUERY: RawMetricQuery = { period: 'last_12_months' };
+
+/**
+ * Recompute the dashboard's opening page into the cache, off the request path.
+ *
+ * The rebuild at the end of every sync empties the metric cache, so whoever
+ * loads the dashboard next pays to reconstruct all 23 cards — 10.7s measured at
+ * 4.1M transactions, on the single thread that also has to answer the health
+ * check. Doing it here spends that time in a process whose only job is to spend
+ * it, and the reader gets a cache hit instead.
+ *
+ * Only the default shape is warmed. A reader who picks a different range still
+ * computes it themselves, once, and it is cached from then on — this is an
+ * optimization for the common case, not a promise about every case.
+ *
+ * Nothing in here may fail a sync. A metric that throws has a bug worth fixing,
+ * but the fix is not "stop syncing", and the entry it failed to write simply
+ * stays cold.
+ */
+export function warmDashboardMetrics(): number {
+  let warmed = 0;
+  for (const metric of HEADLINE_METRICS) {
+    try {
+      runMetric(metric, DASHBOARD_DEFAULT_QUERY);
+      warmed += 1;
+    } catch (cause) {
+      console.warn(`[partnerdex] could not warm ${metric}:`, cause);
+    }
+  }
+  return warmed;
+}

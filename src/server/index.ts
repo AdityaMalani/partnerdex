@@ -6,7 +6,7 @@ import { getConfig } from '../config.js';
 import { getCustomer, listCustomers, type CustomerSort } from '../customers/index.js';
 import { getDb } from '../db/index.js';
 import { type RawMetricQuery } from '../metrics/context.js';
-import { listMetrics, runMetric } from '../metrics/registry.js';
+import { HEADLINE_METRICS, listMetrics, runMetric } from '../metrics/registry.js';
 import { dispatchPending } from '../notifications/dispatch.js';
 import {
   linkCandidates,
@@ -27,32 +27,6 @@ import { bigqueryRouter } from './bigquery.js';
 import { listAppSources } from '../bigquery/connection.js';
 import { funnelReport } from '../metrics/reports/funnel.js';
 
-/** Everything the dashboard renders, so one request paints the whole page. */
-const HEADLINE_METRICS = [
-  'mrr',
-  'arr',
-  'gross_earnings',
-  'mrr_growth',
-  'mrr_by_app',
-  'arpu',
-  'ltv',
-  'trials',
-  'on_trial',
-  'trial_conversion_rate',
-  'active_subscriptions',
-  'subscribers',
-  'new_subscriptions',
-  'subscription_growth',
-  'active_installs',
-  'churn',
-  'revenue_churn',
-  'subscription_churn',
-  'logo_churn',
-  'reviews_posted',
-  'reviews_live',
-  'reviews_average_rating',
-  'reviews_removed',
-];
 
 function queryOf(request: express.Request): RawMetricQuery {
   const pick = (name: string): string | undefined => {

@@ -7,6 +7,12 @@ import { autoInterval, resolveWindow } from '../src/metrics/time.js';
 import { getDb } from '../src/db/index.js';
 import { listCustomers } from '../src/customers/index.js';
 import { transactionVariables } from '../src/sync/index.js';
+import {
+  computeCurrencyProfile,
+  currencyProfile,
+  currencyProfileKey,
+  warmCurrencyProfiles,
+} from '../src/metrics/context.js';
 
 const NOW = new Date('2024-07-01T00:00:00.000Z');
 
@@ -1238,5 +1244,61 @@ describe('billing cadence before the first sale settles', () => {
       200,
       'the upgrading shop contributes 100, not 1200, alongside the annual shop',
     );
+  });
+});
+
+/**
+ * The currency profile is the one part of building a metric context that reads
+ * the whole transactions table, so it is cached and warmed by the sync. Two
+ * paths to one answer means the answer has to be the same on both — a warm
+ * pass that disagreed with the scan would silently relabel every figure on the
+ * dashboard.
+ */
+describe('currency profile: cached, warmed, and identical either way', () => {
+  beforeEach(() => {
+    resetEnvironment({ CACHE_TTL_SECONDS: '600' });
+    seed([
+      {
+        chargeRef: 'c1',
+        shopId: '1',
+        amount: 30,
+        activatedAt: '2024-01-01T00:00:00Z',
+        firstSaleAt: '2024-01-01T00:00:00Z',
+      },
+    ]);
+  });
+
+  it('warms the same answer the scan would compute', () => {
+    const db = getDb();
+    const scanned = computeCurrencyProfile(db, [APP_ID]);
+
+    db.prepare('DELETE FROM metric_cache').run();
+    warmCurrencyProfiles(db, [APP_ID]);
+
+    // Read through the cache: this must be the warmed row, not a recomputation.
+    assert.deepEqual(currencyProfile(db, [APP_ID]), scanned);
+    // One entry per distinct warmed scope. With a single app in scope, "every
+    // app" and "that app" are the same set and therefore the same entry.
+    assert.equal(
+      (db.prepare('SELECT COUNT(*) AS n FROM metric_cache').get() as { n: number }).n,
+      1,
+    );
+  });
+
+  it('answers correctly with an empty cache, and fills it', () => {
+    const db = getDb();
+    db.prepare('DELETE FROM metric_cache').run();
+
+    const first = currencyProfile(db, [APP_ID]);
+    assert.equal(first.currency, 'USD');
+    assert.equal(first.mixed, false);
+
+    // Poison the stored entry: if the second call still says USD, it never
+    // reached the cache at all and the caching is doing nothing.
+    db.prepare('UPDATE metric_cache SET payload = ? WHERE key = ?').run(
+      JSON.stringify({ currency: 'EUR', mixed: true }),
+      currencyProfileKey([APP_ID]),
+    );
+    assert.equal(currencyProfile(db, [APP_ID]).currency, 'EUR');
   });
 });

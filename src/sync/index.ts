@@ -9,6 +9,8 @@ import {
   TRANSACTIONS_QUERY,
 } from '../partner/queries.js';
 import { addDays, toUtcIso } from '../metrics/time.js';
+import { warmCurrencyProfiles } from '../metrics/context.js';
+import { warmDashboardMetrics } from '../metrics/registry.js';
 import {
   insertAppEvents,
   insertTransactions,
@@ -372,13 +374,29 @@ async function runSyncReported(options: SyncOptions, reporter: SyncReporter): Pr
   const derived = await reporter.phase(
     'derive',
     null,
-    async () => rebuildDerivedTables(db),
+    async () => rebuildDerivedTables(db, { full: options.full }),
     (result) => ({
       subscriptions: result.subscriptions,
       installs: result.installs,
       customerEvents: result.customerEvents,
     }),
   );
+
+  /*
+   * Refill what the rebuild just emptied, here in the worker rather than on the
+   * first request that arrives afterwards.
+   *
+   * `rebuildDerivedTables` clears the metric cache, and the currency profile
+   * lives in it — a full scan of `transactions` that every metric needs before
+   * it can even look for its own cached answer. Leaving it cold hands that scan
+   * to a request thread that is also the health check's only chance to be
+   * answered. Warming it costs one pass here, off the request path, in a
+   * process whose only job is to be busy.
+   */
+  await reporter.phase('warm', null, async () => {
+    warmCurrencyProfiles(db, appIds);
+    warmDashboardMetrics();
+  });
 
   return { apps: appIds, transactions, events, reviews, listing, ...derived };
 }

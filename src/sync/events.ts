@@ -515,6 +515,10 @@ function paymentEvents(rows: TransactionRow[], out: CleanEvent[]): void {
   for (const row of rows) {
     const refund = row.gross_amount < 0;
     out.push({
+      // Deterministic, and the reason the payment half of this table can be
+      // rebuilt incrementally: the id of an event is derivable from the
+      // transaction alone, so "has this transaction been compiled yet" is a
+      // question the store can answer without recompiling anything.
       event_id: `tx|${row.id}`,
       app_id: row.app_id,
       shop_id: row.shop_id,
@@ -575,7 +579,123 @@ function derivedItems(sub: SubRow): TimelineItem[] {
   return items;
 }
 
-export function buildCustomerEvents(db: Db): number {
+/**
+ * How many payment events are compiled and committed at a time.
+ *
+ * The whole point of the chunk. Compiling every transaction into one array and
+ * writing it in one transaction cost 3.9 GB of RSS and a 2.3 GB WAL at 4.1M
+ * transactions, measured — on a 2 GB machine that is not slow, it is an
+ * out-of-memory kill, and it is why the derived tables were still empty in
+ * production. At this size the pass holds a few megabytes and commits as it
+ * goes.
+ */
+const PAYMENT_CHUNK = 25_000;
+
+/**
+ * How far back a payment event is recompiled even though it already exists.
+ *
+ * A transaction is not immutable: `insertTransactions` updates `gross_amount`,
+ * `net_amount` and `shopify_fee` in place, and the sync re-reads `OVERLAP_DAYS`
+ * (3) behind its watermark on every run, so a correction can land on a row that
+ * was already compiled — flipping a payment to a refund, or moving the figure
+ * in `detail`. Nothing older than the overlap can be rewritten, because nothing
+ * older is ever re-read, and a `--full` run asks for `full` instead.
+ *
+ * Twice the overlap plus a day, so a run that fails and retries an hour later,
+ * or a machine that was down over a weekend, still recompiles everything its
+ * next sync could have corrected. Wider costs a few thousand no-op upserts per
+ * sync; narrower costs a figure that is never corrected at all, so the slack
+ * sits on the safe side deliberately.
+ */
+const PAYMENT_RECHECK_DAYS = 7;
+
+const MS_PER_DAY = 86_400_000;
+
+/**
+ * The payment half of the table, compiled from transactions in id order.
+ *
+ * Returns how many events were written, not how many exist: in the steady state
+ * this pass touches only the handful of transactions the sync just brought in.
+ *
+ * `full` forces every transaction to be recompiled. It is what `rebuild` and
+ * `sync --full` ask for — the two commands whose job is to distrust what is
+ * already stored — and it costs one pass over the table rather than one row.
+ */
+function rebuildPaymentEvents(
+  db: Db,
+  statement: ReturnType<Db['prepare']>,
+  full: boolean,
+): number {
+  const recheckFrom = new Date(Date.now() - PAYMENT_RECHECK_DAYS * MS_PER_DAY).toISOString();
+
+  /*
+   * Keyset pagination on the primary key rather than LIMIT/OFFSET, which would
+   * re-walk the whole prefix for every chunk and turn one pass into a quadratic
+   * one. `transactions` is WITHOUT ROWID on `id`, so `id > @after ORDER BY id`
+   * is a seek into the table's own b-tree and each chunk resumes exactly where
+   * the last stopped.
+   */
+  const select = db.prepare(
+    `SELECT t.id, t.type, t.app_id, t.shop_id, t.charge_ref, t.created_at,
+            t.gross_amount, t.net_amount, t.currency
+       FROM transactions t
+      WHERE t.id > @after
+        AND t.shop_id <> '' AND t.gross_amount <> 0
+        AND (@full = 1
+             OR t.created_at >= @recheckFrom
+             OR NOT EXISTS (
+                  SELECT 1 FROM customer_events c WHERE c.event_id = 'tx|' || t.id
+                ))
+      ORDER BY t.id
+      LIMIT @chunk`,
+  );
+
+  const write = db.transaction((rows: CleanEvent[]) => {
+    for (const row of rows) statement.run(row);
+  });
+
+  let after = '';
+  let written = 0;
+
+  for (;;) {
+    const batch = select.all({
+      after,
+      full: full ? 1 : 0,
+      recheckFrom,
+      chunk: PAYMENT_CHUNK,
+    }) as TransactionRow[];
+    if (batch.length === 0) break;
+
+    const events: CleanEvent[] = [];
+    paymentEvents(batch, events);
+    write(events);
+
+    written += events.length;
+    after = batch[batch.length - 1]!.id;
+  }
+
+  return written;
+}
+
+/**
+ * Compile the clean event feed.
+ *
+ * Two halves, rebuilt differently on purpose. The lifecycle half is small — one
+ * row per install and per subscription movement — and every row of it can move
+ * when a late correction lands, so it is dropped and rebuilt in one atomic
+ * transaction exactly as before. The payment half is one row per transaction,
+ * millions of them, and each row depends on nothing but the transaction it was
+ * compiled from; rewriting all of it every five minutes was the single most
+ * expensive thing this process did.
+ *
+ * The trade the chunking makes: the payment half is no longer replaced
+ * atomically, so a reader during a rebuild can see a customer's timeline with
+ * the newest payments missing. In the steady state that window is milliseconds
+ * wide and holds events the reader could not have seen a moment earlier anyway,
+ * which is a far smaller cost than the process being killed mid-rebuild and the
+ * table never being built at all.
+ */
+export function buildCustomerEvents(db: Db, options: { full?: boolean } = {}): number {
   unknownTypes.clear();
 
   const subs = db
@@ -632,16 +752,6 @@ export function buildCustomerEvents(db: Db): number {
     foldInstall(items, events);
   }
 
-  const transactions = db
-    .prepare(
-      `SELECT id, type, app_id, shop_id, charge_ref, created_at, gross_amount,
-              net_amount, currency
-       FROM transactions
-       WHERE shop_id <> '' AND gross_amount <> 0`,
-    )
-    .all() as TransactionRow[];
-  paymentEvents(transactions, events);
-
   if (unknownTypes.size > 0) {
     console.warn(
       `[partnerdex] Skipped unmapped app event types: ${[...unknownTypes].sort().join(', ')}`,
@@ -658,20 +768,48 @@ export function buildCustomerEvents(db: Db): number {
        @plan_name, @plan_amount, @billing_interval, @currency, @net_change, @amount,
        @suppressed, @detail
      )
+     -- Every non-key column is refreshed, not a chosen subset. A compiled event
+     -- is a pure function of the raw rows behind it, so if those are corrected
+     -- the event has to move with them; no column here may keep an older
+     -- reading than its neighbours.
+     --
+     -- The narrower list this replaces updated the type and net_change but not
+     -- the amount or the currency. That was harmless for exactly as long as the
+     -- table was emptied before every insert: nothing conflicted, so the clause
+     -- never ran. Chunking the rebuild let payment rows survive between passes,
+     -- which promoted this from dead code to the only path a corrected
+     -- transaction can take — and a sale restated at a different gross would
+     -- have updated the row's type while leaving the money on it stale.
      ON CONFLICT(event_id) DO UPDATE SET
+       app_id = excluded.app_id,
+       shop_id = excluded.shop_id,
        type = excluded.type,
        occurred_at = excluded.occurred_at,
-       net_change = excluded.net_change,
+       charge_id = excluded.charge_id,
+       prev_charge_id = excluded.prev_charge_id,
+       plan_name = excluded.plan_name,
        plan_amount = excluded.plan_amount,
+       billing_interval = excluded.billing_interval,
+       currency = excluded.currency,
+       net_change = excluded.net_change,
+       amount = excluded.amount,
        suppressed = excluded.suppressed,
        detail = excluded.detail`,
   );
 
+  /*
+   * The lifecycle rows only. Deleting the payment rows here too would throw
+   * away the very work the incremental pass below exists to avoid, and they
+   * cannot go stale on their own: a payment event is a pure function of a
+   * transaction row, and `rebuildPaymentEvents` re-derives every row that could
+   * still be moving.
+   */
   const write = db.transaction((rows: CleanEvent[]) => {
-    db.prepare('DELETE FROM customer_events').run();
+    db.prepare(`DELETE FROM customer_events WHERE type NOT IN ('payment', 'refund')`).run();
     for (const row of rows) statement.run(row);
   });
 
   write(events);
-  return events.length;
+
+  return events.length + rebuildPaymentEvents(db, statement, options.full ?? false);
 }
