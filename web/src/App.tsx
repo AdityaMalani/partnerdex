@@ -21,6 +21,7 @@ import { Customers } from './components/Customers';
 import { Login } from './components/Login';
 import { MetricCard } from './components/MetricCard';
 import { Nav } from './components/Nav';
+import { PageActionSlot } from './components/PageAction';
 import { Listings } from './components/Listings';
 import { BigQuery } from './components/BigQuery';
 import { Funnel } from './components/Funnel';
@@ -257,6 +258,8 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [theme, toggleTheme] = useTheme();
+  /** The header's action slot, once it has been laid down. See `PageAction`. */
+  const [actionSlot, setActionSlot] = useState<HTMLElement | null>(null);
 
   useEffect(() => {
     fetchApps()
@@ -399,6 +402,9 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
   const fixedRange = isFunnel && query.granularity === 'previous_7_days';
 
   return (
+    /* The page header keeps a slot for whatever the open page calls its primary
+       action; the page fills it from wherever in its own tree it is decided. */
+    <PageActionSlot.Provider value={actionSlot}>
     <div className={collapsed ? 'shell collapsed' : 'shell'}>
       <Nav
         current={page.id}
@@ -415,6 +421,7 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
             <h1>{heading.title}</h1>
             <p className="subtitle">{heading.blurb}</p>
           </div>
+          <div className="masthead-actions" ref={setActionSlot} />
         </header>
 
         {/* Which filters a page shows is declared on the page, because they are
@@ -655,5 +662,6 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
         ) : null}
       </main>
     </div>
+    </PageActionSlot.Provider>
   );
 }

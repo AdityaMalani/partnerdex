@@ -470,6 +470,19 @@ h3,
   min-width: 0;
 }
 
+/*
+ * The page's primary action, on the title's line and at the right of it.
+ *
+ * Empty on a page that declares no action, and an empty flex child takes no
+ * room, so such a page is laid out exactly as it was before the slot existed.
+ */
+.masthead-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex: 0 0 auto;
+}
+
 .masthead h1 {
   font-size: 22px;
   margin: 0;
