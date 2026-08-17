@@ -817,9 +817,30 @@ h3,
 
 /* ----------------------------------------------------------- table view */
 
+/*
+ * A table bleeds to the edges of the card it is in.
+ *
+ * Two things follow from that, and they are the same decision seen twice.
+ *
+ * The row rule spans the whole container. A rule that stops 16px short at each
+ * end reads as a line drawn *under some text*; one that runs edge to edge reads
+ * as the seam between two rows, which is what it is. So the scroll container
+ * cancels the card's padding and the rules run the full width of the card.
+ *
+ * The text then lines up with everything else on the card. The first column
+ * takes the card's own padding back — not as decoration, but so the first
+ * merchant name starts on the same vertical as the card's label above it and
+ * the stat tiles beside it. What is gone is the extra 10px a cell used to carry
+ * on both sides, which put the table's content 10px inside every other thing on
+ * the page and made the table look like it was sitting in a box of its own.
+ *
+ * Columns are separated by a gap on the *left* of every cell but the first, so
+ * a column boundary is one space rather than two half-spaces, and the outermost
+ * columns never pay for it.
+ */
 .table-wrap {
   overflow-x: auto;
-  margin-bottom: 12px;
+  margin: 0 calc(-1 * var(--card-px)) var(--space-3);
 }
 
 table {
@@ -832,14 +853,25 @@ table {
 th,
 td {
   text-align: right;
-  padding: 6px 10px;
+  padding: 6px 0;
   border-bottom: 1px solid var(--rule);
   white-space: nowrap;
 }
 
+th+th,
+td+td {
+  padding-left: var(--space-4);
+}
+
 th:first-child,
 td:first-child {
+  padding-left: var(--card-px);
   text-align: left;
+}
+
+th:last-child,
+td:last-child {
+  padding-right: var(--card-px);
 }
 
 thead th {
