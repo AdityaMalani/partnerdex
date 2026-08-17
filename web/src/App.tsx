@@ -14,6 +14,7 @@ import {
   type QueryState,
   type Session,
   type Status,
+  type SyncStatus,
 } from './api';
 import { formatDateTime } from './format';
 import { CustomerDetail } from './components/CustomerDetail';
@@ -87,6 +88,22 @@ function useTheme(): ['dark' | 'light', () => void] {
  * the page a reader lands on. The hour is the only thing it knows about them,
  * so that is what it uses; the sentence underneath still says what the page is.
  */
+/**
+ * One phrase for what the sync is doing, for the footer.
+ *
+ * The elapsed time is the point of it. "Syncing" on its own is what the footer
+ * said before, and it says the same thing at three seconds and at three hours.
+ */
+function describeSyncPhase(sync: SyncStatus): string {
+  if (!sync.phase) return 'syncing';
+  const where = sync.phaseOrg ? `${sync.phase} (${sync.phaseOrg})` : sync.phase;
+  const started = sync.phaseStartedAt ? Date.parse(sync.phaseStartedAt) : NaN;
+  if (!Number.isFinite(started)) return `syncing: ${where}`;
+  const seconds = Math.max(0, Math.round((Date.now() - started) / 1000));
+  const elapsed = seconds < 90 ? `${seconds}s` : `${Math.round(seconds / 60)}m`;
+  return `syncing: ${where}, ${elapsed}`;
+}
+
 function greeting(): { title: string; blurb: string } {
   const hour = new Date().getHours();
 
@@ -670,13 +687,24 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
         {status?.lastSyncAt ? (
           <p className="footnote">
             Last sync {formatDateTime(status.lastSyncAt)}
+            {/* What the sync is doing right now, while it is doing it. A pass
+                that takes minutes used to be indistinguishable here from one
+                that had wedged an hour ago: both showed a timestamp going
+                quietly out of date. */}
+            {status.sync?.running ? <> · {describeSyncPhase(status.sync)}</> : null}
             {/* Silence while the loop is healthy. A failing sync would
                 otherwise read as nothing more than a timestamp going quietly
                 out of date. */}
             {status.sync?.consecutiveFailures > 0 ? (
               <span className="footnote-warn">
                 {' '}
-                · last attempt failed{status.sync.lastError ? `: ${status.sync.lastError}` : ''}
+                · last attempt failed
+                {status.sync.lastErrorPhase
+                  ? ` in ${status.sync.lastErrorPhase}${
+                      status.sync.lastErrorOrg ? `/${status.sync.lastErrorOrg}` : ''
+                    }`
+                  : ''}
+                {status.sync.lastError ? `: ${status.sync.lastError}` : ''}
               </span>
             ) : null}
           </p>

@@ -17,10 +17,86 @@ interface GraphQLResponse<T> {
 }
 
 const MAX_ATTEMPTS = 6;
-const BASE_BACKOFF_MS = 500;
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+/**
+ * The first retry's wait, doubling with each attempt after it.
+ *
+ * Read from the environment for the same two reasons the timeouts above are: a
+ * test can shorten it rather than waiting out six real backoffs, and an operator
+ * on a link that fails in bursts can lengthen it without a rebuild.
+ */
+function baseBackoffMs(): number {
+  const raw = Number(process.env.PARTNER_RETRY_BACKOFF_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : 500;
+}
+
+/**
+ * How long one Partner API request may take before it is treated as a hang.
+ *
+ * Not a latency budget — a page of a large connection can legitimately take a
+ * while, and cutting one off would turn a slow sync into a failing one. This
+ * exists only so a request that will *never* answer cannot park the pipeline.
+ *
+ * Read per call rather than captured once, so a test can shorten it without
+ * waiting out the real value, and so an operator can raise it on a slow link
+ * without a rebuild.
+ */
+function requestTimeoutMs(): number {
+  const raw = Number(process.env.PARTNER_REQUEST_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : 120_000;
+}
+
+/**
+ * The longest a `Retry-After` header may park this client.
+ *
+ * The header is honoured because the API is entitled to say how long to wait,
+ * but not without a ceiling. A 429 carrying `Retry-After: 900` parks one attempt
+ * for fifteen minutes; five of them is an hour and a quarter of a sync that has
+ * not failed, has not progressed and has printed nothing. Reproduced against a
+ * fake Partner API — see `scripts/stall-probe.ts`, mode `retry-after`.
+ *
+ * Waiting less than asked risks another 429, which costs one more round trip.
+ * Waiting an unbounded amount costs the whole pass, and with it every figure on
+ * the dashboard until someone restarts the machine. The cheaper mistake wins.
+ */
+function maxRetryAfterMs(): number {
+  const raw = Number(process.env.PARTNER_MAX_RETRY_AFTER_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : 60_000;
+}
+
+/** A sleep an abort can cut short, so a deadline is not held up by a backoff. */
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(signal.reason ?? new Error('aborted'));
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      reject(signal?.reason ?? new Error('aborted'));
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+/**
+ * The signal one request runs under: this call's own hang timeout, plus any
+ * deadline the caller is imposing on a larger unit of work.
+ */
+function requestSignal(caller?: AbortSignal): AbortSignal {
+  const hang = AbortSignal.timeout(requestTimeoutMs());
+  return caller ? AbortSignal.any([hang, caller]) : hang;
+}
+
+export interface PartnerRequestOptions {
+  /**
+   * A deadline larger than one request — an organization's pass, say. Aborting
+   * it ends the retry loop rather than merely the request in flight, which is
+   * the difference between a stalled organization yielding to the next one and
+   * a stalled organization retrying its way through the whole sync window.
+   */
+  signal?: AbortSignal;
 }
 
 /**
@@ -31,6 +107,7 @@ function sleep(ms: number): Promise<void> {
 export async function partnerQuery<T>(
   query: string,
   variables: Record<string, unknown> = {},
+  options: PartnerRequestOptions = {},
 ): Promise<T> {
   const { partner } = getConfig();
 
@@ -45,12 +122,28 @@ export async function partnerQuery<T>(
           Accept: 'application/json',
         },
         body: JSON.stringify({ query, variables }),
+        // Without this, a connection the server accepts and then never answers
+        // hangs here forever. Nothing above catches that: the retry loop below
+        // handles errors and bad statuses, and a request that never settles is
+        // neither. It froze a production backfill for over an hour — cursor
+        // parked mid-pagination, no rows written, no error, and the sync's own
+        // overlap guard meant no later run could start either. One dead socket
+        // stopped the pipeline indefinitely.
+        //
+        // A timeout turns that into an ordinary network error, which the loop
+        // already knows how to retry with backoff. Generous on purpose: a slow
+        // page of a large connection is normal and must not be cut off, so this
+        // is set to catch a hang, not to bound latency.
+        signal: requestSignal(options.signal),
       });
     } catch (cause) {
+      // A caller's deadline is not a transient error and must not be retried
+      // through: it is the larger unit of work saying it has given up.
+      if (options.signal?.aborted) throw options.signal.reason ?? cause;
       if (attempt === MAX_ATTEMPTS) {
         throw new PartnerApiError(`Network error calling the Partner API: ${String(cause)}`, null);
       }
-      await sleep(BASE_BACKOFF_MS * 2 ** (attempt - 1));
+      await sleep(baseBackoffMs() * 2 ** (attempt - 1), options.signal);
       continue;
     }
 
@@ -63,9 +156,9 @@ export async function partnerQuery<T>(
       }
       const retryAfter = Number(response.headers.get('retry-after'));
       const waitMs = Number.isFinite(retryAfter) && retryAfter > 0
-        ? retryAfter * 1000
-        : BASE_BACKOFF_MS * 2 ** (attempt - 1);
-      await sleep(waitMs);
+        ? Math.min(retryAfter * 1000, maxRetryAfterMs())
+        : baseBackoffMs() * 2 ** (attempt - 1);
+      await sleep(waitMs, options.signal);
       continue;
     }
 
@@ -98,7 +191,7 @@ export async function partnerQuery<T>(
         (error) => (error.extensions?.code as string | undefined) === 'THROTTLED',
       );
       if (throttled && attempt < MAX_ATTEMPTS) {
-        await sleep(BASE_BACKOFF_MS * 2 ** attempt);
+        await sleep(baseBackoffMs() * 2 ** attempt, options.signal);
         continue;
       }
       throw new PartnerApiError(
@@ -141,11 +234,13 @@ export async function* paginate<TNode>(
   variables: Record<string, unknown>,
   select: (data: any) => Connection<TNode> | null | undefined,
   startCursor: string | null = null,
+  options: PartnerRequestOptions = {},
 ): AsyncGenerator<{ nodes: TNode[]; endCursor: string | null }> {
   let after: string | null = startCursor;
 
   for (;;) {
-    const data = await partnerQuery<unknown>(query, { ...variables, after });
+    options.signal?.throwIfAborted();
+    const data = await partnerQuery<unknown>(query, { ...variables, after }, options);
     const connection = select(data);
     if (!connection) return;
 
@@ -157,6 +252,28 @@ export async function* paginate<TNode>(
     }
 
     if (!connection.pageInfo.hasNextPage || !endCursor) return;
+
+    /*
+     * A page that says "there is more" and hands back the cursor we just asked
+     * from is not more — it is the same page again, forever. The loop stays
+     * inside `for (;;)`, re-inserts the same idempotent rows, rewrites the same
+     * cursor and never advances the watermark, so from outside it is
+     * indistinguishable from a hang: no error, no progress, no end. Reproduced
+     * against a fake Partner API at five thousand pages a second — see
+     * `scripts/stall-probe.ts`, mode `same-cursor`.
+     *
+     * Thrown rather than returned. Returning would let the caller clear its
+     * cursor and record the pass as clean, which would silently truncate the
+     * connection at whatever page the API got stuck on. A failure that retries
+     * next tick is the honest outcome.
+     */
+    if (endCursor === after) {
+      throw new PartnerApiError(
+        'Partner API paginated in place: it reported another page but returned the same ' +
+          'cursor. Refusing to loop.',
+        null,
+      );
+    }
     after = endCursor;
   }
 }
