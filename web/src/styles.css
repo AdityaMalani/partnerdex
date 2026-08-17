@@ -247,8 +247,30 @@ h3,
   overflow: hidden;
 }
 
-.nav.collapsed .nav-brand {
-  display: none;
+/*
+ * Collapsed, a label leaves the page but not the document.
+ *
+ * `display: none` takes the wordmark and the item names out of the
+ * accessibility tree with them, so a collapsed rail is a column of unnamed
+ * glyphs and a wordless mark to anything not reading it with its eyes. The
+ * hover titles are the only naming left, and a `title` is a last-resort
+ * accessible name, not a plan.
+ *
+ * Clipped rather than removed. Every item keeps its name for a screen reader,
+ * the wordmark still says whose dashboard this is, and the hover title still
+ * names each icon for a sighted reader who cannot place one.
+ */
+.nav.collapsed .nav-brand,
+.nav.collapsed .nav-label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }
 
 /*
@@ -370,10 +392,6 @@ h3,
   stroke-linejoin: round;
 }
 
-.nav.collapsed .nav-label {
-  display: none;
-}
-
 .nav.collapsed .nav-link {
   justify-content: center;
   padding: 8px 0;
@@ -451,6 +469,45 @@ h3,
 
   .nav-toggle {
     display: none;
+  }
+
+  /*
+   * Collapse is meaningless here and is undone.
+   *
+   * The rail is horizontal under a tablet and the toggle that would set the
+   * state is not on the page, so a reader who collapsed the rail on a laptop
+   * arrives on a phone to a row of unlabelled glyphs, group headings reduced
+   * to stray 1px rules, and no control anywhere to undo it. The state survives
+   * in storage; it just stops being expressed.
+   */
+  .nav.collapsed .nav-head {
+    flex-direction: row;
+    padding: 0 6px 14px;
+  }
+
+  .nav.collapsed .nav-brand,
+  .nav.collapsed .nav-label {
+    position: static;
+    width: auto;
+    height: auto;
+    margin: 0;
+    padding: 0;
+    overflow: visible;
+    clip: auto;
+  }
+
+  .nav.collapsed .nav-link {
+    justify-content: flex-start;
+    padding: 7px 8px;
+  }
+
+  .nav.collapsed .nav-group-label {
+    height: auto;
+    margin: 0;
+    padding: 0 8px 6px;
+    overflow: visible;
+    color: var(--muted);
+    background: none;
   }
 
   .nav-group {
