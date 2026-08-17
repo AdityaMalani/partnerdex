@@ -1,4 +1,4 @@
-import { getConfig } from '../config.js';
+import { getConfig, type PartnerOrg } from '../config.js';
 import { getDb, readSyncState, writeSyncState, type Db } from '../db/index.js';
 import { paginate, partnerQuery } from '../partner/client.js';
 import {
@@ -35,6 +35,59 @@ export interface SyncProgress {
 }
 
 const noop: SyncProgress = () => {};
+
+/**
+ * How long one organization may make no progress before the run moves on to the
+ * next one.
+ *
+ * Organizations sync sequentially, which is fine while every one of them either
+ * finishes or fails. It stops being fine the moment one of them does neither: a
+ * pass that parks in the first organization means the second never runs *at
+ * all* — not late, not partially, never — and no amount of per-organization
+ * error handling helps, because a hang raises nothing to handle. A second
+ * organization can sit configured and unsynced indefinitely on the strength of
+ * the first one's dead socket.
+ *
+ * Fifteen minutes, and it is an idle clock: it resets on every page. No single
+ * legitimate step comes near it — one Partner request is capped at two minutes
+ * — so the only way to reach it is a chain of failures or a hang, and both are
+ * better spent letting the next organization have its turn. It sits below the
+ * pass-level watchdog on purpose, so the run gives up on one organization before
+ * anything gives up on the whole run.
+ */
+function orgStallMs(): number {
+  const raw = Number(process.env.SYNC_ORG_STALL_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : 15 * 60_000;
+}
+
+/**
+ * A deadline for one organization, driven by the run's own progress clock.
+ *
+ * Aborting is what makes this real rather than decorative: a `Promise.race`
+ * would let the abandoned organization carry on writing to the same database
+ * underneath its successor. The signal reaches the Partner client, which stops
+ * both the request in flight and the retry loop around it.
+ */
+function orgDeadline(
+  org: PartnerOrg,
+  reporter: SyncReporter,
+): { signal: AbortSignal; release(): void } {
+  const limit = orgStallMs();
+  const controller = new AbortController();
+  const timer = setInterval(() => {
+    const idle = reporter.idleMs();
+    if (idle < limit) return;
+    const stuckFor = idle >= 60_000 ? `${Math.round(idle / 60_000)}m` : `${Math.round(idle / 1000)}s`;
+    controller.abort(
+      new Error(
+        `Organization ${org.label} made no progress for ${stuckFor} and was given up on so the ` +
+          `remaining organization(s) could sync. It resumes from its cursors on the next run.`,
+      ),
+    );
+  }, Math.min(limit, 15_000));
+  timer.unref?.();
+  return { signal: controller.signal, release: () => clearInterval(timer) };
+}
 
 function windowStart(syncedThrough: string | null, syncStartDate: string): string {
   if (!syncedThrough) return toUtcIso(`${syncStartDate}T00:00:00Z`);
@@ -132,22 +185,58 @@ export function transactionVariables(
   };
 }
 
-export function resolveScopedAppIds(db: Db): string[] {
+/**
+ * The apps in scope, across every organization by default.
+ *
+ * Unfiltered is the default deliberately: every reader of this function — the
+ * dashboard, the metrics, the funnel, the notifier — is
+ * asking "what does this instance cover?", and the answer to that has always
+ * been "all of it". Making it default to one org would silently drop the second
+ * org's apps out of every existing figure the moment it was configured.
+ *
+ * `organizationId` narrows it, and only the sync passes it, because only the
+ * sync has to pick a token.
+ */
+export function resolveScopedAppIds(db: Db, organizationId?: string): string[] {
   const { scope } = getConfig();
-  if (scope.appIds.length > 0) return scope.appIds;
-  const rows = db.prepare('SELECT id FROM apps ORDER BY id').all() as Array<{ id: string }>;
-  return rows.map((row) => row.id);
+
+  if (organizationId === undefined) {
+    if (scope.appIds.length > 0) return scope.appIds;
+    const rows = db.prepare('SELECT id FROM apps ORDER BY id').all() as Array<{ id: string }>;
+    return rows.map((row) => row.id);
+  }
+
+  // Per org the database is the authority, because `PARTNER_APP_IDS` is a flat
+  // list that names no organization. Intersecting keeps the allowlist meaning
+  // what it always meant without pretending it knows which org an id is in.
+  const rows = db
+    .prepare('SELECT id FROM apps WHERE org_id = ? ORDER BY id')
+    .all(organizationId) as Array<{ id: string }>;
+  const ids = rows.map((row) => row.id);
+  if (scope.appIds.length === 0) return ids;
+  const allowed = new Set(scope.appIds);
+  return ids.filter((id) => allowed.has(id));
+}
+
+/** Watermark keys are per organization; see the migration in `src/db/index.ts`. */
+export function transactionsKey(org: PartnerOrg, appId: string | null): string {
+  return `org:${org.organizationId}:transactions:${appId ?? 'all'}`;
+}
+
+export function eventsKey(org: PartnerOrg, appId: string): string {
+  return `org:${org.organizationId}:events:${appId}`;
 }
 
 async function syncTransactionsFor(
   db: Db,
+  org: PartnerOrg,
   appId: string | null,
   options: SyncOptions,
   signal?: AbortSignal,
 ): Promise<number> {
   const { scope } = getConfig();
   const onProgress = options.onProgress ?? noop;
-  const key = appId ? `transactions:${appId}` : 'transactions:all';
+  const key = transactionsKey(org, appId);
 
   if (options.full) {
     writeSyncState(db, key, { cursor: null, cursorWindow: null, syncedThrough: null });
@@ -162,6 +251,7 @@ async function syncTransactionsFor(
   let latest: string | null = null;
 
   const pages = paginate<TransactionNode>(
+    org,
     TRANSACTIONS_QUERY,
     transactionVariables(appId, createdAtMin, SALE_TRANSACTION_TYPES),
     (data) => data?.transactions,
@@ -170,7 +260,7 @@ async function syncTransactionsFor(
   );
 
   for await (const page of pages) {
-    total += insertTransactions(db, page.nodes);
+    total += insertTransactions(db, page.nodes, org.organizationId);
     for (const node of page.nodes) {
       const at = toUtcIso(node.createdAt);
       if (!latest || at > latest) latest = at;
@@ -192,13 +282,14 @@ async function syncTransactionsFor(
 
 async function syncEventsFor(
   db: Db,
+  org: PartnerOrg,
   appId: string,
   options: SyncOptions,
   signal?: AbortSignal,
 ): Promise<number> {
   const { scope } = getConfig();
   const onProgress = options.onProgress ?? noop;
-  const key = `events:${appId}`;
+  const key = eventsKey(org, appId);
 
   if (options.full) {
     writeSyncState(db, key, { cursor: null, cursorWindow: null, syncedThrough: null });
@@ -211,6 +302,7 @@ async function syncEventsFor(
   let latest: string | null = null;
 
   const pages = paginate<AppEventNode>(
+    org,
     APP_EVENTS_QUERY,
     {
       appId: `gid://partners/App/${appId}`,
@@ -240,19 +332,27 @@ async function syncEventsFor(
   return total;
 }
 
-/** Confirms an allowlisted app id exists and records its name locally. */
-async function confirmApp(db: Db, appId: string, signal?: AbortSignal): Promise<boolean> {
+/** Confirms an app id exists **in this organization** and records it locally. */
+async function confirmApp(
+  db: Db,
+  org: PartnerOrg,
+  appId: string,
+  signal?: AbortSignal,
+): Promise<boolean> {
   const data = await partnerQuery<{ app: { id: string; name: string; apiKey: string } | null }>(
+    org,
     APP_QUERY,
     { appId: `gid://partners/App/${appId}` },
     { signal },
   );
   if (!data.app) return false;
-  upsertApp(db, data.app);
+  upsertApp(db, data.app, org.organizationId);
   return true;
 }
 
 export interface SyncResult {
+  /** The organization ids this run covered, in configured order. */
+  orgs: string[];
   apps: string[];
   transactions: number;
   events: number;
@@ -262,6 +362,77 @@ export interface SyncResult {
   reviewEvents: number;
   reviews: ReviewSyncResult;
   listing: ListingSyncResult;
+}
+
+/**
+ * One organization's Partner API pass: transactions, then that org's events.
+ *
+ * Events live in here rather than in a single loop afterwards because picking
+ * the right token for an app means knowing its org, and because one org's
+ * revoked token then strands only its own events.
+ */
+async function syncOrg(
+  db: Db,
+  org: PartnerOrg,
+  options: SyncOptions,
+  reporter: SyncReporter,
+  signal: AbortSignal,
+): Promise<{ transactions: number; events: number }> {
+  const { scope } = getConfig();
+  const onProgress = options.onProgress ?? noop;
+
+  let transactions = 0;
+  let claimed: string[] = [];
+
+  if (scope.appIds.length > 0) {
+    /*
+     * `PARTNER_APP_IDS` is a flat list with no organization on it, so an id
+     * this org does not have is not necessarily a typo any more — it is
+     * probably the other org's app. A miss is recorded rather than thrown, and
+     * `runSync` complains at the end about any id that *no* org claimed, which
+     * is the case that really is a typo.
+     */
+    await reporter.phase('scope', org.label, async () => {
+      for (const appId of scope.appIds) {
+        if (await confirmApp(db, org, appId, signal)) claimed.push(appId);
+      }
+      return claimed;
+    }, (found) => ({ apps: found.length, configured: scope.appIds.length }));
+    onProgress(
+      `[${org.label}] scope: ${claimed.length} of ${scope.appIds.length} app(s) from ` +
+        `PARTNER_APP_IDS belong to this organization.`,
+    );
+    for (const appId of claimed) {
+      onProgress(`[${org.label}] syncing transactions for app ${appId}...`);
+      transactions += await reporter.phase(
+        'transactions',
+        org.label,
+        () => syncTransactionsFor(db, org, appId, options, signal),
+        (rows) => ({ rows }),
+      );
+    }
+  } else {
+    onProgress(`[${org.label}] scope: every app with recorded transactions.`);
+    transactions += await reporter.phase(
+      'transactions',
+      org.label,
+      () => syncTransactionsFor(db, org, null, options, signal),
+      (rows) => ({ rows }),
+    );
+  }
+
+  let events = 0;
+  for (const appId of resolveScopedAppIds(db, org.organizationId)) {
+    onProgress(`[${org.label}] syncing events for app ${appId}...`);
+    events += await reporter.phase(
+      'events',
+      org.label,
+      () => syncEventsFor(db, org, appId, options, signal),
+      (rows) => ({ rows }),
+    );
+  }
+
+  return { transactions, events };
 }
 
 export async function runSync(options: SyncOptions = {}): Promise<SyncResult> {
@@ -282,7 +453,8 @@ export async function runSync(options: SyncOptions = {}): Promise<SyncResult> {
 
 async function runSyncReported(options: SyncOptions, reporter: SyncReporter): Promise<SyncResult> {
   const db = getDb();
-  const { scope } = getConfig();
+  const { partner, scope } = getConfig();
+  const orgs = partner.orgs;
 
   /*
    * Every step below is handed the reporter's own callback rather than the
@@ -294,41 +466,42 @@ async function runSyncReported(options: SyncOptions, reporter: SyncReporter): Pr
   const onProgress = steps.onProgress ?? noop;
 
   let transactions = 0;
+  let events = 0;
 
-  if (scope.appIds.length > 0) {
-    onProgress(`Scope: ${scope.appIds.length} app(s) from PARTNER_APP_IDS.`);
-    await reporter.phase(
-      'scope',
-      null,
-      async () => {
-        for (const appId of scope.appIds) {
-          if (!(await confirmApp(db, appId))) {
-            throw new Error(
-              `App id ${appId} from PARTNER_APP_IDS was not found in this organization.`,
-            );
-          }
-        }
-        return scope.appIds;
-      },
-      (found) => ({ apps: found.length }),
-    );
-    for (const appId of scope.appIds) {
-      onProgress(`Syncing transactions for app ${appId}...`);
-      transactions += await reporter.phase(
-        'transactions',
-        null,
-        () => syncTransactionsFor(db, appId, steps),
-        (rows) => ({ rows }),
-      );
+  /*
+   * One organization's failure does not take the others down.
+   *
+   * With a single org, "abort the run" and "abort this org" were the same
+   * thing. With two they are not: a revoked token on org B would otherwise stop
+   * org A syncing at all, and stop the rebuild below, so every figure in the
+   * dashboard would freeze because of a credential for apps it does not even
+   * cover. Errors are collected, everything that can still run runs, and the
+   * aggregate is thrown at the end — so the scheduler still records a failure
+   * and still backs off.
+   */
+  const failures: Array<{ org: PartnerOrg; error: Error }> = [];
+
+  for (const org of orgs) {
+    onProgress(`Organization ${org.label} (${org.organizationId})...`);
+    try {
+      const deadline = orgDeadline(org, reporter);
+      try {
+        const counts = await reporter.phase(
+          'org',
+          org.label,
+          () => syncOrg(db, org, steps, reporter, deadline.signal),
+          (result) => ({ transactions: result.transactions, events: result.events }),
+        );
+        transactions += counts.transactions;
+        events += counts.events;
+      } finally {
+        deadline.release();
+      }
+    } catch (cause) {
+      const error = cause instanceof Error ? cause : new Error(String(cause));
+      failures.push({ org, error });
+      onProgress(`Organization ${org.label} failed: ${error.message}`);
     }
-  } else {
-    onProgress('Scope: every app with recorded transactions (PARTNER_APP_IDS is empty).');
-    transactions += await reporter.phase(
-      'transactions',
-      null,
-      () => syncTransactionsFor(db, null, steps),
-      (rows) => ({ rows }),
-    );
   }
 
   const appIds = resolveScopedAppIds(db);
@@ -336,15 +509,20 @@ async function runSyncReported(options: SyncOptions, reporter: SyncReporter): Pr
     onProgress('No apps discovered. Set PARTNER_APP_IDS if your apps have no transactions yet.');
   }
 
-  let events = 0;
-  for (const appId of appIds) {
-    onProgress(`Syncing events for app ${appId}...`);
-    events += await reporter.phase(
-      'events',
-      null,
-      () => syncEventsFor(db, appId, steps),
-      (rows) => ({ rows }),
+  // An id no organization claimed is the typo the old hard throw used to catch.
+  // It cannot be thrown per org any more, so it is checked once, here, where
+  // "no org has it" is actually knowable.
+  if (scope.appIds.length > 0 && failures.length === 0) {
+    const known = new Set(
+      (db.prepare('SELECT id FROM apps').all() as Array<{ id: string }>).map((row) => row.id),
     );
+    const orphans = scope.appIds.filter((appId) => !known.has(appId));
+    if (orphans.length > 0) {
+      onProgress(
+        `Warning: app id(s) ${orphans.join(', ')} from PARTNER_APP_IDS were not found in any ` +
+          `configured organization. Check for a typo, or add the organization that owns them.`,
+      );
+    }
   }
 
   // Before the rebuild, so a review that arrives this run is matched to a
@@ -401,5 +579,21 @@ async function runSyncReported(options: SyncOptions, reporter: SyncReporter): Pr
     warmDashboardMetrics();
   });
 
-  return { apps: appIds, transactions, events, reviews, listing, ...derived };
+  if (failures.length > 0) {
+    throw new Error(
+      `${failures.length} of ${orgs.length} organization(s) failed to sync: ` +
+        failures.map(({ org, error }) => `${org.label}: ${error.message}`).join('; '),
+      { cause: failures[0]?.error },
+    );
+  }
+
+  return {
+    orgs: orgs.map((org) => org.organizationId),
+    apps: appIds,
+    transactions,
+    events,
+    reviews,
+    listing,
+    ...derived,
+  };
 }

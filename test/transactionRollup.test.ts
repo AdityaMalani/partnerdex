@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { beforeEach, describe, it } from 'node:test';
-import { APP_GID, resetEnvironment } from './helpers.js';
+import { APP_GID, ORG_ID, resetEnvironment } from './helpers.js';
 import { getDb } from '../src/db/index.js';
 import { resetConfig } from '../src/config.js';
 import { insertTransactions, type TransactionNode } from '../src/sync/ingest.js';
@@ -56,7 +56,7 @@ function seedLedger(): void {
       );
     }
   }
-  insertTransactions(db, nodes);
+  insertTransactions(db, nodes, ORG_ID);
   rebuildDerivedTables(db);
 }
 
@@ -141,7 +141,7 @@ describe('incremental maintenance', () => {
     const db = getDb();
     const before = rollupRows();
 
-    insertTransactions(db, [sale('late-1', '2024-06-15T04:00:00.000Z', 5)]);
+    insertTransactions(db, [sale('late-1', '2024-06-15T04:00:00.000Z', 5)], ORG_ID);
     const result = syncTransactionDaily(db);
 
     assert.equal(result.full, false, 'a one-day arrival must not rebuild everything');
@@ -162,7 +162,7 @@ describe('incremental maintenance', () => {
     seedLedger();
     const db = getDb();
 
-    insertTransactions(db, [sale('backdated', '2024-04-02T11:00:00.000Z', 77.77)]);
+    insertTransactions(db, [sale('backdated', '2024-04-02T11:00:00.000Z', 77.77)], ORG_ID);
     syncTransactionDaily(db);
 
     assert.deepEqual(rollupRows(), rawTotals());
@@ -184,7 +184,7 @@ describe('incremental maintenance', () => {
       const at = new Date(Date.UTC(2023, 0, 1) + day * 86_400_000);
       nodes.push(sale(`bulk-${day}`, at.toISOString(), 1.11));
     }
-    insertTransactions(db, nodes);
+    insertTransactions(db, nodes, ORG_ID);
     assert.equal(syncTransactionDaily(db).full, true);
     assert.deepEqual(rollupRows(), rawTotals());
   });
@@ -206,7 +206,7 @@ describe('restatement', () => {
       .get('2024-04-05') as { g: number };
 
     // Same id, different money: an upsert, not an insert.
-    insertTransactions(db, [sale('4-0', '2024-04-05T01:17:33.000Z', 500)]);
+    insertTransactions(db, [sale('4-0', '2024-04-05T01:17:33.000Z', 500)], ORG_ID);
     syncTransactionDaily(db);
 
     const corrected = db
@@ -222,7 +222,7 @@ describe('restatement', () => {
     const before = rollupRows();
 
     // The amount the fixture already gave this row, so nothing actually moves.
-    insertTransactions(db, [sale('4-0', '2024-04-05T01:17:33.000Z', AMOUNTS[16 % AMOUNTS.length]!)]);
+    insertTransactions(db, [sale('4-0', '2024-04-05T01:17:33.000Z', AMOUNTS[16 % AMOUNTS.length]!)], ORG_ID);
     syncTransactionDaily(db);
 
     // Recomputed from the raw rows rather than adjusted, so applying the same
@@ -256,7 +256,7 @@ describe('reporting timezone', () => {
     resetEnvironment({ METRICS_INCLUDE_USAGE: 'true', REPORTING_TIMEZONE: 'America/Los_Angeles' });
     const db = getDb();
     // 03:00 UTC on the 6th is 20:00 on the 5th in that zone.
-    insertTransactions(db, [sale('tz', '2024-04-06T03:00:00.000Z', 10)]);
+    insertTransactions(db, [sale('tz', '2024-04-06T03:00:00.000Z', 10)], ORG_ID);
     rebuildDerivedTables(db);
 
     const rows = db.prepare('SELECT day FROM transaction_daily').all() as Array<{ day: string }>;

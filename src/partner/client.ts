@@ -1,4 +1,4 @@
-import { getConfig } from '../config.js';
+import type { PartnerOrg } from '../config.js';
 
 export class PartnerApiError extends Error {
   constructor(
@@ -103,22 +103,41 @@ export interface PartnerRequestOptions {
  * The Partner API is throttled per organization and answers with 429 plus a
  * Retry-After when you exceed it. Everything goes through this one function so
  * backoff and error shaping live in a single place.
+ *
+ * `org` is the **first** parameter and has no default, on purpose. The
+ * organization lives in the endpoint path, so every call is already a call to
+ * one specific org — the only question is whether the code says which. An
+ * optional trailing argument would answer "org 0" for any call site that forgot,
+ * and against the wrong org an app id either 404s (loud, but far from the cause)
+ * or, worse, resolves — writing one organization's rows under an app id that
+ * belongs to the other. Required and first means a forgotten call site is a
+ * compile error.
  */
 export async function partnerQuery<T>(
+  org: PartnerOrg,
   query: string,
   variables: Record<string, unknown> = {},
   options: PartnerRequestOptions = {},
 ): Promise<T> {
-  const { partner } = getConfig();
+  // The compiler enforces this for TypeScript callers; the runtime check is for
+  // the ones it cannot see — a JS import, a test double, `any` in the middle of
+  // a chain — because a missing org here is a wrong-data bug, not a crash.
+  if (!org?.endpoint || !org.token) {
+    throw new PartnerApiError(
+      'partnerQuery was called without an organization. Every Partner API call must name ' +
+        'the organization it is for; there is no default.',
+      null,
+    );
+  }
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
     let response: Response;
     try {
-      response = await fetch(partner.endpoint, {
+      response = await fetch(org.endpoint, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'X-Shopify-Access-Token': partner.token,
+          'X-Shopify-Access-Token': org.token,
           Accept: 'application/json',
         },
         body: JSON.stringify({ query, variables }),
@@ -164,15 +183,17 @@ export async function partnerQuery<T>(
 
     if (response.status === 401 || response.status === 403) {
       throw new PartnerApiError(
-        `Partner API rejected the token (${response.status}). Check PARTNER_API_TOKEN and that the ` +
-          `client has the "View financials" and "Manage apps" permissions.`,
+        `Partner API rejected the token for organization ${org.label} (${response.status}). ` +
+          `Check that org's token and that the client has the "View financials" and ` +
+          `"Manage apps" permissions.`,
         response.status,
       );
     }
 
     if (response.status === 404) {
       throw new PartnerApiError(
-        `Partner API returned 404. Check PARTNER_ORGANIZATION_ID and PARTNER_API_VERSION.`,
+        `Partner API returned 404 for organization ${org.organizationId}. Check that ` +
+          `organization id and PARTNER_API_VERSION.`,
         404,
       );
     }
@@ -230,6 +251,7 @@ export interface Connection<T> {
  * callers can persist incrementally and keep a resumable cursor.
  */
 export async function* paginate<TNode>(
+  org: PartnerOrg,
   query: string,
   variables: Record<string, unknown>,
   select: (data: any) => Connection<TNode> | null | undefined,
@@ -240,7 +262,7 @@ export async function* paginate<TNode>(
 
   for (;;) {
     options.signal?.throwIfAborted();
-    const data = await partnerQuery<unknown>(query, { ...variables, after }, options);
+    const data = await partnerQuery<unknown>(org, query, { ...variables, after }, options);
     const connection = select(data);
     if (!connection) return;
 
@@ -269,8 +291,8 @@ export async function* paginate<TNode>(
      */
     if (endCursor === after) {
       throw new PartnerApiError(
-        'Partner API paginated in place: it reported another page but returned the same ' +
-          'cursor. Refusing to loop.',
+        `Partner API paginated in place for organization ${org.label}: it reported another page ` +
+          `but returned the same cursor. Refusing to loop.`,
         null,
       );
     }

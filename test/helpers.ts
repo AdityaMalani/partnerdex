@@ -1,6 +1,6 @@
 import { closeDb, getDb } from '../src/db/index.js';
 import { resetConfig } from '../src/config.js';
-import { insertAppEvents, insertTransactions } from '../src/sync/ingest.js';
+import { insertAppEvents, insertTransactions, resetAppOrgWarnings } from '../src/sync/ingest.js';
 import { rebuildDerivedTables } from '../src/sync/derive.js';
 import type { AppEventNode, TransactionNode } from '../src/sync/ingest.js';
 
@@ -13,11 +13,29 @@ import type { AppEventNode, TransactionNode } from '../src/sync/ingest.js';
 export const APP_ID = '111';
 export const APP_GID = `gid://partners/App/${APP_ID}`;
 
+/**
+ * The organization the fixtures are attributed to.
+ *
+ * It matches `PARTNER_ORGANIZATION_ID` below on purpose: the default fixture
+ * environment is the legacy single-org one, which is the compatibility
+ * guarantee this change has to keep. Multi-org tests set the indexed variables
+ * themselves.
+ */
+export const ORG_ID = '999';
+export const OTHER_ORG_ID = '888';
+
 export function resetEnvironment(overrides: Record<string, string> = {}): void {
   closeDb();
   resetConfig();
   process.env.PARTNER_API_TOKEN = 'test-token';
-  process.env.PARTNER_ORGANIZATION_ID = '999';
+  process.env.PARTNER_ORGANIZATION_ID = ORG_ID;
+  // Indexed org variables are additive to the legacy pair, so one multi-org
+  // test would otherwise leave a second organization configured for every test
+  // that ran after it in the same process.
+  for (const name of Object.keys(process.env)) {
+    if (/^PARTNER_ORG_(\d+_(ID|TOKEN|LABEL)|LABEL)$/.test(name)) delete process.env[name];
+  }
+  resetAppOrgWarnings();
   process.env.PARTNER_API_VERSION = '2026-07';
   process.env.PARTNER_APP_IDS = APP_ID;
   process.env.DATABASE_PATH = ':memory:';
@@ -196,7 +214,7 @@ export function seed(
   }
 
   insertAppEvents(db, APP_ID, events);
-  insertTransactions(db, transactions);
+  insertTransactions(db, transactions, ORG_ID);
   rebuildDerivedTables(db);
   return db;
 }
@@ -209,9 +227,10 @@ export function pointAt(response: { timeSeries: Array<{ value: number; periodSta
 
 /**
  * Seeds one live paid subscription for an arbitrary app id, so tests can build a
- * shop that subscribes to more than one app.
+ * shop that subscribes to more than one app — and, with `orgId`, an app in a
+ * different Partner organization.
  */
-export function seedForApp(appId: string, chargeRef: string, shopId = '10') {
+export function seedForApp(appId: string, chargeRef: string, shopId = '10', orgId = ORG_ID) {
   const db = getDb();
   const charge = {
     id: `gid://shopify/AppSubscription/${chargeRef}`,
@@ -242,7 +261,7 @@ export function seedForApp(appId: string, chargeRef: string, shopId = '10') {
       netAmount: { amount: '21', currencyCode: 'USD' },
       shopifyFee: { amount: '4', currencyCode: 'USD' },
     },
-  ]);
+  ], orgId);
   rebuildDerivedTables(db);
   return db;
 }

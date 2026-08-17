@@ -109,6 +109,132 @@ function appStoreHandles(): Record<string, string> {
 }
 
 /**
+ * One Shopify Partner organization and the credential that opens it.
+ *
+ * The organization id is part of the endpoint *path*, not a header, so the
+ * endpoint is per-org and there is no such thing as an org-agnostic Partner API
+ * call. That is why this object — not a bare id — is what gets passed around:
+ * a caller holding a `PartnerOrg` cannot pair one org's id with another's token.
+ */
+export interface PartnerOrg {
+  organizationId: string;
+  token: string;
+  /** Human label for logs and the doctor output; defaults to the id. */
+  label: string;
+  apiVersion: string;
+  endpoint: string;
+}
+
+/** The one place the endpoint URL template exists. */
+function endpointFor(organizationId: string, apiVersion: string): string {
+  return `https://partners.shopify.com/${organizationId}/api/${apiVersion}/graphql.json`;
+}
+
+function apiVersion(): string {
+  const value = optional('PARTNER_API_VERSION', '2026-07');
+  if (!/^(\d{4}-\d{2}|unstable)$/.test(value)) {
+    throw new ConfigError(`PARTNER_API_VERSION must be YYYY-MM or "unstable", got "${value}".`);
+  }
+  return value;
+}
+
+/**
+ * Every configured organization, in priority order. Never empty.
+ *
+ * Two forms, and they **combine** rather than override, because the combination
+ * is the migration path:
+ *
+ *   1. `PARTNER_ORGANIZATION_ID` + `PARTNER_API_TOKEN` — the original pair.
+ *      Still supported, still first in the list, still the source of the same
+ *      error message when nothing at all is configured. An existing deployment
+ *      changes no variable it already has.
+ *   2. `PARTNER_ORG_<n>_ID` + `PARTNER_ORG_<n>_TOKEN` (+ optional
+ *      `PARTNER_ORG_<n>_LABEL`) for any positive integer n.
+ *
+ * So adding a second organization to a running instance is exactly two new
+ * secrets and nothing removed — `fly secrets set PARTNER_ORG_2_ID=...
+ * PARTNER_ORG_2_TOKEN=...`. Indexed variables rather than one
+ * `PARTNER_ORGS="id:token,id:token"` list for three reasons: `fly secrets set`
+ * takes one name-value pair at a time, so rotating org B's token would
+ * otherwise mean re-pasting org A's; a token is never a substring of a larger
+ * value that some log line might print whole; and there is no delimiter for a
+ * token to collide with.
+ *
+ * The indices are *scanned*, not counted up from 1, so deleting
+ * `PARTNER_ORG_2_*` and leaving `PARTNER_ORG_3_*` in place drops one org
+ * instead of silently dropping two.
+ *
+ * Order matters beyond cosmetics: `orgs[0]` is what the `apps.org_id` migration
+ * backfills existing rows to. With the legacy pair present it is the legacy
+ * org, which is by definition the only org those rows can have come from.
+ */
+function partnerOrgs(version: string): PartnerOrg[] {
+  const orgs: PartnerOrg[] = [];
+  const seen = new Map<string, string>();
+
+  const add = (rawId: string, token: string, label: string, source: string): void => {
+    const organizationId = normalizeAppId(rawId);
+    if (!/^\d+$/.test(organizationId)) {
+      throw new ConfigError(
+        `${source} must be the numeric organization id from the Partner dashboard URL, ` +
+          `got "${rawId}".`,
+      );
+    }
+    if (!token) {
+      throw new ConfigError(`Organization ${organizationId} (${source}) has no access token.`);
+    }
+    const previous = seen.get(organizationId);
+    if (previous) {
+      throw new ConfigError(
+        `Organization ${organizationId} is configured twice, by ${previous} and ${source}. ` +
+          `Two entries for one org would sync it twice and fight over its watermarks.`,
+      );
+    }
+    seen.set(organizationId, source);
+    orgs.push({
+      organizationId,
+      token,
+      label: label || organizationId,
+      apiVersion: version,
+      endpoint: endpointFor(organizationId, version),
+    });
+  };
+
+  const legacyId = process.env.PARTNER_ORGANIZATION_ID?.trim();
+  if (legacyId) {
+    add(
+      legacyId,
+      required('PARTNER_API_TOKEN'),
+      process.env.PARTNER_ORG_LABEL?.trim() ?? '',
+      'PARTNER_ORGANIZATION_ID',
+    );
+  }
+
+  const indices = Object.keys(process.env)
+    .map((name) => /^PARTNER_ORG_(\d+)_ID$/.exec(name)?.[1])
+    .filter((index): index is string => Boolean(index))
+    .map(Number)
+    .sort((a, b) => a - b);
+
+  for (const index of indices) {
+    const id = process.env[`PARTNER_ORG_${index}_ID`]?.trim();
+    if (!id) continue;
+    add(
+      id,
+      required(`PARTNER_ORG_${index}_TOKEN`),
+      process.env[`PARTNER_ORG_${index}_LABEL`]?.trim() ?? '',
+      `PARTNER_ORG_${index}_ID`,
+    );
+  }
+
+  // The original message, unchanged, for the original mistake: an instance with
+  // no organization at all.
+  if (orgs.length === 0) required('PARTNER_ORGANIZATION_ID');
+
+  return orgs;
+}
+
+/**
  * The dashboard password, or null when the gate is off.
  *
  * A short password is worse than none, because it invites exposing the port on
@@ -164,10 +290,17 @@ export interface ReportingDefaults {
 
 export interface Config {
   partner: {
-    token: string;
-    organizationId: string;
     apiVersion: string;
-    endpoint: string;
+    /**
+     * Every configured organization. Never empty; `orgs[0]` is the primary.
+     *
+     * There is deliberately no `organizationId`/`token`/`endpoint` beside this
+     * any more. A convenience "default org" on the config object is exactly the
+     * silent fallback this whole change exists to remove: a caller that forgot
+     * to say which org it meant would keep compiling and write one org's data
+     * under the other org's app.
+     */
+    orgs: PartnerOrg[];
   };
   auth: {
     /**
@@ -234,18 +367,12 @@ let cached: Config | null = null;
 export function getConfig(): Config {
   if (cached) return cached;
 
-  const organizationId = normalizeAppId(required('PARTNER_ORGANIZATION_ID'));
-  const apiVersion = optional('PARTNER_API_VERSION', '2026-07');
-  if (!/^(\d{4}-\d{2}|unstable)$/.test(apiVersion)) {
-    throw new ConfigError(`PARTNER_API_VERSION must be YYYY-MM or "unstable", got "${apiVersion}".`);
-  }
+  const version = apiVersion();
 
   cached = {
     partner: {
-      token: required('PARTNER_API_TOKEN'),
-      organizationId,
-      apiVersion,
-      endpoint: `https://partners.shopify.com/${organizationId}/api/${apiVersion}/graphql.json`,
+      apiVersion: version,
+      orgs: partnerOrgs(version),
     },
     auth: {
       password: dashboardPassword(),
@@ -278,6 +405,37 @@ export function getConfig(): Config {
   };
 
   return cached;
+}
+
+/**
+ * The primary organization — `orgs[0]`.
+ *
+ * Exactly one thing is allowed to use this: the `apps.org_id` backfill, which
+ * is answering "which org did the rows in this database, synced when only one
+ * org could be configured, come from?". It is not a default for API calls. Use
+ * `getOrg` when you have an id, and take a `PartnerOrg` parameter otherwise.
+ */
+export function getPrimaryOrg(): PartnerOrg {
+  const [first] = getConfig().partner.orgs;
+  // `partnerOrgs` refuses to return an empty list, so this is unreachable — it
+  // exists because `noUncheckedIndexedAccess` is on and a non-null assertion
+  // here would be the one place a config bug turned into `undefined.token`.
+  if (!first) throw new ConfigError('No Shopify Partner organization is configured.');
+  return first;
+}
+
+/** Credentials for a known organization id, refused rather than guessed. */
+export function getOrg(organizationId: string): PartnerOrg {
+  const match = getConfig().partner.orgs.find(
+    (org) => org.organizationId === organizationId,
+  );
+  if (!match) {
+    throw new ConfigError(
+      `No credentials configured for Shopify Partner organization ${organizationId}. ` +
+        `Set PARTNER_ORG_<n>_ID and PARTNER_ORG_<n>_TOKEN for it.`,
+    );
+  }
+  return match;
 }
 
 /** Test seam: drop the memoized config so a new environment can be read. */

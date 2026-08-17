@@ -6,9 +6,10 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { closeDb, getDb, readSyncState, writeSyncState } from '../src/db/index.js';
-import { runSync } from '../src/sync/index.js';
+import { runSync, transactionsKey } from '../src/sync/index.js';
 import { addDays, toUtcIso } from '../src/metrics/time.js';
-import { resetEnvironment } from './helpers.js';
+import { getPrimaryOrg } from '../src/config.js';
+import { ORG_ID, resetEnvironment } from './helpers.js';
 
 /**
  * The two ways a pass could leave the sync behind its own data.
@@ -135,7 +136,7 @@ function fakePartnerApi(rows: Row[], pageSize = 2): Fake {
 }
 
 function key(): string {
-  return 'transactions:all';
+  return transactionsKey(getPrimaryOrg(), null);
 }
 
 /** The window a pass will ask for, given what is recorded. */
@@ -385,11 +386,11 @@ describe('the cursor_window column on an existing database', () => {
       `);
       legacy
         .prepare('INSERT INTO sync_state VALUES (?, ?, ?, ?)')
-        .run('transactions:all', 'legacy-cursor', '2026-08-01T00:00:00.000Z', '2026-08-01T00:00:00.000Z');
+        .run(`org:${ORG_ID}:transactions:all`, 'legacy-cursor', '2026-08-01T00:00:00.000Z', '2026-08-01T00:00:00.000Z');
       legacy.close();
 
       resetEnvironment({ DATABASE_PATH: file });
-      const state = readSyncState(getDb(), 'transactions:all');
+      const state = readSyncState(getDb(), `org:${ORG_ID}:transactions:all`);
       // The column is there, the row survived, and its cursor reads as
       // provenance-unknown rather than as belonging to some window.
       assert.deepEqual(state, {

@@ -6,7 +6,7 @@ import { getCustomer, listCustomers } from '../src/customers/index.js';
 import { runMetric } from '../src/metrics/registry.js';
 import { rebuildDerivedTables } from '../src/sync/derive.js';
 import { insertTransactions, type TransactionNode } from '../src/sync/ingest.js';
-import { APP_GID, APP_ID, resetEnvironment, seed } from './helpers.js';
+import { APP_GID, APP_ID, ORG_ID, resetEnvironment, seed } from './helpers.js';
 
 /**
  * The acceptance scenarios from the customer-events spec, plus the invariant
@@ -678,7 +678,7 @@ describe('customer events: compiling payments without rewriting them', () => {
     const later = 'gid://partners/AppSubscriptionSale/c40-late';
     assert.equal(paymentEvent(later), undefined);
 
-    insertTransactions(getDb(), [sale('c40-late', '2024-04-01T00:00:00Z', 20)]);
+    insertTransactions(getDb(), [sale('c40-late', '2024-04-01T00:00:00Z', 20)], ORG_ID);
     rebuildDerivedTables(getDb());
 
     assert.equal(paymentEvent(later)?.type, 'payment');
@@ -694,13 +694,13 @@ describe('customer events: compiling payments without rewriting them', () => {
     const id = 'gid://partners/AppSubscriptionSale/c40-fresh';
     const today = new Date().toISOString();
 
-    insertTransactions(getDb(), [sale('c40-fresh', today, 20)]);
+    insertTransactions(getDb(), [sale('c40-fresh', today, 20)], ORG_ID);
     rebuildDerivedTables(getDb());
     assert.equal(paymentEvent(id)?.type, 'payment');
 
     // The Partner API restates it as a reversal, exactly as `insertTransactions`
     // would on the next overlapping pass.
-    insertTransactions(getDb(), [sale('c40-fresh', today, -20)]);
+    insertTransactions(getDb(), [sale('c40-fresh', today, -20)], ORG_ID);
     rebuildDerivedTables(getDb());
 
     assert.equal(paymentEvent(id)?.type, 'refund');
@@ -782,13 +782,13 @@ describe('a corrected transaction moves the money on its compiled event', () => 
           .get() as { amount: number | null; currency: string | null } | undefined
       );
 
-    insertTransactions(getDb(), [restate(50)]);
+    insertTransactions(getDb(), [restate(50)], ORG_ID);
     rebuildDerivedTables(getDb());
     assert.equal(amountOf()?.amount, 50, 'the first compile carries the original figure');
 
     // Same transaction id, restated by the Partner API at a lower gross. The
     // event already exists, so this goes through ON CONFLICT rather than INSERT.
-    insertTransactions(getDb(), [restate(35)]);
+    insertTransactions(getDb(), [restate(35)], ORG_ID);
     rebuildDerivedTables(getDb());
 
     assert.equal(amountOf()?.amount, 35, 'the compiled event must carry the corrected figure');

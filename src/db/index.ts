@@ -1,7 +1,7 @@
 import Database from 'better-sqlite3';
 import fs from 'node:fs';
 import path from 'node:path';
-import { getConfig } from '../config.js';
+import { getConfig, getPrimaryOrg } from '../config.js';
 import { ADD_APP_CLICK_EVENT, LISTING_VIEW_EVENT } from '../bigquery/events.js';
 import { SCHEMA_SQL } from './schema.js';
 
@@ -62,6 +62,68 @@ function migrate(db: Db): void {
   if (!columns('sync_state').has('cursor_window')) {
     db.exec('ALTER TABLE sync_state ADD COLUMN cursor_window TEXT');
   }
+
+  /*
+   * Apps learned which Shopify Partner organization they came from.
+   *
+   * Two things happen here and they have to happen together, which is why they
+   * share one transaction: the column, and the renaming of the sync watermarks.
+   *
+   * The backfill is the reason this is a migration rather than a schema line.
+   * Every app already in this file was synced when only one organization could
+   * be configured, so it can only have come from that one — `orgs[0]`. Left
+   * blank instead, the first multi-org sync would have apps it cannot pick a
+   * token for.
+   *
+   * The rename is the reason it is urgent. Watermark keys used to be
+   * `transactions:all` / `transactions:<appId>` / `events:<appId>`, which name
+   * no organization; two orgs sharing `transactions:all` would take turns
+   * pushing each other's watermark forward and each would then skip the range
+   * the other had already claimed — a silent gap, not a crash. The new keys are
+   * `org:<orgId>:...`. Renaming the existing ones rather than letting them fall
+   * out of use is what stops a completed multi-hour backfill restarting from
+   * `SYNC_START_DATE`. `sync_state` is WITHOUT ROWID with `key` as its primary
+   * key, and an UPDATE of a primary key simply rewrites the row.
+   *
+   * `reviews:` and `bigquery:` keys are deliberately untouched — they are keyed
+   * by app id and app ids are globally unique across organizations.
+   *
+   * In a transaction because it is two statements over the same fact: a crash
+   * between them would leave a database with the column and un-namespaced keys,
+   * which reads as "never synced".
+   */
+  const apps = columns('apps');
+  if (!apps.has('org_id')) {
+    const primaryOrgId = getPrimaryOrg().organizationId;
+    db.transaction(() => {
+      db.exec(`ALTER TABLE apps ADD COLUMN org_id TEXT NOT NULL DEFAULT ''`);
+      db.prepare(`UPDATE apps SET org_id = ? WHERE org_id = ''`).run(primaryOrgId);
+
+      // Defensive, and cheap: a legacy key whose namespaced counterpart somehow
+      // already exists would make the UPDATE below a primary-key collision and
+      // take the boot down. The namespaced row is the newer of the two, so the
+      // legacy one goes.
+      db.prepare(
+        `DELETE FROM sync_state
+          WHERE (key LIKE 'transactions:%' OR key LIKE 'events:%')
+            AND EXISTS (SELECT 1 FROM sync_state other
+                         WHERE other.key = 'org:' || ? || ':' || sync_state.key)`,
+      ).run(primaryOrgId);
+
+      db.prepare(
+        `UPDATE sync_state
+            SET key = 'org:' || ? || ':' || key
+          WHERE key LIKE 'transactions:%' OR key LIKE 'events:%'`,
+      ).run(primaryOrgId);
+    })();
+  }
+
+  // Unconditional and idempotent, outside the guard above and deliberately so:
+  // inside it a *new* database would never get the index, because its table
+  // arrives with the column already present and the branch never runs. And not
+  // in the schema block, because that runs before this and would name a column
+  // an old database lacks.
+  db.exec('CREATE INDEX IF NOT EXISTS idx_apps_org ON apps (org_id)');
 
   // The GA4 export dataset moved from the connection to the app. A partner
   // running one GA4 property per listing has a dataset per app, so a single

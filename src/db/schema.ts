@@ -24,8 +24,22 @@ export const SCHEMA_SQL = `
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
 
+-- \`org_id\` is the Shopify Partner organization this app was synced from. One
+-- instance can cover several, and an app id alone does not say which token
+-- reaches it.
+--
+-- \`DEFAULT ''\` is load-bearing rather than tidy: this block is
+-- \`CREATE TABLE IF NOT EXISTS\` re-run on every open, so on an existing database
+-- the column only ever arrives through the \`ALTER TABLE\` in \`migrate()\`, and
+-- SQLite's ADD COLUMN refuses a NOT NULL column with no default. The blank is
+-- also what the backfill there looks for.
+--
+-- The index on it is NOT here. See \`migrate()\` — this block runs before
+-- migrations on every open, so an index naming a column that a migration adds
+-- takes the process down on every database that predates the column.
 CREATE TABLE IF NOT EXISTS apps (
   id             TEXT PRIMARY KEY,
+  org_id         TEXT NOT NULL DEFAULT '',
   name           TEXT NOT NULL,
   api_key        TEXT,
   discovered_at  TEXT NOT NULL

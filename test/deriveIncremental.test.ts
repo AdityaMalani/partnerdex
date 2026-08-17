@@ -5,7 +5,7 @@ import { insertAppEvents, insertTransactions } from '../src/sync/ingest.js';
 import type { AppEventNode, TransactionNode } from '../src/sync/ingest.js';
 import { rebuildDerivedTables } from '../src/sync/derive.js';
 import { nextDirtyPairs } from '../src/sync/chargeIndex.js';
-import { APP_ID, resetEnvironment } from './helpers.js';
+import { APP_ID, ORG_ID, resetEnvironment } from './helpers.js';
 
 /**
  * The incremental derive, proven rather than asserted.
@@ -180,7 +180,7 @@ function seedPopulation(): void {
   }
 
   insertAppEvents(db, APP_ID, events);
-  insertTransactions(db, sales);
+  insertTransactions(db, sales, ORG_ID);
   rebuildDerivedTables(db);
 }
 
@@ -205,7 +205,7 @@ describe('the incremental derive: what makes a merchant dirty', () => {
 
     // The transaction names the charge, not the merchant's derived rows; the
     // pair has to be recovered from the charge index.
-    insertTransactions(db, [sale('c1', 's1', '2024-03-16T00:00:00.000Z', 11)]);
+    insertTransactions(db, [sale('c1', 's1', '2024-03-16T00:00:00.000Z', 11)], ORG_ID);
     const before = nextDirtyPairs(db);
     assert.equal(before.length, 0, 'the ingest marks the charge, not the pair');
 
@@ -231,7 +231,7 @@ describe('the incremental derive: what makes a merchant dirty', () => {
       netAmount: { amount: '2', currencyCode: 'USD' },
       shopifyFee: { amount: '1', currencyCode: 'USD' },
     };
-    insertTransactions(db, [usage]);
+    insertTransactions(db, [usage], ORG_ID);
 
     const marked = db
       .prepare('SELECT COUNT(*) AS n FROM charge_sales_dirty')
@@ -297,6 +297,7 @@ describe('the incremental derive: what makes a merchant dirty', () => {
     insertTransactions(
       db,
       [sale('pb3', 'p3', '2024-01-15T00:00:00.000Z', 240, 'ANNUAL')],
+      ORG_ID,
     );
     rebuildDerivedTables(db);
 
@@ -333,6 +334,7 @@ describe('the incremental derive: exactness against a full rebuild', () => {
         sale('c41', 's41', '2024-06-16T00:00:00.000Z', 55),
         sale('c6', 's6', '2024-03-16T00:00:00.000Z', 16),
       ],
+      ORG_ID,
     );
     rebuildDerivedTables(db);
 
@@ -363,6 +365,7 @@ describe('the incremental derive: exactness against a full rebuild', () => {
           sale('c0', 's0', '2024-01-16T00:00:00.000Z', 99),
           sale('c3', 's3', '2024-01-16T00:00:00.000Z', 77),
         ],
+        ORG_ID,
       );
 
     restate();
@@ -414,7 +417,7 @@ describe('the incremental derive: exactness against a full rebuild', () => {
     resetEnvironment();
     const db = getDb();
     insertAppEvents(db, APP_ID, [activation('z1', 'z1', '2024-01-01T00:00:00.000Z', 20)]);
-    insertTransactions(db, [sale('z1', 'z1', '2024-01-16T00:00:00.000Z', 20)]);
+    insertTransactions(db, [sale('z1', 'z1', '2024-01-16T00:00:00.000Z', 20)], ORG_ID);
     rebuildDerivedTables(db);
     assert.equal(
       (
@@ -425,7 +428,7 @@ describe('the incremental derive: exactness against a full rebuild', () => {
       1,
     );
 
-    insertTransactions(db, [sale('z1', 'z1', '2024-01-16T00:00:00.000Z', 0)]);
+    insertTransactions(db, [sale('z1', 'z1', '2024-01-16T00:00:00.000Z', 0)], ORG_ID);
     rebuildDerivedTables(db);
     assert.equal(
       (

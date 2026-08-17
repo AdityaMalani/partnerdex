@@ -63,16 +63,63 @@ export interface AppEventNode {
   } | null;
 }
 
-export function upsertApp(db: Db, app: AppNode): string {
+/**
+ * `<appId>:<orgId>` pairs whose attribution has already been checked.
+ *
+ * `upsertApp` runs once per *transaction row* — 8.6M of them on the backfill —
+ * against a table with a few dozen rows in it. Without this memo the check
+ * below would be an extra prepare and lookup on every one of those rows to
+ * re-answer a question that cannot change within a page. First sight pays for
+ * it; nothing after does.
+ */
+const orgChecked = new Set<string>();
+
+/** Test seam: forget what has been checked and warned about. */
+export function resetAppOrgWarnings(): void {
+  orgChecked.clear();
+}
+
+/**
+ * `orgId` is required. An app id is globally unique across Partner
+ * organizations, so this column is the only record of which token reaches it —
+ * and a wrong value is not a crash, it is one org's rows filed under the other.
+ */
+export function upsertApp(db: Db, app: AppNode, orgId: string): string {
   const id = gidTail(app.id);
   if (!id) return '';
+
+  /*
+   * A change of organization is reported, not performed quietly.
+   *
+   * `gid://partners/App/<id>` is a global id, so two orgs cannot legitimately
+   * hand back the same app — an app that appears to move org means either a
+   * genuine transfer between the partner's own organizations, or a token
+   * pointed at the wrong org. Both are worth a line in the log; only the second
+   * is a bug, and it is invisible otherwise.
+   */
+  const memo = `${id}:${orgId}`;
+  if (!orgChecked.has(memo)) {
+    orgChecked.add(memo);
+    const existing = db.prepare('SELECT org_id FROM apps WHERE id = ?').get(id) as
+      | { org_id: string }
+      | undefined;
+    if (existing && existing.org_id && existing.org_id !== orgId) {
+      console.warn(
+        `[partnerdex] app ${id} was recorded under organization ${existing.org_id} and has now ` +
+          `been returned by organization ${orgId}. Re-attributing it. If that is not a transfer ` +
+          `you made, one of the configured tokens is pointed at the wrong organization.`,
+      );
+    }
+  }
+
   db.prepare(
-    `INSERT INTO apps (id, name, api_key, discovered_at)
-     VALUES (?, ?, ?, ?)
+    `INSERT INTO apps (id, org_id, name, api_key, discovered_at)
+     VALUES (?, ?, ?, ?, ?)
      ON CONFLICT(id) DO UPDATE SET
+       org_id = excluded.org_id,
        name = excluded.name,
        api_key = COALESCE(excluded.api_key, apps.api_key)`,
-  ).run(id, app.name, app.apiKey ?? null, new Date().toISOString());
+  ).run(id, orgId, app.name, app.apiKey ?? null, new Date().toISOString());
   return id;
 }
 
@@ -89,7 +136,12 @@ export function upsertShop(db: Db, shop: ShopNode | null | undefined): string {
   return id;
 }
 
-export function insertTransactions(db: Db, nodes: TransactionNode[]): number {
+/**
+ * `orgId` is required and applies to the whole batch, which is correct by
+ * construction: a page of transactions came back from exactly one
+ * organization's endpoint, so every app named on it belongs to that org.
+ */
+export function insertTransactions(db: Db, nodes: TransactionNode[], orgId: string): number {
   const statement = db.prepare(
     `INSERT INTO transactions (
        id, type, app_id, shop_id, charge_id, charge_ref, created_at,
@@ -136,7 +188,7 @@ export function insertTransactions(db: Db, nodes: TransactionNode[]): number {
     const touchedTransactions: string[] = [];
     for (const node of batch) {
       if (!node.app) continue; // non-app transactions (tax, referral) are out of scope
-      const appId = upsertApp(db, node.app);
+      const appId = upsertApp(db, node.app, orgId);
       const shopId = upsertShop(db, node.shop);
       const gross = money(node.grossAmount);
       const net = money(node.netAmount);

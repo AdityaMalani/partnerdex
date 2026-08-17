@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import { resetEnvironment } from './helpers.js';
 import { paginate, PartnerApiError } from '../src/partner/client.js';
+import type { PartnerOrg } from '../src/config.js';
 import { runInWorker } from '../src/sync/fork.js';
 import {
   resetSyncScheduler,
@@ -25,15 +26,8 @@ const EMPTY = {} as SyncResult;
  * answered, a 429 that asks for a quarter of an hour, and a connection that
  * paginates in place.
  */
-const realFetch = globalThis.fetch;
-
-/**
- * The Partner endpoint is derived from the organization id, so there is no
- * setting that points the client at a test server. `fetch` is redirected to the
- * fake instead — the request, its abort signal and the socket underneath it are
- * all real, which is the part these tests are about; only the address changes.
- */
 function fakePartnerApi(handler: (respond: Respond) => void): Promise<{
+  org: PartnerOrg;
   close: () => Promise<void>;
 }> {
   const server: Server = createServer((_request, response) => handler(response as Respond));
@@ -41,13 +35,15 @@ function fakePartnerApi(handler: (respond: Respond) => void): Promise<{
     server.listen(0, '127.0.0.1', () => {
       const address = server.address();
       const port = typeof address === 'object' && address ? address.port : 0;
-      const origin = `http://127.0.0.1:${port}/`;
-      globalThis.fetch = ((_url: unknown, init?: RequestInit) =>
-        realFetch(origin, init)) as typeof fetch;
       resolve({
+        org: {
+          label: 'acme',
+          organizationId: '1',
+          endpoint: `http://127.0.0.1:${port}/`,
+          token: 'token',
+        } as PartnerOrg,
         close: () =>
           new Promise((done) => {
-            globalThis.fetch = realFetch;
             // The parked-socket case leaves connections open by design, and
             // `close` alone waits for them forever.
             server.closeAllConnections();
@@ -74,9 +70,10 @@ function connectionPage(cursor: string, hasNextPage: boolean): string {
   });
 }
 
-async function drain(limit = 50): Promise<number> {
+async function drain(org: PartnerOrg, limit = 50): Promise<number> {
   let pages = 0;
   for await (const _page of paginate(
+    org,
     'query { transactions }',
     {},
     (data: any) => data?.transactions,
@@ -104,7 +101,7 @@ describe('a pass that cannot finish must still end', () => {
     process.env.PARTNER_RETRY_BACKOFF_MS = '5';
 
     const began = Date.now();
-    await assert.rejects(() => drain(), /Network error calling the Partner API/);
+    await assert.rejects(() => drain(api.org), /Network error calling the Partner API/);
     // Bounded, and bounded by the timeout rather than by the test's patience.
     assert.ok(Date.now() - began < 20_000, 'six bounded attempts, not one unbounded wait');
 
@@ -124,7 +121,7 @@ describe('a pass that cannot finish must still end', () => {
     process.env.PARTNER_RETRY_BACKOFF_MS = '5';
 
     const began = Date.now();
-    await assert.rejects(() => drain(), /returned 429 after/);
+    await assert.rejects(() => drain(api.org), /returned 429 after/);
     assert.ok(Date.now() - began < 10_000, 'the cap, not the header, decides how long we wait');
     assert.ok(requests > 1, 'it still retried');
 
@@ -142,7 +139,7 @@ describe('a pass that cannot finish must still end', () => {
       );
     });
 
-    await assert.rejects(() => drain(), (error: unknown) => {
+    await assert.rejects(() => drain(api.org), (error: unknown) => {
       assert.ok(error instanceof PartnerApiError);
       assert.match(error.message, /paginated in place/);
       return true;
@@ -161,7 +158,7 @@ describe('a pass that cannot finish must still end', () => {
         .end(connectionPage(`cursor-${page}`, page < 3));
     });
 
-    assert.equal(await drain(), 3);
+    assert.equal(await drain(api.org), 3);
     await api.close();
   });
 });

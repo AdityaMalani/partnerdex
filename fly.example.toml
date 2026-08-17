@@ -27,6 +27,11 @@ primary_region = "<your-region>"
   # https://partners.shopify.com/<PARTNER_ORGANIZATION_ID>/...
   PARTNER_ORGANIZATION_ID = "<your-org-id>"
   PARTNER_API_VERSION = "2026-07"
+  # A second Partner organization, synced into the same database. The id is not
+  # a secret and can live here; its token is a secret and must not
+  # (`fly secrets set PARTNER_ORG_2_TOKEN=...`). Any positive index works.
+  # PARTNER_ORG_2_ID = "<other-org-id>"
+  # PARTNER_ORG_2_LABEL = "Second Org"
 
   # --- Scope ---------------------------------------------------------------
   # Comma-separated app ids to report on; empty includes every app in the org.

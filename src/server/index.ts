@@ -146,7 +146,17 @@ export function createApp(): express.Express {
     response.json({ metrics: listMetrics() });
   });
 
-  /** Apps in reporting scope, resolved at runtime so no ids live in the code. */
+  /**
+   * Apps in reporting scope, resolved at runtime so no ids live in the code.
+   *
+   * Every organization's apps, in one list. That is the whole point of running
+   * one instance over several organizations, and it is also the answer that
+   * does not change a single existing figure: `resolveScopedAppIds` has always
+   * returned every app this instance covers, and the per-app picker built on
+   * this list is already a finer filter than an organization filter would be.
+   * `orgId` rides along so the UI can *label* an app's organization without
+   * anything being scoped by it.
+   */
   app.get('/api/apps', (_request, response) => {
     try {
       const db = getDb();
@@ -157,8 +167,10 @@ export function createApp(): express.Express {
       }
       const placeholders = scoped.map(() => '?').join(',');
       const rows = db
-        .prepare(`SELECT id, name FROM apps WHERE id IN (${placeholders}) ORDER BY name`)
-        .all(...scoped) as Array<{ id: string; name: string }>;
+        .prepare(
+          `SELECT id, name, org_id AS orgId FROM apps WHERE id IN (${placeholders}) ORDER BY name`,
+        )
+        .all(...scoped) as Array<{ id: string; name: string; orgId: string }>;
       response.json({ apps: rows });
     } catch (error) {
       sendError(response, error);

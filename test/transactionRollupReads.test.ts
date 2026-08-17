@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { beforeEach, describe, it } from 'node:test';
-import { APP_GID, resetEnvironment } from './helpers.js';
+import { APP_GID, ORG_ID, resetEnvironment } from './helpers.js';
 import { getDb } from '../src/db/index.js';
 import { insertTransactions, type TransactionNode } from '../src/sync/ingest.js';
 import { rebuildDerivedTables } from '../src/sync/derive.js';
@@ -55,7 +55,7 @@ function seedLedger(): void {
       );
     }
   }
-  insertTransactions(db, nodes);
+  insertTransactions(db, nodes, ORG_ID);
   rebuildDerivedTables(db);
 }
 
