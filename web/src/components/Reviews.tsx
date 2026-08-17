@@ -7,6 +7,7 @@ import {
   type ReviewSummary,
 } from '../api';
 import { formatCalendarDate } from '../format';
+import { useDebounced } from '../hooks';
 
 /**
  * The reviews we could not attribute to a customer, and the way to fix that.
@@ -37,16 +38,6 @@ export function Stars({ rating }: { rating: number }) {
       </span>
     </span>
   );
-}
-
-/** Waits for the typing to stop before asking the server. */
-function useDebounced<T>(value: T, delay: number): T {
-  const [settled, setSettled] = useState(value);
-  useEffect(() => {
-    const timer = window.setTimeout(() => setSettled(value), delay);
-    return () => window.clearTimeout(timer);
-  }, [value, delay]);
-  return settled;
 }
 
 /**
@@ -180,27 +171,44 @@ function UnmatchedRow({ review, onLinked }: { review: ReviewSummary; onLinked: (
   );
 }
 
-export function UnmatchedReviews({ appId }: { appId: string }) {
+export function UnmatchedReviews({ appId, orgId = '' }: { appId: string; orgId?: string }) {
   const [reviews, setReviews] = useState<ReviewSummary[]>([]);
   const [total, setTotal] = useState(0);
   const [open, setOpen] = useState(false);
   const dialog = useRef<HTMLDialogElement>(null);
 
-  const load = useCallback(() => {
-    fetchReviews({ appId, linked: 'unmatched', sort: 'newest', limit: 100 })
+  /**
+   * The one place this list is read from, and the one place the guard lives.
+   *
+   * The refresh after a link used to re-inline the identical request, so the
+   * query existed twice and neither copy could tell a superseded response from
+   * a current one — switching app twice in quick succession could leave the
+   * first app's unmatched reviews on screen. Resolves to the new total, or to
+   * null when the response has been superseded and was thrown away.
+   */
+  const generation = useRef(0);
+  const load = useCallback((): Promise<number | null> => {
+    const mine = (generation.current += 1);
+    return fetchReviews({ appId, orgId, linked: 'unmatched', sort: 'newest', limit: 100 })
       .then((result) => {
+        if (generation.current !== mine) return null;
         setReviews(result.reviews);
         setTotal(result.total);
+        return result.total;
       })
       .catch(() => {
         // A banner that cannot load is not worth an error of its own: the page
         // it sits on has its own, and there is nothing here to act on.
+        if (generation.current !== mine) return null;
         setReviews([]);
         setTotal(0);
+        return null;
       });
-  }, [appId]);
+  }, [appId, orgId]);
 
-  useEffect(load, [load]);
+  useEffect(() => {
+    void load();
+  }, [load]);
 
   /**
    * A native `<dialog>` rather than a hand-rolled overlay.
@@ -239,19 +247,16 @@ export function UnmatchedReviews({ appId }: { appId: string }) {
   // Linking the last one empties the dialog, so close it rather than leaving an
   // empty box open over the page.
   const handleLinked = useCallback(() => {
-    fetchReviews({ appId, linked: 'unmatched', sort: 'newest', limit: 100 })
-      .then((result) => {
-        setReviews(result.reviews);
-        setTotal(result.total);
-        if (result.total === 0) setOpen(false);
-        // The row that was just linked is gone, and the button inside it that
-        // had focus went with it — leaving focus on `<body>`, outside the
-        // dialog, where Escape no longer closes it and a keyboard reader is
-        // stranded. Put focus back on the dialog itself.
-        else dialog.current?.focus();
-      })
-      .catch(() => undefined);
-  }, [appId]);
+    void load().then((total) => {
+      if (total === null) return;
+      if (total === 0) setOpen(false);
+      // The row that was just linked is gone, and the button inside it that had
+      // focus went with it — leaving focus on `<body>`, outside the dialog,
+      // where Escape no longer closes it and a keyboard reader is stranded. Put
+      // focus back on the dialog itself.
+      else dialog.current?.focus();
+    });
+  }, [load]);
 
   if (total === 0) return null;
 

@@ -107,7 +107,7 @@ export function trialsReport(context: MetricContext): MetricResponse {
  * decisions has an empty pipeline.
  */
 export function onTrialReport(context: MetricContext): MetricResponse {
-  const series = onTrialSeries(context.db, context.bucketsWithLead, context.appIds);
+  const series = onTrialSeries(context.db, context.bucketsWithLead, context.appIds, context.window.timeZone);
   const values = context.bucketsWithLead.map((_, idx) => series.get(idx) ?? 0);
   const [leading, ...visible] = values;
 

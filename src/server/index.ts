@@ -2,11 +2,11 @@ import express from 'express';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { getConfig } from '../config.js';
+import { ConfigError, getConfig } from '../config.js';
 import { getCustomer, listCustomers, type CustomerSort } from '../customers/index.js';
 import { getDb } from '../db/index.js';
 import { type RawMetricQuery } from '../metrics/context.js';
-import { listMetrics, runMetric } from '../metrics/registry.js';
+import { HEADLINE_METRICS, listMetrics, runMetric } from '../metrics/registry.js';
 import { dispatchPending } from '../notifications/dispatch.js';
 import {
   linkCandidates,
@@ -20,39 +20,19 @@ import { buildReviewEvents } from '../appstore/events.js';
 import { resolveScopedAppIds } from '../sync/index.js';
 import { onSyncComplete, startSyncScheduler, syncStatus } from '../sync/scheduler.js';
 import { authRequired, authRouter, requireAuth } from './auth.js';
+import { portalAuthRouter, requirePortalAuth } from './portalAuth.js';
+import { portalRouter } from './portal.js';
+import { signupRouter } from './signup.js';
+import { referralRedirectRouter } from './referralRedirect.js';
 import { sendError } from './errors.js';
 import { notificationsRouter } from './notifications.js';
 import { listingsRouter } from './listings.js';
 import { bigqueryRouter } from './bigquery.js';
+import { affiliatesAdminRouter } from './affiliatesAdmin.js';
+import { organizationsRouter } from './organizations.js';
 import { listAppSources } from '../bigquery/connection.js';
 import { funnelReport } from '../metrics/reports/funnel.js';
 
-/** Everything the dashboard renders, so one request paints the whole page. */
-const HEADLINE_METRICS = [
-  'mrr',
-  'arr',
-  'gross_earnings',
-  'mrr_growth',
-  'mrr_by_app',
-  'arpu',
-  'ltv',
-  'trials',
-  'on_trial',
-  'trial_conversion_rate',
-  'active_subscriptions',
-  'subscribers',
-  'new_subscriptions',
-  'subscription_growth',
-  'active_installs',
-  'churn',
-  'revenue_churn',
-  'subscription_churn',
-  'logo_churn',
-  'reviews_posted',
-  'reviews_live',
-  'reviews_average_rating',
-  'reviews_removed',
-];
 
 function queryOf(request: express.Request): RawMetricQuery {
   const pick = (name: string): string | undefined => {
@@ -65,6 +45,7 @@ function queryOf(request: express.Request): RawMetricQuery {
     end: pick('end'),
     interval: pick('interval'),
     appIds: pick('appIds'),
+    orgId: pick('orgId'),
     includeAnnual: pick('includeAnnual'),
     includeUsage: pick('includeUsage'),
     includeTrials: pick('includeTrials'),
@@ -74,17 +55,115 @@ function queryOf(request: express.Request): RawMetricQuery {
   };
 }
 
+/**
+ * The organization a request is scoped to, or undefined for all of them.
+ *
+ * One reading of the parameter, shared by every route that resolves its own app
+ * scope, so `?orgId=` cannot mean one thing on the customer list and another on
+ * the funnel. Empty is normalized to undefined here rather than downstream:
+ * `resolveScopedAppIds(db, '')` would ask for the apps of an organization whose
+ * id is the empty string, which is a different question from "every app".
+ */
+function orgOf(request: express.Request): string | undefined {
+  const value = request.query.orgId;
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+/** Where `npm run build:web` leaves both bundles. */
+const WEB_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../web');
+
+/**
+ * The affiliate portal's shell — its own HTML entry, not the dashboard's.
+ *
+ * Separate bundles rather than one app with a route, so an affiliate's browser
+ * is never sent the dashboard's code at all. That is not a security boundary on
+ * its own (the API is), but shipping the admin bundle to hundreds of external
+ * people would hand them a map of every endpoint worth attacking.
+ */
+function servePortal(response: express.Response, next: express.NextFunction): void {
+  const file = path.join(WEB_ROOT, 'portal.html');
+  if (!fs.existsSync(file)) {
+    next();
+    return;
+  }
+  response.sendFile(file);
+}
+
+/**
+ * Refuse to build a server that would serve everything to everybody by accident.
+ *
+ * `isAuthenticated` returns true for every caller when `DASHBOARD_PASSWORD` is
+ * unset. That is a supported mode — it is what a localhost install has always
+ * done — but it is indistinguishable, from inside this process, from a
+ * deployment whose secret failed to arrive. The review's F6 spells out what is
+ * on the other side of that gate, and the worst of it is
+ * `POST /api/affiliates/set-password-links`: one unauthenticated request
+ * returning a live 24-hour takeover link for each of hundreds of affiliates.
+ *
+ * So the open mode is now something an operator asks for, not something that
+ * happens when a variable is missing. `ALLOW_NO_AUTH=true` keeps the documented
+ * localhost workflow exactly as it was, one line in `.env`; anything else stops
+ * here, at startup, where somebody is watching — rather than at the first
+ * request from a stranger, where nobody is.
+ *
+ * Thrown from `createApp` rather than from `getConfig` on purpose: `partnerdex
+ * sync`, `rebuild`, `doctor` and the importers have no HTTP surface and no
+ * business needing a dashboard password.
+ */
+function assertAuthIsIntentional(): void {
+  const { password, allowNoAuth } = getConfig().auth;
+  if (password !== null || allowNoAuth) return;
+  throw new ConfigError(
+    'DASHBOARD_PASSWORD is not set, so every /api route would be open to anyone ' +
+      'who can reach this port — including the one that mints set-password links ' +
+      'for every affiliate. Set DASHBOARD_PASSWORD, or set ALLOW_NO_AUTH=true to ' +
+      'confirm you mean to run without a login (local development).',
+  );
+}
+
 export function createApp(): express.Express {
+  assertAuthIsIntentional();
+
+  if (!authRequired()) {
+    // Loud, repeated, and on stderr: an operator who typed ALLOW_NO_AUTH=true
+    // into a production environment should trip over this in the logs.
+    console.error(
+      '[partnerdex] ############################################################\n' +
+        '[partnerdex] # ALLOW_NO_AUTH=true — the dashboard API has NO login.     #\n' +
+        '[partnerdex] # Every /api route, including affiliate set-password       #\n' +
+        '[partnerdex] # links, is open to anyone who can reach this port.        #\n' +
+        '[partnerdex] # Do not expose this process to a network.                 #\n' +
+        '[partnerdex] ############################################################',
+    );
+  }
+
   const app = express();
   app.disable('x-powered-by');
 
-  // Behind a TLS-terminating proxy the request arrives as plain HTTP, so
-  // `request.protocol` reads "http" and the session cookie would ship without
-  // its Secure flag; `request.ip` would be the proxy's, collapsing every failed
-  // login into one lockout bucket. One hop, because that is what a proxy in
-  // front of this process is — trusting more would trust whatever a client put
-  // in the header.
-  if (getConfig().runtime.trustProxy) app.set('trust proxy', 1);
+  /*
+   * An organization as a list of app ids, for the routes that take an app list
+   * rather than a metric query. An empty list means "every app" to all of them,
+   * which is exactly what an absent organization should mean — so this returns
+   * one, and only narrows when an organization really was named.
+   */
+  const orgScope = (orgId: string | undefined): string[] =>
+    orgId === undefined ? [] : resolveScopedAppIds(getDb(), orgId);
+
+  /*
+   * Behind a TLS-terminating proxy the request arrives as plain HTTP, so
+   * `request.protocol` reads "http" and the session cookie would ship without
+   * its Secure flag; `request.ip` would be the proxy's, collapsing every failed
+   * login into one lockout bucket.
+   *
+   * The hop count is configuration rather than the compiled-in `1` it used to
+   * be, because it is the number that decides whether a client can choose its
+   * own rate-limit key, and it is different for the deployment we have and the
+   * one the runbook proposes. Fly-direct is one appending hop (measured);
+   * Pangolin in front of Fly is two. See `TRUST_PROXY_HOPS` in `config.ts` for
+   * what each kind of wrongness costs.
+   */
+  const { trustProxy, trustProxyHops } = getConfig().runtime;
+  if (trustProxy) app.set('trust proxy', trustProxyHops);
   // Only the notification routes accept a body, and the largest of those is a
   // name and a URL. A small ceiling keeps a stray upload from becoming memory.
   app.use(express.json({ limit: '64kb' }));
@@ -100,6 +179,31 @@ export function createApp(): express.Express {
   app.use('/api/auth', authRouter());
 
   /*
+   * The affiliate realm, entire. Everything it serves lives under `/portal` and
+   * `/r`, neither of which is a prefix of `/api`, so no affiliate request can
+   * reach `requireAuth`'s routes by falling through — and `requirePortalAuth`
+   * guards nothing outside its own mount. See `portalAuth.ts` for why the two
+   * realms share no cookie name and no signing key.
+   */
+  app.use('/r', referralRedirectRouter());
+  app.use('/portal/api/auth', portalAuthRouter());
+  /*
+   * Self-signup, mounted *ahead* of `requirePortalAuth` and public by design —
+   * a partner applying to join has, by definition, no session to present. It
+   * sits beside `/portal/api/auth` rather than inside it because it is not an
+   * auth route: it writes to the affiliate ledger, which is the only fully
+   * public write in this process and the reason `signup.ts` opens with the
+   * security review's findings rather than a description.
+   *
+   * Order matters. Express matches in registration order, so this has to be
+   * above the `/portal/api` mount or `requirePortalAuth` would 401 every
+   * applicant — a failure that would look exactly like a broken form.
+   */
+  app.use('/portal/api/signup', signupRouter());
+  app.use('/portal/api', requirePortalAuth, portalRouter());
+  app.get(['/portal', '/portal/*'], (_request, response, next) => servePortal(response, next));
+
+  /*
    * Everything below reads the store, so everything below is gated. The static
    * dashboard bundle deliberately is not: it holds no data, and it has to load
    * before it can ask for the password.
@@ -109,6 +213,17 @@ export function createApp(): express.Express {
   app.use('/api/notifications', notificationsRouter());
   app.use('/api/listings', listingsRouter());
   app.use('/api/bigquery', bigqueryRouter());
+  // Inside the gate, and that is the point: this router can reassign a merchant
+  // from one affiliate to another. It is admin, never the partner-facing realm.
+  app.use('/api/affiliates', affiliatesAdminRouter());
+  /*
+   * Organization management, inside the same gate and for a stronger reason
+   * than most of what is in here: it holds live Partner API credentials, and a
+   * request that reached it could point one at an organization of its choosing.
+   * Admin realm only — the affiliate portal's cookie is a different name, a
+   * different path and a different signing key, and none of it reaches `/api`.
+   */
+  app.use('/api/organizations', organizationsRouter());
 
   /**
    * The install funnel.
@@ -129,10 +244,10 @@ export function createApp(): express.Express {
    * entry, because summing across apps puts one app's visitors above several
    * apps' installs and produces a conversion rate over 100%.
    */
-  app.get('/api/funnel/apps', (_request, response) => {
+  app.get('/api/funnel/apps', (request, response) => {
     try {
       const db = getDb();
-      const apps = listAppSources(resolveScopedAppIds(db), db)
+      const apps = listAppSources(resolveScopedAppIds(db, orgOf(request)), db)
         .filter((source) => source.dataset !== null)
         .map((source) => ({
           id: source.appId,
@@ -159,7 +274,10 @@ export function createApp(): express.Express {
           start: pick('start'),
           end: pick('end'),
           granularity: pick('granularity'),
-          appIds: pick('appIds'),
+          // The funnel is always about one app, so the organization only ever
+          // narrows the list the picker offered — it cannot change the answer
+          // for an app that was named explicitly.
+          appIds: pick('appIds') || orgScope(orgOf(request)).join(','),
           nocache: pick('nocache'),
         }),
       );
@@ -172,43 +290,118 @@ export function createApp(): express.Express {
     response.json({ metrics: listMetrics() });
   });
 
-  /** Apps in reporting scope, resolved at runtime so no ids live in the code. */
-  app.get('/api/apps', (_request, response) => {
+  /**
+   * Apps in reporting scope, resolved at runtime so no ids live in the code.
+   *
+   * Every organization's apps, in one list. That is the whole point of running
+   * one instance over several organizations, and it is also the answer that
+   * does not change a single existing figure: `resolveScopedAppIds` has always
+   * returned every app this instance covers, and the per-app picker built on
+   * this list is already a finer filter than an organization filter would be.
+   * `orgId` rides along so the UI can *label* an app's organization without
+   * anything being scoped by it.
+   */
+  app.get('/api/apps', (request, response) => {
     try {
       const db = getDb();
-      const scoped = resolveScopedAppIds(db);
+      const scoped = resolveScopedAppIds(db, orgOf(request));
       if (scoped.length === 0) {
         response.json({ apps: [] });
         return;
       }
       const placeholders = scoped.map(() => '?').join(',');
       const rows = db
-        .prepare(`SELECT id, name FROM apps WHERE id IN (${placeholders}) ORDER BY name`)
-        .all(...scoped) as Array<{ id: string; name: string }>;
+        .prepare(
+          `SELECT id, name, org_id AS orgId FROM apps WHERE id IN (${placeholders}) ORDER BY name`,
+        )
+        .all(...scoped) as Array<{ id: string; name: string; orgId: string }>;
       response.json({ apps: rows });
     } catch (error) {
       sendError(response, error);
     }
   });
 
-  app.get('/api/status', (_request, response) => {
+  /*
+   * The row counts behind this are memoized, and that is not an optimization —
+   * without it this route takes the whole process down.
+   *
+   * SQLite keeps no row count, so `COUNT(*)` walks the table. Measured on the
+   * live database: `transactions` 56.5s and `customer_events` 85.0s, together
+   * over two minutes of *synchronous* work on the single thread that also serves
+   * every other route and answers the health check. No index can help — there is
+   * nothing to look up, only rows to count.
+   *
+   * The dashboard shell polls this on every page for one footer line, so each
+   * navigation stalled the entire app and Fly pulled the machine from the load
+   * balancer. It presented as "every page hangs", which sent us looking at the
+   * pages rather than at the footer.
+   *
+   * So the counts are now opt-in, behind `?counts=1`, and memoized for a minute
+   * when asked for. The dashboard shell reads only `sync` and `lastSyncAt` —
+   * verified against the frontend, which never renders a row count anywhere —
+   * and both of those are cheap and read fresh on every call, because they are
+   * what tells a reader whether the figures in front of them are stale.
+   */
+  let countsCache: { at: number; value: Record<string, unknown> } | null = null;
+  const COUNTS_TTL_MS = 60_000;
+
+  app.get('/api/status', (request, response) => {
     try {
       const db = getDb();
-      const counts = db
-        .prepare(
-          `SELECT
-             (SELECT COUNT(*) FROM apps) AS apps,
-             (SELECT COUNT(*) FROM shops) AS shops,
-             (SELECT COUNT(*) FROM app_events) AS events,
-             (SELECT COUNT(*) FROM transactions) AS transactions,
-             (SELECT COUNT(*) FROM subscriptions) AS subscriptions,
-             (SELECT COUNT(*) FROM customer_events WHERE suppressed = 0) AS customerEvents,
-             (SELECT MAX(updated_at) FROM sync_state) AS lastSyncAt`,
-        )
-        .get() as Record<string, unknown>;
-      // The dashboard watches `lastSyncAt` to know when its figures went stale,
-      // and `sync` to say so when the background loop is failing.
-      response.json({ ...counts, sync: syncStatus() });
+
+      // Always cheap, and polled on every page.
+      const lastSyncAt = (
+        db.prepare('SELECT MAX(updated_at) AS lastSyncAt FROM sync_state').get() as {
+          lastSyncAt: string | null;
+        }
+      ).lastSyncAt;
+
+      /*
+       * Whether the store holds anything, which the shell needs and used to work
+       * out from the row counts above. Making those opt-in would otherwise take
+       * the answer away with them: the counts stop arriving, `?? 0` reads the
+       * absence as zero, and a store holding millions of rows reports itself
+       * empty and tells its operator to run a sync.
+       *
+       * So the question is answered here instead of reconstructed from figures
+       * that happened to be nearby. `LIMIT 1` stops at the first row, which is
+       * what lets it stay on the cheap path beside a `COUNT(*)` that could not.
+       *
+       * Both tables, because either alone is too narrow: a store can hold
+       * subscriptions rebuilt from events that carried no sale yet, and it is
+       * not empty — it has figures to show.
+       */
+      const hasData =
+        db.prepare('SELECT 1 AS present FROM transactions LIMIT 1').get() !== undefined ||
+        db.prepare('SELECT 1 AS present FROM subscriptions LIMIT 1').get() !== undefined;
+
+      const base = { lastSyncAt, hasData, sync: syncStatus() };
+
+      // The counts are opt-in. Callers that want them ask; the shell does not,
+      // and used to pay for them on every navigation regardless.
+      if (request.query.counts !== '1') {
+        response.json(base);
+        return;
+      }
+
+      if (!countsCache || Date.now() - countsCache.at > COUNTS_TTL_MS) {
+        countsCache = {
+          at: Date.now(),
+          value: db
+            .prepare(
+              `SELECT
+                 (SELECT COUNT(*) FROM apps) AS apps,
+                 (SELECT COUNT(*) FROM shops) AS shops,
+                 (SELECT COUNT(*) FROM app_events) AS events,
+                 (SELECT COUNT(*) FROM transactions) AS transactions,
+                 (SELECT COUNT(*) FROM subscriptions) AS subscriptions,
+                 (SELECT COUNT(*) FROM customer_events WHERE suppressed = 0) AS customerEvents`,
+            )
+            .get() as Record<string, unknown>,
+        };
+      }
+
+      response.json({ ...countsCache.value, ...base });
     } catch (error) {
       sendError(response, error);
     }
@@ -258,7 +451,12 @@ export function createApp(): express.Express {
           sort: (pick('sort') ?? 'mrr') as CustomerSort,
           limit: Number.isFinite(limit) ? limit : undefined,
           offset: Number.isFinite(offset) ? offset : undefined,
-          appIds: appIds ? appIds.split(',').filter(Boolean) : [],
+          // An explicit app list wins; otherwise the organization, if one was
+          // named; otherwise every app, which is the behaviour this route has
+          // always had and the one an untouched dashboard still gets.
+          appIds: appIds
+            ? appIds.split(',').filter(Boolean)
+            : orgScope(orgOf(request)),
         }),
       );
     } catch (error) {
@@ -270,7 +468,7 @@ export function createApp(): express.Express {
     try {
       const appIds = typeof request.query.appIds === 'string' ? request.query.appIds : '';
       const detail = getCustomer(request.params.shopId, {
-        appIds: appIds ? appIds.split(',').filter(Boolean) : [],
+        appIds: appIds ? appIds.split(',').filter(Boolean) : orgScope(orgOf(request)),
       });
       if (!detail) {
         response.status(404).json({ error: `No customer with shop id ${request.params.shopId}.` });
@@ -300,7 +498,7 @@ export function createApp(): express.Express {
       response.json(
         listReviews({
           search: pick('q') ?? '',
-          appIds: appIds ? appIds.split(',').filter(Boolean) : [],
+          appIds: appIds ? appIds.split(',').filter(Boolean) : orgScope(orgOf(request)),
           rating: Number.isInteger(rating) && rating >= 1 && rating <= 5 ? rating : null,
           status: (pick('status') ?? 'all') as ReviewStatusFilter,
           linked: (pick('linked') ?? 'all') as ReviewLinkFilter,

@@ -1,0 +1,546 @@
+/*
+ * The affiliate portal, drawn in the dashboard's design system.
+ *
+ * Everything here is additive: the tokens, the card, the table, the pills and
+ * the login card all come from `styles.css` unchanged. What the portal needs
+ * that the dashboard does not is a single-column page with no rail — there is
+ * one page, so a navigation rail would be an empty frame — and three small
+ * components the dashboard has no use for.
+ */
+
+.portal-shell {
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 32px 24px 64px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.portal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.portal-title {
+  margin: 0;
+  font-size: 20px;
+}
+
+.portal-head .subtitle {
+  margin: 2px 0 0;
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.portal-section {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.portal-section h2 {
+  margin: 0;
+  font-size: 15px;
+  color: var(--text-secondary);
+}
+
+/*
+ * The referral link.
+ *
+ * Set in the mono face and allowed to wrap mid-string, because the one thing a
+ * reader does here besides copying is *check* the handle, character by
+ * character, against what they pasted somewhere else. An ellipsis would defeat
+ * the only reason to render it at all.
+ */
+.portal-link {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 8px 8px 12px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.portal-link code {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  word-break: break-all;
+  color: var(--text-primary);
+}
+
+.portal-link button {
+  flex: none;
+  padding: 6px 12px;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--brand-on);
+  background: var(--brand);
+  border: none;
+  border-radius: 5px;
+  cursor: pointer;
+}
+
+.portal-link button:hover {
+  background: var(--brand-hover);
+}
+
+/* Second and later fields on a login card; the first sits under the blurb. */
+.portal-field {
+  margin-top: 14px;
+}
+
+.portal-hint {
+  margin: 12px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.portal-note {
+  margin-left: 0;
+}
+
+/*
+ * A button that reads as a link: "send me a link", "sign out". Both are actions
+ * rather than navigation, so they are buttons — a reader using a keyboard or a
+ * screen reader should be told which one it is.
+ */
+.link-button {
+  padding: 0;
+  font: inherit;
+  color: var(--brand-accent);
+  background: none;
+  border: none;
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+.link-button:disabled {
+  color: var(--muted);
+  cursor: default;
+}
+
+/* The merchant column carries a status pill inline, so it needs the gap. */
+.portal-shell td .pill + .pill {
+  margin-left: 8px;
+}
+
+/*
+ * The four sections, as tabs rather than a rail.
+ *
+ * A rail costs 220px of a 360px phone, and there are four destinations. They
+ * scroll sideways instead of wrapping, so the row keeps its shape at any width
+ * and never reflows the page under the reader's thumb.
+ */
+.portal-tabs {
+  display: flex;
+  gap: 4px;
+  overflow-x: auto;
+  border-bottom: 1px solid var(--border);
+  margin-top: -12px;
+  scrollbar-width: none;
+}
+
+.portal-tabs::-webkit-scrollbar {
+  display: none;
+}
+
+.portal-tab {
+  flex: none;
+  padding: 10px 14px;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.portal-tab:hover {
+  color: var(--text-primary);
+}
+
+/* Colour and a weight change, not colour alone. */
+.portal-tab.active {
+  color: var(--text-primary);
+  font-weight: 600;
+  border-bottom-color: var(--brand);
+}
+
+.portal-tab:focus-visible {
+  outline: 2px solid var(--brand-accent);
+  outline-offset: -2px;
+  border-radius: 4px;
+}
+
+.portal-shell .notice:last-child {
+  margin-bottom: 0;
+}
+
+/* --------------------------------------------------------------- tiles */
+
+/*
+ * The figures, and the first thing on every tab.
+ *
+ * `auto-fit` rather than the dashboard's fixed four, because the count varies:
+ * the overview grows a fifth tile when commission has been withdrawn, and a row
+ * of four that silently becomes a row of four-plus-one orphan is worse than one
+ * that reflows. The 150px floor is what keeps a money value on one line.
+ */
+.portal-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 12px;
+}
+
+.portal-stats .stat {
+  display: flex;
+  flex-direction: column;
+  padding: 12px 14px;
+}
+
+/* --------------------------------------------------------- the sparkline */
+
+/*
+ * Twelve months of earnings, at the size of a row rather than a chart.
+ *
+ * One series, so no legend: the label above it is the series name. The bars are
+ * drawn against a fixed 44px height and stretched horizontally to fit, which
+ * keeps every bar's height honest — the axis that carries the meaning is never
+ * rescaled by the width of the reader's window.
+ */
+.portal-spark {
+  margin: 0;
+  padding: 12px 14px 10px;
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: var(--shadow-md);
+}
+
+.portal-spark-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.portal-spark-peak {
+  color: var(--muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.portal-spark-plot {
+  display: block;
+  width: 100%;
+  height: 52px;
+  margin-top: 10px;
+}
+
+.portal-spark-bar {
+  fill: var(--series-1);
+}
+
+/* A month that earned nothing is a gap in the row, not a bar of zero height
+   dressed up as one — but the baseline still runs through it. */
+.portal-spark-bar.empty {
+  fill: var(--grid);
+}
+
+/* The month still filling. Same treatment the dashboard's charts give their
+   last point: present, and visibly not final. */
+.portal-spark-bar.partial {
+  fill-opacity: 0.45;
+}
+
+.portal-spark-axis {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+/* ------------------------------------------------------------ link rows */
+
+.portal-links {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/*
+ * Program name and link on one line. The name is a fixed column so two links
+ * stack with their fields aligned; below the breakpoint it goes above instead,
+ * because a 140px label leaves nothing for a URL on a phone.
+ */
+.portal-link-row {
+  display: grid;
+  grid-template-columns: 140px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+}
+
+@media (max-width: 640px) {
+  .portal-link-row {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 4px;
+  }
+}
+
+/* ------------------------------------------------------------- programs */
+
+/*
+ * The terms table. Its cells are phrases rather than figures, so they wrap —
+ * the dashboard's `nowrap` would push "Subscription charges only" into a
+ * sideways scroll on every laptop.
+ */
+.terms-table th,
+.terms-table td {
+  white-space: normal;
+  vertical-align: top;
+  text-align: left;
+}
+
+.terms-table td code {
+  font-size: 11px;
+  word-break: break-all;
+}
+
+/* The rules that hold for every program, said once instead of per card. */
+.portal-terms {
+  margin: 4px 0 0;
+  padding-left: 18px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.portal-terms li + li {
+  margin-top: 4px;
+}
+
+/*
+ * Carried on every tab, so it is a strip and not a card: an affiliate on hold
+ * has to see this beside their figures, and a bordered block repeated on four
+ * tabs is a block that stops being read by the second one.
+ */
+.portal-banner {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0;
+  padding: 10px 12px;
+  border-left: 3px solid var(--delta-down);
+  background: var(--surface-2);
+  border-radius: 0 6px 6px 0;
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+/* A per-row aside — why a referral stopped earning, what part of a payout was
+   actually sent. Sits under the cell it qualifies rather than in a column of
+   its own, which would not survive a phone. */
+.row-hint {
+  display: block;
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 11px;
+  white-space: normal;
+}
+
+/* Redundant with the pill on a wide screen, so it only earns its space once the
+   table has stacked. */
+@media (min-width: 641px) {
+  .portal-shell td .row-hint:not(.always) {
+    display: none;
+  }
+}
+
+@media (max-width: 640px) {
+  .portal-shell {
+    padding: 24px 16px 48px;
+  }
+
+  .portal-head {
+    align-items: flex-start;
+  }
+
+  /*
+   * Tables stop being tables.
+   *
+   * Sideways scrolling works for an operator comparing forty merchants; it does
+   * not work for an affiliate on a phone checking one. Each row becomes a
+   * labelled block, with the label coming from `data-label` on the cell so the
+   * markup stays a real table for anything reading it as one.
+   */
+  .portal-shell .table-wrap {
+    overflow-x: visible;
+  }
+
+  .portal-shell table,
+  .portal-shell tbody,
+  .portal-shell tr,
+  .portal-shell td {
+    display: block;
+    width: 100%;
+  }
+
+  .portal-shell thead {
+    /* Hidden from sight, not from assistive technology. */
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+  }
+
+  .portal-shell tbody tr {
+    padding: 10px 0;
+    border-bottom: 1px solid var(--grid);
+  }
+
+  .portal-shell td {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: 4px 16px;
+    text-align: right;
+    padding: 4px 0;
+    border: none;
+    white-space: normal;
+  }
+
+  .portal-shell td::before {
+    content: attr(data-label);
+    flex: none;
+    color: var(--muted);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+  }
+
+  /* The merchant name leads the block, so it keeps its weight and loses its
+     label — nobody needs to be told a store name is a store name. */
+  .portal-shell td:first-child {
+    font-weight: 600;
+    font-size: 13px;
+  }
+
+  .portal-shell td:first-child::before {
+    display: none;
+  }
+
+  /* The aside is a third item in a two-item flex row, so it takes a line of its
+     own rather than squeezing in beside the value it qualifies. */
+  .portal-shell td > .row-hint {
+    flex-basis: 100%;
+    text-align: right;
+  }
+}
+
+/*
+ * The application form's program picker.
+ *
+ * A fieldset rather than a styled div, because these checkboxes are one question
+ * with several answers and a screen reader should hear the question once. Each
+ * row carries the program's terms under its name — the rate, the duration, and
+ * whether applications are reviewed — so the choice is made against the offer
+ * rather than against a name the applicant has to look up afterwards.
+ */
+.signup-programs {
+  margin: 18px 0 0;
+  padding: 0;
+  border: none;
+}
+
+.signup-programs legend {
+  padding: 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.signup-program {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  margin-top: 10px;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+/* Nudged onto the first line of the label, which is two lines tall. */
+.signup-program input {
+  margin-top: 3px;
+}
+
+.signup-program .row-hint {
+  margin-top: 3px;
+}
+
+/*
+ * Filing a claim.
+ *
+ * The only form in the portal that is not a login card, and it is deliberately
+ * not one: a login card is a page you have arrived at, and this is a control
+ * sitting above the table it adds to. So it borrows the dashboard's `.controls`
+ * row wholesale — same labels, same inputs, same focus ring as every filter in
+ * the product — and adds only what that row has no rule for: a text area, and a
+ * submit line that keeps the button and the one-sentence explanation on the same
+ * baseline instead of stacking a paragraph under it.
+ */
+.claim-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+/* The merchant is the field people type most into, so it takes the slack. */
+.claim-merchant {
+  flex: 1 1 260px;
+}
+
+.claim-notes textarea {
+  width: 100%;
+  padding: 7px 10px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--text-primary);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  resize: vertical;
+}
+
+.claim-notes textarea:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 1px;
+}
+
+.claim-submit {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 12px;
+}
+
+/* The sentence beside the button is a note, not a lead-in: it must not push the
+   button down a line on a narrow screen until it genuinely has to wrap. */
+.claim-submit .portal-hint {
+  margin: 0;
+  flex: 1 1 260px;
+}

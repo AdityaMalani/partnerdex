@@ -23,6 +23,15 @@ const ICONS: Record<string, string> = {
   // Stacked cylinders — the universal read for a warehouse table.
   bigquery:
     'M4.5 6c0-1.1 2.9-2 6.5-2s6.5.9 6.5 2-2.9 2-6.5 2-6.5-.9-6.5-2zM4.5 6v10c0 1.1 2.9 2 6.5 2s6.5-.9 6.5-2V6M4.5 11c0 1.1 2.9 2 6.5 2s6.5-.9 6.5-2',
+  // Affiliates. A ticket with its terms on it; two figures with a link between
+  // them; an arrow branching to a second party; a banknote.
+  'affiliate-programs': 'M3.5 6.5h15v9h-15zM7 10h8M7 13h5',
+  affiliates:
+    'M8 9.5a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM2.5 19a5.5 5.5 0 0 1 11 0M15.5 8.5a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5M15 12.5a4.5 4.5 0 0 1 4.5 4.5',
+  referrals: 'M4 18V6h6M4 6l6 5.5M14.5 8.5l3.5-3-3.5-3M18 5.5h-3.5a4.5 4.5 0 0 0-4.5 4.5v8',
+  // A hand raised over a document: somebody asking for something to be theirs.
+  claims: 'M4.5 3.5h9l4 4v11h-13zM13 3.5v4.5h4.5M7.5 12h7M7.5 15h4',
+  payouts: 'M3.5 7.5h15v9h-15zM11 14.2a2.2 2.2 0 1 0 0-4.4 2.2 2.2 0 0 0 0 4.4M6 7.5v9M16 7.5v9',
 };
 
 function Icon({ id }: { id: string }) {

@@ -109,6 +109,187 @@ function appStoreHandles(): Record<string, string> {
 }
 
 /**
+ * One Shopify Partner organization and the credential that opens it.
+ *
+ * The organization id is part of the endpoint *path*, not a header, so the
+ * endpoint is per-org and there is no such thing as an org-agnostic Partner API
+ * call. That is why this object — not a bare id — is what gets passed around:
+ * a caller holding a `PartnerOrg` cannot pair one org's id with another's token.
+ */
+export interface PartnerOrg {
+  organizationId: string;
+  token: string;
+  /** Human label for logs and the doctor output; defaults to the id. */
+  label: string;
+  apiVersion: string;
+  endpoint: string;
+}
+
+/** The one place the endpoint URL template exists. */
+export function endpointFor(organizationId: string, apiVersion: string): string {
+  return `https://partners.shopify.com/${organizationId}/api/${apiVersion}/graphql.json`;
+}
+
+function apiVersion(): string {
+  const value = optional('PARTNER_API_VERSION', '2026-07');
+  if (!/^(\d{4}-\d{2}|unstable)$/.test(value)) {
+    throw new ConfigError(`PARTNER_API_VERSION must be YYYY-MM or "unstable", got "${value}".`);
+  }
+  return value;
+}
+
+/**
+ * Every organization named by the environment, in priority order. May be empty.
+ *
+ * This list is the **seed**, not the answer. Organizations live in the
+ * `organizations` table now; `getDb()` inserts anything here that the table does
+ * not already have, and the table wins from then on — see
+ * `seedOrganizationsFromEnv`. Everything that opens a Partner endpoint reads
+ * `activeOrgs()`, never this.
+ *
+ * Empty is legal, and that is the change an existing deployment cannot see but a
+ * new one depends on: an install with no secrets set has to boot far enough to
+ * serve the page you add an organization on. The old refusal — "Missing required
+ * environment variable PARTNER_ORGANIZATION_ID" at `getConfig()` — has moved to
+ * where the question can actually be answered, which is after the table has been
+ * consulted. `requireOrgs()` in the sync raises it there, with the same advice.
+ *
+ * Two forms, and they **combine** rather than override, because the combination
+ * is the migration path:
+ *
+ *   1. `PARTNER_ORGANIZATION_ID` + `PARTNER_API_TOKEN` — the original pair.
+ *      Still supported, still first in the list, still the source of the same
+ *      error message when nothing at all is configured. An existing deployment
+ *      changes no variable it already has.
+ *   2. `PARTNER_ORG_<n>_ID` + `PARTNER_ORG_<n>_TOKEN` (+ optional
+ *      `PARTNER_ORG_<n>_LABEL`) for any positive integer n.
+ *
+ * So adding a second organization to a running instance is exactly two new
+ * secrets and nothing removed — `fly secrets set PARTNER_ORG_2_ID=...
+ * PARTNER_ORG_2_TOKEN=...`. Indexed variables rather than one
+ * `PARTNER_ORGS="id:token,id:token"` list for three reasons: `fly secrets set`
+ * takes one name-value pair at a time, so rotating org B's token would
+ * otherwise mean re-pasting org A's; a token is never a substring of a larger
+ * value that some log line might print whole; and there is no delimiter for a
+ * token to collide with.
+ *
+ * The indices are *scanned*, not counted up from 1, so deleting
+ * `PARTNER_ORG_2_*` and leaving `PARTNER_ORG_3_*` in place drops one org
+ * instead of silently dropping two.
+ *
+ * Order matters beyond cosmetics: `orgs[0]` is what the `apps.org_id` migration
+ * backfills existing rows to. With the legacy pair present it is the legacy
+ * org, which is by definition the only org those rows can have come from.
+ */
+function partnerOrgs(version: string): PartnerOrg[] {
+  const orgs: PartnerOrg[] = [];
+  const seen = new Map<string, string>();
+
+  const add = (rawId: string, token: string, label: string, source: string): void => {
+    const organizationId = normalizeAppId(rawId);
+    if (!/^\d+$/.test(organizationId)) {
+      throw new ConfigError(
+        `${source} must be the numeric organization id from the Partner dashboard URL, ` +
+          `got "${rawId}".`,
+      );
+    }
+    if (!token) {
+      throw new ConfigError(`Organization ${organizationId} (${source}) has no access token.`);
+    }
+    const previous = seen.get(organizationId);
+    if (previous) {
+      throw new ConfigError(
+        `Organization ${organizationId} is configured twice, by ${previous} and ${source}. ` +
+          `Two entries for one org would sync it twice and fight over its watermarks.`,
+      );
+    }
+    seen.set(organizationId, source);
+    orgs.push({
+      organizationId,
+      token,
+      label: label || organizationId,
+      apiVersion: version,
+      endpoint: endpointFor(organizationId, version),
+    });
+  };
+
+  const legacyId = process.env.PARTNER_ORGANIZATION_ID?.trim();
+  if (legacyId) {
+    add(
+      legacyId,
+      required('PARTNER_API_TOKEN'),
+      process.env.PARTNER_ORG_LABEL?.trim() ?? '',
+      'PARTNER_ORGANIZATION_ID',
+    );
+  }
+
+  const indices = Object.keys(process.env)
+    .map((name) => /^PARTNER_ORG_(\d+)_ID$/.exec(name)?.[1])
+    .filter((index): index is string => Boolean(index))
+    .map(Number)
+    .sort((a, b) => a - b);
+
+  for (const index of indices) {
+    const id = process.env[`PARTNER_ORG_${index}_ID`]?.trim();
+    if (!id) continue;
+    add(
+      id,
+      required(`PARTNER_ORG_${index}_TOKEN`),
+      process.env[`PARTNER_ORG_${index}_LABEL`]?.trim() ?? '',
+      `PARTNER_ORG_${index}_ID`,
+    );
+  }
+
+  return orgs;
+}
+
+/**
+ * The trusted hop count, refused rather than clamped when it is nonsense.
+ *
+ * Zero would mean "trust nothing", which is what leaving `TRUST_PROXY` off
+ * already says and is not the same thing as "there is a proxy, and it is zero
+ * hops away". A negative or fractional value can only be a typo, and a typo in
+ * this particular number silently decides whether clients can pick their own
+ * rate-limit key — so it fails at startup, where somebody is watching.
+ */
+function trustProxyHops(): number {
+  const hops = int('TRUST_PROXY_HOPS', 1);
+  if (hops < 1) {
+    throw new ConfigError(
+      `TRUST_PROXY_HOPS must be at least 1 (the number of proxies in front of ` +
+        `this process), got "${hops}". Unset TRUST_PROXY to trust none.`,
+    );
+  }
+  return hops;
+}
+
+/**
+ * The affiliate terms URL, refused rather than accepted when it is not a URL.
+ *
+ * This string is rendered into an anchor on a public page, so it fails at
+ * startup unless it is an absolute http(s) URL. A `javascript:` value in an
+ * operator's `.env` would otherwise become a script sink on the one page in this
+ * product that strangers are invited to open.
+ */
+function affiliateTermsUrl(): string {
+  const value = optional('AFFILIATE_TERMS_URL', '');
+  if (!value) return '';
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new ConfigError(`AFFILIATE_TERMS_URL must be an absolute URL, got "${value}".`);
+  }
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+    throw new ConfigError(
+      `AFFILIATE_TERMS_URL must be http(s), got "${parsed.protocol}". It is rendered as a ` +
+        `link on a public page.`,
+    );
+  }
+  return parsed.toString();
+}
+
+/**
  * The dashboard password, or null when the gate is off.
  *
  * A short password is worse than none, because it invites exposing the port on
@@ -150,6 +331,99 @@ function timezone(name: string, fallback: string): string {
   return value;
 }
 
+export interface EmailSettings {
+  /**
+   * False means the no-op sender: links are still minted and the ask is still
+   * recorded, and nothing leaves the process.
+   */
+  enabled: boolean;
+  host: string;
+  port: number;
+  user: string;
+  password: string;
+  /** The `From:` header as configured, display name and all. */
+  from: string;
+  /** Just the address out of `from`, for the envelope and the Message-ID. */
+  fromAddress: string;
+  /** Who the message says it is from, in its own text. */
+  senderName: string;
+  implicitTls: boolean;
+  allowInsecure: boolean;
+  /** Pause between two sends in a bulk run, in milliseconds. */
+  spacingMs: number;
+}
+
+/**
+ * Mail configuration, or the no-op sender.
+ *
+ * The default is off, and off is a complete, working state rather than a broken
+ * one: `deliverSetPasswordLink` records the request without the secret, exactly
+ * as it did before this existed, and the bulk sender refuses to start rather
+ * than reporting a batch of successful sends that never happened.
+ *
+ * Turning it on, though, is checked hard and at startup. A half-configured
+ * mailer is the failure mode worth spending a crash on — the alternative is a
+ * bulk run that marks people as emailed on the strength of a connection to
+ * `undefined:587`. So `EMAIL_ENABLED=true` with no host, or a `SMTP_FROM` that
+ * is not an address, stops the process where somebody is watching, and every
+ * other path leaves it off.
+ */
+function emailSettings(): EmailSettings {
+  const off: EmailSettings = {
+    enabled: false,
+    host: '',
+    port: 0,
+    user: '',
+    password: '',
+    from: '',
+    fromAddress: '',
+    senderName: '',
+    implicitTls: false,
+    allowInsecure: false,
+    spacingMs: nonNegative('EMAIL_SEND_SPACING_MS', 1_200),
+  };
+  if (!bool('EMAIL_ENABLED', false)) return off;
+
+  const host = process.env.SMTP_HOST?.trim() ?? '';
+  if (!host) {
+    throw new ConfigError(
+      'EMAIL_ENABLED is on but SMTP_HOST is empty. Set the relay host, or unset ' +
+        'EMAIL_ENABLED to keep the no-op sender.',
+    );
+  }
+
+  const from = process.env.SMTP_FROM?.trim() ?? '';
+  const match = /<([^>]+)>\s*$/.exec(from);
+  const fromAddress = (match?.[1] ?? from).trim();
+  if (!fromAddress.includes('@') || /[\s<>,]/.test(fromAddress)) {
+    throw new ConfigError(
+      `SMTP_FROM must be an address, optionally with a display name — ` +
+        `"Partners <partners@example.com>" or "partners@example.com". Got "${from}".`,
+    );
+  }
+
+  // The name in `From:` is also the name the message uses about itself, so a
+  // partner reads the same words in the sender column and in the first line.
+  const displayName = from.slice(0, match?.index ?? 0).trim().replace(/^"|"$/g, '');
+
+  const port = int('SMTP_PORT', 587);
+  return {
+    enabled: true,
+    host,
+    port,
+    user: process.env.SMTP_USER?.trim() ?? '',
+    password: process.env.SMTP_PASSWORD ?? '',
+    from: from || fromAddress,
+    fromAddress,
+    senderName: displayName || fromAddress,
+    // 465 is the submission port that is TLS from the first byte. Everything
+    // else is assumed to negotiate, which is what 587 and 25 do.
+    implicitTls: bool('SMTP_IMPLICIT_TLS', port === 465),
+    allowInsecure: bool('SMTP_ALLOW_INSECURE', false),
+    spacingMs: off.spacingMs,
+  };
+}
+
 export interface ReportingDefaults {
   includeAnnual: boolean;
   includeUsage: boolean;
@@ -164,10 +438,19 @@ export interface ReportingDefaults {
 
 export interface Config {
   partner: {
-    token: string;
-    organizationId: string;
     apiVersion: string;
-    endpoint: string;
+    /**
+     * The organizations the *environment* names, which is the bootstrap path
+     * and nothing more. May be empty. The live set is `activeOrgs()`, read from
+     * the `organizations` table.
+     *
+     * There is deliberately no `organizationId`/`token`/`endpoint` beside this.
+     * A convenience "default org" on the config object is exactly the silent
+     * fallback this whole change exists to remove: a caller that forgot to say
+     * which org it meant would keep compiling and write one org's data under
+     * the other org's app.
+     */
+    orgs: PartnerOrg[];
   };
   auth: {
     /**
@@ -176,6 +459,29 @@ export interface Config {
      * the gate on; nothing else has to change.
      */
     password: string | null;
+    /**
+     * Explicit consent to serve HTTP with no gate at all (`ALLOW_NO_AUTH`).
+     *
+     * The review's F6: with no password, `isAuthenticated` returns true for
+     * everybody, and behind that gate sits `/api/customers`, every revenue
+     * figure, the BigQuery credential's description, and
+     * `POST /api/affiliates/set-password-links` — which mints live 24-hour
+     * account-takeover links for every affiliate in a single response body.
+     * A forgotten `fly secrets set`, a typo'd secret name or an `unset` turns
+     * all of that into a public endpoint, and nothing louder than a log line
+     * happens.
+     *
+     * So the open mode now requires somebody to have *said* so. It is gated on
+     * intent rather than on a guess about the environment (is there a proxy? is
+     * this a private IP?) for two reasons: every guess has a wrong answer that
+     * either bricks a legitimate deployment or silently permits a public one,
+     * and the documented localhost workflow — clone, `npm run dev`, no password
+     * — has to keep working with one obvious step rather than becoming a
+     * puzzle. `createApp` is where this is enforced; the CLI does not need a
+     * dashboard password to run a sync, and refusing to start it would be a new
+     * way to break a deployment while fixing nothing.
+     */
+    allowNoAuth: boolean;
   };
   scope: {
     appIds: string[];
@@ -225,7 +531,56 @@ export interface Config {
      * fresh IP per request to walk around the login lockout, which keys on it.
      */
     trustProxy: boolean;
+    /**
+     * How many proxies really stand in front of this process.
+     *
+     * Express resolves `request.ip` by walking `X-Forwarded-For` from the right,
+     * skipping this many entries — so the number has to match the deployment
+     * exactly, and getting it wrong fails in a different direction each way:
+     *
+     *   - **Too low** and a hop's own appended entry is taken as the client, so
+     *     everybody behind that proxy collapses into a single rate-limit bucket
+     *     and one guesser locks out the population.
+     *   - **Too high** and the walk runs off the end of the appended entries into
+     *     the part of the header the *client* wrote, which means a client can
+     *     choose its own throttle key and every limit in the process is optional.
+     *
+     * Measured for the current deployment: Fly.io in front of this process is
+     * exactly **one** appending hop — verified against the live app by sending
+     * rotated `X-Forwarded-For` values at the login and watching the lockout
+     * follow the real client anyway. Putting Pangolin/Traefik in front of Fly, as
+     * `DEPLOY-RUNBOOK.md` suggests, makes it **two**, and that migration is the
+     * reason this is configurable rather than compiled in.
+     */
+    trustProxyHops: number;
+    /**
+     * Origin to build affiliate set-password links against, e.g.
+     * `https://partners.example.com`. Empty means links are emitted as
+     * site-relative paths, because this server genuinely does not know its own
+     * public hostname and a link built from a guess is worse than one an
+     * operator pastes a prefix onto.
+     */
+    portalBaseUrl: string;
+    /**
+     * The terms a new affiliate agrees to when they apply, as a URL.
+     *
+     * Empty by default and empty today, which is a deliberate state rather than
+     * an unfinished one. Mantle's equivalent (`termsUrl`) was never configured
+     * either, so not one of the imported affiliates has ever agreed to
+     * anything — and this system is not the place to invent the document. What
+     * it does is carry the *mechanism*: set this and the signup form shows the
+     * link, requires the box to be ticked, and stores what was accepted against
+     * the affiliate. Leave it unset and signup still works, with nothing claimed
+     * about consent that did not happen.
+     *
+     * Point it at a versioned URL if the document will ever change. The stored
+     * column records the URL that was presented, so a document edited in place
+     * silently rewrites what every past applicant is recorded as having agreed
+     * to — that is a property of URLs, not something the column can fix.
+     */
+    affiliateTermsUrl: string;
   };
+  email: EmailSettings;
   reporting: ReportingDefaults;
 }
 
@@ -234,21 +589,16 @@ let cached: Config | null = null;
 export function getConfig(): Config {
   if (cached) return cached;
 
-  const organizationId = normalizeAppId(required('PARTNER_ORGANIZATION_ID'));
-  const apiVersion = optional('PARTNER_API_VERSION', '2026-07');
-  if (!/^(\d{4}-\d{2}|unstable)$/.test(apiVersion)) {
-    throw new ConfigError(`PARTNER_API_VERSION must be YYYY-MM or "unstable", got "${apiVersion}".`);
-  }
+  const version = apiVersion();
 
   cached = {
     partner: {
-      token: required('PARTNER_API_TOKEN'),
-      organizationId,
-      apiVersion,
-      endpoint: `https://partners.shopify.com/${organizationId}/api/${apiVersion}/graphql.json`,
+      apiVersion: version,
+      orgs: partnerOrgs(version),
     },
     auth: {
       password: dashboardPassword(),
+      allowNoAuth: bool('ALLOW_NO_AUTH', false),
     },
     scope: {
       appIds: appIds(),
@@ -264,7 +614,13 @@ export function getConfig(): Config {
       reviewSweepHours: nonNegative('REVIEW_SWEEP_HOURS', 24),
       notificationMaxAgeHours: nonNegative('NOTIFICATION_MAX_AGE_HOURS', 24),
       trustProxy: bool('TRUST_PROXY', false),
+      // Defaults to today's compiled-in behaviour, so nothing changes silently
+      // for a deployment that upgrades without reading the release note.
+      trustProxyHops: trustProxyHops(),
+      portalBaseUrl: optional('PORTAL_BASE_URL', '').replace(/\/+$/, ''),
+      affiliateTermsUrl: affiliateTermsUrl(),
     },
+    email: emailSettings(),
     reporting: {
       includeAnnual: bool('METRICS_INCLUDE_ANNUAL', true),
       includeUsage: bool('METRICS_INCLUDE_USAGE', true),
@@ -278,6 +634,43 @@ export function getConfig(): Config {
   };
 
   return cached;
+}
+
+/**
+ * The primary environment organization — `orgs[0]` — or null when the
+ * environment names none.
+ *
+ * Exactly one thing is allowed to use this: the `apps.org_id` backfill, which
+ * is answering "which org did the rows in this database, synced when only one
+ * org could be configured, come from?". It is not a default for API calls. Use
+ * `activeOrg` when you have an id, and take a `PartnerOrg` parameter otherwise.
+ *
+ * Null is a real answer now that the environment is optional, and the backfill
+ * handles it by leaving the column blank rather than guessing — see `migrate()`.
+ */
+export function primaryEnvOrg(): PartnerOrg | null {
+  return getConfig().partner.orgs[0] ?? null;
+}
+
+/** The same, for callers that treat "no environment organization" as an error. */
+export function getPrimaryOrg(): PartnerOrg {
+  const first = primaryEnvOrg();
+  if (!first) throw new ConfigError('No Shopify Partner organization is configured.');
+  return first;
+}
+
+/** Credentials for a known *environment* organization id, refused rather than guessed. */
+export function getOrg(organizationId: string): PartnerOrg {
+  const match = getConfig().partner.orgs.find(
+    (org) => org.organizationId === organizationId,
+  );
+  if (!match) {
+    throw new ConfigError(
+      `No credentials configured for Shopify Partner organization ${organizationId}. ` +
+        `Set PARTNER_ORG_<n>_ID and PARTNER_ORG_<n>_TOKEN for it.`,
+    );
+  }
+  return match;
 }
 
 /** Test seam: drop the memoized config so a new environment can be read. */

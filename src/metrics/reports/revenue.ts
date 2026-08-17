@@ -1,5 +1,6 @@
-import { bucketsCte, stockSeries, stockSeriesByApp, usageSeries } from '../asof.js';
+import { stockSeries, stockSeriesByApp, usageSeries } from '../asof.js';
 import type { MetricContext } from '../context.js';
+import { appIdFilter, rollupReady, splitBuckets, splitCte } from '../rollup.js';
 import { growthFrom } from '../growth.js';
 import { buildResponse, type MetricResponse, type NamedSeries } from '../response.js';
 import type { Bucket } from '../time.js';
@@ -21,10 +22,10 @@ interface MrrComponents {
 }
 
 function mrrComponents(context: MetricContext, buckets: Bucket[]): MrrComponents {
-  const stock = stockSeries(context.db, buckets, context.asOf);
+  const stock = stockSeries(context.db, buckets, context.asOf, context.window.timeZone);
   const byIndex = new Map(stock.map((point) => [point.idx, point]));
   const usage = context.includeUsage
-    ? usageSeries(context.db, buckets, context.appIds)
+    ? usageSeries(context.db, buckets, context.appIds, context.window.timeZone)
     : new Map<number, number>();
 
   const monthly: number[] = [];
@@ -137,7 +138,7 @@ const MAX_APP_SERIES = 4;
  */
 export function mrrByAppReport(context: MetricContext): MetricResponse {
   const buckets = context.window.buckets;
-  const points = stockSeriesByApp(context.db, buckets, context.asOf);
+  const points = stockSeriesByApp(context.db, buckets, context.asOf, context.window.timeZone);
 
   const totalByApp = new Map<string, number>();
   const nameByApp = new Map<string, string>();
@@ -244,39 +245,67 @@ interface EarningsRow {
  * subscription index, because billed money and contracted price diverge
  * (proration, refunds, failed charges).
  */
+/**
+ * Gross earnings is the metric the rollup was built for: it is a flow, so every
+ * bucket sums a disjoint slice of the ledger, and reading it from the raw table
+ * meant one full pass per bucket — a dozen passes over millions of rows to
+ * produce a dozen numbers.
+ *
+ * The bucket interiors come from `transaction_daily`, which carries `type`, so
+ * the component breakdown splits the same way the total does. Only the two
+ * outermost buckets have a remainder to read raw: the first bucket is clamped to
+ * the requested start and the last to `now`, and every boundary between them is
+ * a local midnight the rollup is keyed on.
+ */
 export function grossEarningsReport(context: MetricContext): MetricResponse {
   const buckets = context.window.buckets;
-  const cte = bucketsCte(buckets);
+  const split = splitBuckets(
+    buckets.map((bucket, idx) => ({ idx, from: bucket.start, to: bucket.end })),
+    context.window.timeZone,
+    rollupReady(context.db),
+  );
+  const cte = splitCte(split);
+  const rollupApps = appIdFilter(context.appIds, 'r.app_id', 'erapp');
+  const rawApps = appIdFilter(context.appIds, 't.app_id', 'eapp');
 
-  const params: Record<string, unknown> = { ...cte.params };
-  const appNames = context.appIds.map((id, index) => {
-    params[`eapp${index}`] = id;
-    return `@eapp${index}`;
-  });
-  const appFilter = appNames.length > 0 ? `AND t.app_id IN (${appNames.join(', ')})` : '';
+  const params: Record<string, unknown> = {
+    ...cte.params,
+    ...rollupApps.params,
+    ...rawApps.params,
+  };
   const typeNames = EARNING_TYPES.map((type, index) => {
     params[`etype${index}`] = type;
     return `@etype${index}`;
   });
+  const typeFilter = `type IN (${typeNames.join(', ')})`;
 
   const rows = context.db
     .prepare(
       `WITH ${cte.sql}
-       SELECT b.idx AS idx,
-              COALESCE(SUM(t.gross_amount), 0) AS gross,
-              COALESCE(SUM(t.net_amount), 0) AS net,
-              COALESCE(SUM(CASE WHEN t.type = 'AppSubscriptionSale' THEN t.gross_amount ELSE 0 END), 0) AS subscription,
-              COALESCE(SUM(CASE WHEN t.type = 'AppOneTimeSale' THEN t.gross_amount ELSE 0 END), 0) AS oneTime,
-              COALESCE(SUM(CASE WHEN t.type = 'AppUsageSale' THEN t.gross_amount ELSE 0 END), 0) AS usage,
-              COALESCE(SUM(CASE WHEN t.type IN ('AppSaleAdjustment', 'AppSaleCredit') THEN t.gross_amount ELSE 0 END), 0) AS adjustments
-       FROM buckets b
-       LEFT JOIN transactions t
-         ON t.created_at >= b.bucket_from
-        AND t.created_at < b.as_of
-        AND t.type IN (${typeNames.join(', ')})
-        ${appFilter}
-       GROUP BY b.idx
-       ORDER BY b.idx`,
+       SELECT idx,
+              COALESCE(SUM(gross), 0) AS gross,
+              COALESCE(SUM(net), 0) AS net,
+              COALESCE(SUM(CASE WHEN type = 'AppSubscriptionSale' THEN gross ELSE 0 END), 0) AS subscription,
+              COALESCE(SUM(CASE WHEN type = 'AppOneTimeSale' THEN gross ELSE 0 END), 0) AS oneTime,
+              COALESCE(SUM(CASE WHEN type = 'AppUsageSale' THEN gross ELSE 0 END), 0) AS usage,
+              COALESCE(SUM(CASE WHEN type IN ('AppSaleAdjustment', 'AppSaleCredit') THEN gross ELSE 0 END), 0) AS adjustments
+       FROM (
+         SELECT b.idx AS idx, r.type AS type, r.gross_amount AS gross, r.net_amount AS net
+         FROM rdays b
+         JOIN transaction_daily r
+           ON r.day >= b.day_from AND r.day < b.day_to
+          AND r.${typeFilter}
+          ${rollupApps.sql ? `AND ${rollupApps.sql}` : ''}
+         UNION ALL
+         SELECT e.idx AS idx, t.type AS type, t.gross_amount AS gross, t.net_amount AS net
+         FROM redges e
+         JOIN transactions t
+           ON t.created_at >= e.lo AND t.created_at < e.hi
+          AND t.${typeFilter}
+          ${rawApps.sql ? `AND ${rawApps.sql}` : ''}
+       )
+       GROUP BY idx
+       ORDER BY idx`,
     )
     .all(params) as EarningsRow[];
 
