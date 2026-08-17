@@ -2,6 +2,7 @@ import { getConfig } from '../config.js';
 import { getDb, readSyncState, writeSyncState, type Db } from '../db/index.js';
 import { addDays, toUtcIso } from '../metrics/time.js';
 import { connect, type Connected } from '../bigquery/client.js';
+import { readAttributionSettings } from './attributionSettings.js';
 import { listAppSources, readConnection, recordCheck } from '../bigquery/connection.js';
 import {
   DEFAULT_LOOKBACK_DAYS,
@@ -367,6 +368,7 @@ export async function syncAttributions(
   }
 
   const result: AttributionSyncResult = { ...EMPTY_ATTRIBUTION, skipped: [] };
+  const settings = readAttributionSettings(db);
 
   for (const source of sources) {
     const handles = enrolledHandles(db, source.appId);
@@ -390,6 +392,11 @@ export async function syncAttributions(
         from,
         to: now,
         handles: [...byHandle.keys()],
+        // Read once per run rather than per app: these are instance-wide, and
+        // reading them per app would let two apps in one sync disagree about
+        // the window if somebody saved the screen mid-run.
+        windowDays: settings.windowDays,
+        touch: settings.touch,
       });
 
       const write = db.transaction((rows: Attribution[]) => {

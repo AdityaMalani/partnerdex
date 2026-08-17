@@ -14,6 +14,12 @@ import {
   type AffiliateSort,
 } from '../affiliates/admin.js';
 import { createProgram, getProgram, updateProgram } from '../affiliates/programAdmin.js';
+import { createAffiliate, updateAffiliate } from '../affiliates/affiliateAdmin.js';
+import { affiliateSetupState } from '../affiliates/setup.js';
+import {
+  readAttributionSettings,
+  updateAttributionSettings,
+} from '../affiliates/attributionSettings.js';
 import { REVENUE_COMPONENTS } from '../affiliates/commission.js';
 import { getPayout, listPayouts } from '../affiliates/payouts.js';
 // Attribution claims. Kept as its own import block so a merge that lands two
@@ -25,7 +31,11 @@ import {
   planOnboarding,
   runOnboarding,
 } from '../notifications/onboarding.js';
-import { issueSetPasswordLink, type SetPasswordLink } from './portalAuth.js';
+import {
+  deliverSetPasswordLink,
+  issueSetPasswordLink,
+  type SetPasswordLink,
+} from './portalAuth.js';
 import { sendError } from './errors.js';
 
 /**
@@ -143,6 +153,95 @@ export function affiliatesAdminRouter(): express.Router {
   });
 
   /**
+   * What state this programme is in, as figures.
+   *
+   * Read fresh on every request rather than stored, so it cannot disagree with
+   * the database it describes — and so half a setup done through the API is
+   * reflected without anybody having to finish a wizard they never started.
+   *
+   * Registered ahead of `/:affiliateId` for the same reason `/claims` is: a
+   * bare word under this router is otherwise swallowed by the affiliate-detail
+   * route and comes back as a 404 that reads as "no such affiliate".
+   */
+  router.get('/setup', (_request, response) => {
+    try {
+      response.json({ setup: affiliateSetupState(getDb()) });
+    } catch (error) {
+      fail(response, error);
+    }
+  });
+
+  /**
+   * Create an affiliate, and optionally enrol them in a programme.
+   *
+   * The verb that did not exist. An affiliate could previously only arrive
+   * through the Mantle import — a one-off that will never run on a fresh
+   * install — or through public self-signup, which needs the person to find the
+   * portal and apply. Neither is a way for an operator to add a partner they
+   * have just agreed terms with.
+   *
+   * Body: `{ name, email, paypalEmail?, status?, payoutHold?, programId?,
+   * handle? }`. Naming a programme enrols them and returns their handle, which
+   * is what makes the response actionable: an affiliate with no membership has
+   * no link, and a link is the reason the operator is here.
+   *
+   * The response carries a **set-password link when one could be minted**, and
+   * that link is an account-takeover credential with a 24-hour life. It is in
+   * the body because the operator is the only one who can deliver it when no
+   * mail relay is configured. It must never be logged, and `deliverSetPasswordLink`
+   * is what sends it when email is on.
+   */
+  router.post('/', (request, response) => {
+    try {
+      const body = (request.body ?? {}) as Record<string, unknown>;
+      const created = createAffiliate(body, getDb());
+      const link = issueSetPasswordLink(getDb(), created.affiliate.id);
+      if (link) deliverSetPasswordLink(link);
+      response.status(201).json({
+        affiliate: created.affiliate,
+        membership: created.membership,
+        setPasswordUrl: link?.url ?? null,
+        setPasswordExpiresAt: link?.expiresAt ?? null,
+      });
+    } catch (error) {
+      fail(response, error);
+    }
+  });
+
+  /**
+   * How a click becomes a referral.
+   *
+   * Instance-wide rather than per programme: which programme a click belongs to
+   * is only known after its handle resolves, and two programmes can share an
+   * app, so a per-programme window would mean two programmes disagreeing about
+   * one click with no principled tie-break.
+   *
+   * Saving these does not re-derive anything already credited. An attribution
+   * is a durable fact with money computed from it — the opposite of a
+   * programme's terms, which are a rule that prices a charge — so a change
+   * applies to the next pipeline run and nothing moves between affiliates.
+   */
+  router.get('/attribution-settings', (_request, response) => {
+    try {
+      response.json({ settings: readAttributionSettings(getDb()) });
+    } catch (error) {
+      fail(response, error);
+    }
+  });
+
+  router.patch('/attribution-settings', (request, response) => {
+    try {
+      const settings = updateAttributionSettings(
+        (request.body ?? {}) as Record<string, unknown>,
+        getDb(),
+      );
+      response.json({ settings });
+    } catch (error) {
+      fail(response, error);
+    }
+  });
+
+  /**
    * Programs and their terms.
    *
    * `revenueComponents` names the vocabulary a program's terms may draw on, so
@@ -201,12 +300,17 @@ export function affiliatesAdminRouter(): express.Router {
    * that does not render a field cannot reset it. `null` clears a duration cap
    * or an uninstall grace period, and is told apart from absent.
    *
-   * Commissions are recomputed inline and returned. That is not a convenience —
-   * the terms are inputs to a pure derivation with no memory of what a
-   * commission was originally computed under, so changing a rate restates every
-   * commission on this program's referrals, retroactively and immediately. The
-   * person changing it is entitled to see that in the same response rather than
-   * discover it on the next sync. Payments are untouched; the recompute has no
+   * A change to any versioned term writes a new row in
+   * `affiliate_program_terms` effective from now, so the edit moves what
+   * referrals earn from here on and leaves what they have already earned where
+   * it is. `effectiveFrom` in the body backdates it, and that path is refused
+   * outright — 409 — if the version would re-price a commission somebody has
+   * already been paid.
+   *
+   * Commissions are recomputed inline and returned. That is not a convenience:
+   * an edit that changes future earnings should say so at the moment it is
+   * made rather than on the next sync, and a backdated one has moved something
+   * the operator needs to see. Payments are untouched; the recompute has no
    * code path that writes one.
    */
   router.patch('/programs/:programId', (request, response) => {
@@ -563,6 +667,31 @@ export function affiliatesAdminRouter(): express.Router {
   });
 
   /* ------------------------------------------------ end attribution claims */
+
+  /**
+   * Edit an affiliate: their name, addresses, status and payout hold.
+   *
+   * Partial, like the programme editor. `status` and `payoutHold` are kept
+   * apart deliberately — disabling stops a handle resolving on the public
+   * redirect, while a payout hold stops nothing and records that somebody has
+   * decided not to pay yet. Commissions keep accruing under a hold, which is
+   * the point of it.
+   *
+   * Registered before `GET /:affiliateId` in source order but on a different
+   * verb, so no route shadowing is involved.
+   */
+  router.patch('/:affiliateId', (request, response) => {
+    try {
+      const affiliate = updateAffiliate(
+        request.params.affiliateId,
+        (request.body ?? {}) as Record<string, unknown>,
+        getDb(),
+      );
+      response.json({ affiliate });
+    } catch (error) {
+      fail(response, error);
+    }
+  });
 
   /** One affiliate: memberships, handles, referrals and commissions. */
   router.get('/:affiliateId', (request, response) => {

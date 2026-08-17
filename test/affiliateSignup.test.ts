@@ -491,42 +491,121 @@ describe('what signup tells a stranger', () => {
   /**
    * The clock, which is the half the review found the login failing (finding 4).
    *
-   * The bound is loose on purpose — CI hardware, GC pauses, and unlike the login
-   * there is no scrypt here to dominate the measurement, so the *absolute*
-   * numbers are small and noisy. What it can still catch is a structural
-   * regression: an early return for an unknown address, or an expensive branch
-   * that only one path takes. Medians of seven probes, because one slow request
-   * is a garbage collection, not a disclosure.
+   * **This test asserts no wall-clock number, and no fixed ratio between the two
+   * paths either.** It used to assert "the two medians are within 4× of each
+   * other", and that is a claim about how quiet the machine is as much as about
+   * the code. Unlike the login there is no scrypt here to dominate, so a signup
+   * costs a couple of milliseconds and a single GC pause is larger than the
+   * whole measurement. It failed about one run in four, in *both* directions —
+   * sometimes the known path looked slower, sometimes the unknown one — which is
+   * the signature of a test reading noise rather than a property.
+   *
+   * The property underneath does not need a constant, it needs a control. Three
+   * series are measured instead of two:
+   *
+   *   - `known`   — an address that is already ours,
+   *   - `unknown` — a fresh address every round, so it is the unknown path each
+   *                 time rather than the first-round-only version of it,
+   *   - `control` — a *second* address that is also already ours.
+   *
+   * `control` runs exactly the same branch as `known`, so the separation between
+   * those two is this machine's noise floor and nothing else. The separation
+   * between `known` and `unknown` is that same noise plus whatever the code
+   * actually does differently. The assertion is that the second is not much
+   * bigger than the first — a ratio between measurements taken on the same box
+   * in the same second, so contention inflates both together and cancels.
+   *
+   * The three are interleaved and their order rotates each round, so a GC pause
+   * or a frequency change lands on all three rather than on whichever one
+   * happened to be running in its own phase. That interleaving is the other half
+   * of the fix: the old version measured one path to completion and then the
+   * other, so any drift between the two phases was read as signal.
+   *
+   * What this catches is the only thing it is for: an expensive branch that one
+   * path takes and the other does not, which is finding 4's shape. Measured
+   * against that defect deliberately reintroduced — a hash on the known path
+   * only — `observed` comes back around 125× against a floor that does not move,
+   * because the control pays the same cost the known path does.
+   *
+   * What it does *not* catch, and no wall-clock test at this endpoint can: a
+   * branch that merely skips a few in-memory statements. That is worth about
+   * 0.05 ms against a request of roughly 0.45 ms, so it never rises above the
+   * noise floor of any machine. The test this replaces did not catch it either.
+   * The defence against that one is the assertion above this test, which
+   * compares the two responses byte for byte.
    */
   it('takes comparable time on both paths', async () => {
     upsertAffiliate({ name: 'Timed', email: 'timed@example.com' }, db);
+    upsertAffiliate({ name: 'Timed Control', email: 'timed-control@example.com' }, db);
+
+    type Series = 'known' | 'unknown' | 'control';
+    const ORDER: Series[] = ['known', 'unknown', 'control'];
+    const ROUNDS = 60;
+    const samples: Record<Series, number[]> = { known: [], unknown: [], control: [] };
 
     const probe = async (email: string): Promise<number> => {
-      const samples: number[] = [];
-      for (let i = 0; i < 7; i += 1) {
-        resetSignupThrottle();
-        const started = performance.now();
-        await post('/portal/api/signup', {
-          name: 'Probe',
-          // A fresh address each round on the unknown side, so this measures the
-          // unknown path every time rather than the first-round-only version of
-          // it — after round one it would otherwise be a *known* address.
-          email,
-          programIds: [ids.openProgram],
-        });
-        samples.push(performance.now() - started);
-      }
-      samples.sort((a, b) => a - b);
-      return samples[Math.floor(samples.length / 2)]!;
+      resetSignupThrottle();
+      const started = performance.now();
+      await post('/portal/api/signup', {
+        name: 'Probe',
+        email,
+        programIds: [ids.openProgram],
+      });
+      return performance.now() - started;
     };
 
-    const knownMedian = await probe('timed@example.com');
-    const unknownMedian = await probe(`nobody-${Date.now()}@example.com`);
-    const ratio = Math.max(knownMedian, unknownMedian) / Math.max(Math.min(knownMedian, unknownMedian), 0.01);
+    for (let round = 0; round < ROUNDS; round += 1) {
+      for (let slot = 0; slot < ORDER.length; slot += 1) {
+        const series = ORDER[(round + slot) % ORDER.length]!;
+        const email =
+          series === 'known'
+            ? 'timed@example.com'
+            : series === 'control'
+              ? 'timed-control@example.com'
+              : `nobody-${round}-${slot}-${Date.now()}@example.com`;
+        samples[series].push(await probe(email));
+      }
+    }
 
+    /*
+     * Mean of the fastest 60% of a series. A plain median over seven samples was
+     * what the old test used and it was still noisy enough to fail one run in
+     * four: one scheduling hiccup in a short series moves the middle value. The
+     * upper tail here is always the machine and never the code, so dropping it
+     * and averaging what is left leaves a figure that repeats to within a few
+     * percent, loaded or idle.
+     */
+    const typical = (xs: number[]): number => {
+      const sorted = [...xs].sort((a, b) => a - b);
+      const kept = sorted.slice(0, Math.max(1, Math.ceil(sorted.length * 0.6)));
+      return kept.reduce((total, x) => total + x, 0) / kept.length;
+    };
+    const separation = (a: number, b: number): number =>
+      Math.max(a, b) / Math.max(Math.min(a, b), 0.01);
+
+    const knownMs = typical(samples.known);
+    const unknownMs = typical(samples.unknown);
+    const controlMs = typical(samples.control);
+
+    const observed = separation(knownMs, unknownMs);
+    const noiseFloor = separation(knownMs, controlMs);
+
+    /*
+     * Loose on purpose. On a healthy tree `observed` measures 1.07–1.35 and the
+     * floor 1.01–1.35, and those ranges were taken with the box loaded to twice
+     * its core count as well as idle — they barely move, which is the point of
+     * measuring a control. The `1.8` is a minimum ceiling for the case where the
+     * floor comes back unusually tight, so a quiet machine cannot make this test
+     * *stricter* than a busy one. The defect it exists for lands two orders of
+     * magnitude past either bound, so there is nothing to be gained by cutting
+     * the headroom finer.
+     */
     assert.ok(
-      ratio < 4,
-      `known ${knownMedian.toFixed(2)}ms vs unknown ${unknownMedian.toFixed(2)}ms is a ${ratio.toFixed(1)}× separation`,
+      observed <= Math.max(noiseFloor * 2, 1.8),
+      `the known and unknown paths must not separate by more than two known paths do: ` +
+        `known ${knownMs.toFixed(2)}ms vs unknown ${unknownMs.toFixed(2)}ms is ${observed.toFixed(2)}×, ` +
+        `against a same-branch noise floor of ${noiseFloor.toFixed(2)}× ` +
+        `(control ${controlMs.toFixed(2)}ms)`,
     );
   });
 

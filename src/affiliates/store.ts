@@ -17,12 +17,26 @@ import { getDb, type Db } from '../db/index.js';
  */
 
 export interface AffiliateInput {
+  /**
+   * An existing affiliate to write to.
+   *
+   * Absent means "mint one", which is what an import or a signup wants. An
+   * edit has to name the row it is editing: this function's key is
+   * `external_id` or a fresh uuid, and an admin-created affiliate has neither,
+   * so without this an edit would insert a second copy of the person.
+   */
+  id?: string;
   name: string;
   email: string;
   paypalEmail?: string | null;
   status?: 'active' | 'disabled';
   payoutHold?: boolean;
-  source?: 'imported' | 'signup';
+  /**
+   * Where the row came from. `admin` is an operator typing it into the
+   * dashboard, and is distinguishable from `signup` on purpose: one has been
+   * vetted by a person and the other has not.
+   */
+  source?: 'imported' | 'signup' | 'admin';
   externalId?: string;
   createdAt?: string;
 }
@@ -139,7 +153,7 @@ export function upsertAffiliate(input: AffiliateInput, db: Db = getDb()): string
   // No natural key. Email is the obvious candidate and is not one: the imported
   // data has a single address shared by two affiliates, so matching on it would
   // silently merge two people who are owed money separately.
-  const id = existingId(db, 'affiliates', input.externalId, null) ?? randomUUID();
+  const id = input.id ?? existingId(db, 'affiliates', input.externalId, null) ?? randomUUID();
 
   db.prepare(
     `INSERT INTO affiliates (id, name, email, paypal_email, status, payout_hold,

@@ -181,6 +181,21 @@ export function formatRate(rate: number): string {
   return `${new Intl.NumberFormat(undefined, { maximumFractionDigits: 2 }).format(rate * 100)}%`;
 }
 
+/**
+ * The revenue streams a programme can pay on, as words.
+ *
+ * The keys are the closed vocabulary in `commission.ts` and the values are the
+ * only place they are spelled for a reader. Keeping the map here rather than in
+ * the form means the terms table and the editor cannot disagree about what
+ * `one_time` is called, which is the kind of drift that has an operator setting
+ * a component they think means something else.
+ */
+export const REVENUE_COMPONENT_LABELS: Record<string, string> = {
+  subscription: 'Subscription',
+  usage: 'Usage',
+  one_time: 'One-off',
+};
+
 /** Null months is not "0 months" — it is the whole of the relationship. */
 export function formatDuration(months: number | null): string {
   if (months === null) return 'Lifetime';

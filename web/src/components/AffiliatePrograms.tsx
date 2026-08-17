@@ -2,12 +2,16 @@ import { useEffect, useMemo, useState } from 'react';
 import {
   fetchAffiliatePrograms,
   fetchListings,
+  fetchProgram,
   type AffiliateProgram,
   type AppListing,
+  type ProgramDetail,
 } from '../api';
 import { formatValue } from '../format';
 import { formatDuration, formatRate, loadReferralFeed, type ReferralFeed } from './AffiliateData';
 import { LoadState, Stat } from './AffiliateCommon';
+import { AffiliateProgramForm } from './AffiliateProgramForm';
+import { AffiliateSetupCard } from './AffiliateSetup';
 
 /**
  * The programs and their terms.
@@ -40,10 +44,12 @@ function ProgramCard({
   program,
   listing,
   feed,
+  onEdit,
 }: {
   program: AffiliateProgram;
   listing: AppListing | undefined;
   feed: ReferralFeed | null;
+  onEdit: () => void;
 }) {
   const stats = useMemo(() => {
     if (!feed) return null;
@@ -65,7 +71,10 @@ function ProgramCard({
         {program.name}{' '}
         <span className={`pill ${program.status === 'active' ? 'pill-paying' : ''}`.trim()}>
           {program.status === 'active' ? 'Active' : 'Closed'}
-        </span>
+        </span>{' '}
+        <button type="button" onClick={onEdit}>
+          Edit
+        </button>
       </div>
 
       <div className="stat-row">
@@ -169,6 +178,9 @@ export function AffiliatePrograms() {
   const [listings, setListings] = useState<AppListing[]>([]);
   const [feed, setFeed] = useState<ReferralFeed | null>(null);
   const [error, setError] = useState<string | null>(null);
+  /** The programme being edited, `'new'` for the create form, or null. */
+  const [editing, setEditing] = useState<ProgramDetail | 'new' | null>(null);
+  const [reload, setReload] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -199,7 +211,7 @@ export function AffiliatePrograms() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [reload]);
 
   const byApp = useMemo(() => {
     const map = new Map<string, AppListing>();
@@ -207,23 +219,64 @@ export function AffiliatePrograms() {
     return map;
   }, [listings]);
 
+  const saved = (): void => {
+    setEditing(null);
+    setReload((count) => count + 1);
+  };
+
+  if (editing === 'new') {
+    return <AffiliateProgramForm onSaved={saved} onCancel={() => setEditing(null)} />;
+  }
+  if (editing) {
+    return (
+      <AffiliateProgramForm
+        program={editing}
+        onSaved={saved}
+        onCancel={() => setEditing(null)}
+        key={editing.id}
+      />
+    );
+  }
+
   return (
-    <LoadState
-      loading={programs === null}
-      error={error}
-      empty={(programs?.length ?? 0) === 0}
-      loadingLabel="Loading programs…"
-      errorTitle="Could not load programs"
-      emptyMessage="No programs yet — they arrive with the affiliate import."
-    >
-      {(programs ?? []).map((program) => (
-        <ProgramCard
-          key={program.id}
-          program={program}
-          listing={byApp.get(program.appId)}
-          feed={feed}
-        />
-      ))}
-    </LoadState>
+    <>
+      <AffiliateSetupCard key={reload} />
+
+      <div className="channel-actions">
+        <button type="button" className="primary" onClick={() => setEditing('new')}>
+          New programme
+        </button>
+      </div>
+
+      <LoadState
+        loading={programs === null}
+        error={error}
+        empty={(programs?.length ?? 0) === 0}
+        loadingLabel="Loading programs…"
+        // The empty state used to read "they arrive with the affiliate import",
+        // which is true of exactly one deployment and a dead end for every
+        // other. The button above it is the answer now, so this only has to say
+        // what a programme is for.
+        errorTitle="Could not load programs"
+        emptyMessage="No programmes yet. One holds the rate, what it earns on, and how long a referral runs."
+      >
+        {(programs ?? []).map((program) => (
+          <ProgramCard
+            key={program.id}
+            program={program}
+            listing={byApp.get(program.appId)}
+            feed={feed}
+            onEdit={() => {
+              // Read the full record rather than promoting the list row: the
+              // list carries a summary, and an edit form seeded from it would
+              // silently blank every field the summary omits.
+              fetchProgram(program.id)
+                .then((result) => setEditing(result.program))
+                .catch((cause: Error) => setError(cause.message));
+            }}
+          />
+        ))}
+      </LoadState>
+    </>
   );
 }

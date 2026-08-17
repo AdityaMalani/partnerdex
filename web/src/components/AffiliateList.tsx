@@ -10,7 +10,9 @@ import {
   type Reconciliation,
 } from '../api';
 import { formatFullDate, formatValue } from '../format';
+import { useDebounced, useResetOnChange } from '../hooks';
 import { LoadState, MembershipPill, Stat } from './AffiliateCommon';
+import { AffiliateInvite } from './AffiliateInvite';
 
 /**
  * The affiliate population.
@@ -35,15 +37,6 @@ const SORTS: Array<{ value: AffiliateSort; label: string }> = [
   { value: 'name', label: 'Name' },
   { value: 'newest', label: 'Newest' },
 ];
-
-function useDebounced<T>(value: T, delay: number): T {
-  const [settled, setSettled] = useState(value);
-  useEffect(() => {
-    const timer = window.setTimeout(() => setSettled(value), delay);
-    return () => window.clearTimeout(timer);
-  }, [value, delay]);
-  return settled;
-}
 
 /**
  * The approval queue.
@@ -156,7 +149,7 @@ function ApprovalQueue({
 }
 
 export function AffiliateList() {
-  const [tab, setTab] = useState<'all' | 'pending'>('all');
+  const [tab, setTab] = useState<'all' | 'pending' | 'add'>('all');
   const [search, setSearch] = useState('');
   const [sort, setSort] = useState<AffiliateSort>('outstanding');
   const [page, setPage] = useState(0);
@@ -174,9 +167,9 @@ export function AffiliateList() {
 
   const debounced = useDebounced(search, 250);
 
-  useEffect(() => {
-    setPage(0);
-  }, [debounced, sort]);
+  // A new search starts at the beginning, and during render rather than in an
+  // effect so the fetch below goes out once — see `useResetOnChange`.
+  useResetOnChange(`${debounced} ${sort}`, () => setPage(0));
 
   useEffect(() => {
     let cancelled = false;
@@ -295,6 +288,19 @@ export function AffiliateList() {
         >
           All affiliates
         </button>
+        {/* A third tab rather than a button above the table: adding an
+            affiliate is a different task from reading the list, and a form
+            permanently open above a list is a form somebody submits by
+            accident on their way to the search box. */}
+        <button
+          type="button"
+          role="tab"
+          aria-selected={tab === 'add'}
+          className={tab === 'add' ? 'active' : undefined}
+          onClick={() => setTab('add')}
+        >
+          Add
+        </button>
         <button
           type="button"
           role="tab"
@@ -306,7 +312,9 @@ export function AffiliateList() {
         </button>
       </div>
 
-      {tab === 'pending' ? (
+      {tab === 'add' ? (
+        <AffiliateInvite onCreated={afterDecision} />
+      ) : tab === 'pending' ? (
         <ApprovalQueue
           memberships={pending}
           loading={pendingLoading}

@@ -55,6 +55,18 @@ import {
 export const REFERRAL_WINDOW_DAYS = 30;
 
 /**
+ * The URL parameters a referral handle may arrive in, in precedence order.
+ *
+ * The order is the rule: an affiliate link that has also picked up a campaign
+ * tag is still an affiliate link, and reading `utm_source` off it would credit
+ * the campaign. This is the compiled default and the seed for
+ * `affiliate_attribution_settings.parameters` — a deployment whose links use a
+ * different parameter edits the row, and one that has never opened the screen
+ * behaves exactly as this list says.
+ */
+export const REFERRAL_PARAMETERS = ['mref', 'utm_source', 'ref'] as const;
+
+/**
  * What an affiliate handle looks like: eight lowercase alphanumerics.
  *
  * This matters more than it first appears. The referral parameter is read with
@@ -153,9 +165,17 @@ export interface Attribution {
  * its translation. A test can hold this to the URLs that actually appear in
  * the export; nothing can hold a regex inside a BigQuery string to anything.
  */
-export function extractReferralHandle(pageLocation: string | null | undefined): string | null {
+export function extractReferralHandle(
+  pageLocation: string | null | undefined,
+  /**
+   * The parameter names, in precedence order. Defaults to the list this
+   * pipeline was built with, so a caller that does not care reads exactly as
+   * before — and the settings row, when there is one, is the same list.
+   */
+  parameters: readonly string[] = REFERRAL_PARAMETERS,
+): string | null {
   if (!pageLocation) return null;
-  for (const key of ['mref', 'utm_source', 'ref']) {
+  for (const key of parameters) {
     // Anchored on `?` or `&` so `ref` does not also match the tail of `mref`,
     // and stopped at `#` so a fragment cannot end up inside the handle.
     const match = pageLocation.match(new RegExp(`[?&]${key}=([^&#]*)`));
@@ -175,6 +195,17 @@ export interface SelectionOptions {
   windowDays?: number;
   /** The real affiliate handles, when the caller has them. Case-insensitive. */
   handles?: string[];
+  /**
+   * Which click wins when a merchant has more than one. Defaults to `first`.
+   *
+   * First touch credits discovery and last touch credits closing, and neither
+   * is more correct than the other — this deployment uses first because the
+   * platform it replaced did. What is *not* configurable is that exactly one
+   * click wins: two affiliates credited for one merchant is two invoices for
+   * one sale, and every downstream query assumes at most one live referral per
+   * (programme, merchant).
+   */
+  touch?: 'first' | 'last';
 }
 
 /**
@@ -223,6 +254,7 @@ export function selectFirstTouch(
   options: SelectionOptions = {},
 ): Attribution[] {
   const windowDays = options.windowDays ?? REFERRAL_WINDOW_DAYS;
+  const touch = options.touch ?? 'first';
   const allowed = options.handles
     ? new Set(options.handles.map((handle) => handle.trim().toLowerCase()))
     : null;
@@ -240,11 +272,23 @@ export function selectFirstTouch(
     if (!qualifies(candidate, windowDays)) continue;
 
     const current = best.get(candidate.shopId);
-    if (
-      !current ||
-      candidate.clickedAt < current.clickedAt ||
-      (candidate.clickedAt === current.clickedAt && handle < current.handle.toLowerCase())
-    ) {
+    /*
+     * The only difference between the two rules is which way this comparison
+     * points. The tie-break does *not* flip with it: it stays the lowest
+     * lowercased handle under both, so switching the setting cannot silently
+     * reassign a merchant whose two clicks share an instant — the answer stays
+     * arbitrary but stable, which is what makes it reconcilable and correctable
+     * by hand once.
+     */
+    if (!current) {
+      best.set(candidate.shopId, { ...candidate, handle });
+      continue;
+    }
+    const beats =
+      touch === 'last'
+        ? candidate.clickedAt > current.clickedAt
+        : candidate.clickedAt < current.clickedAt;
+    if (beats || (candidate.clickedAt === current.clickedAt && handle < current.handle.toLowerCase())) {
       best.set(candidate.shopId, { ...candidate, handle });
     }
   }
@@ -532,7 +576,11 @@ export async function runAttribution(
     });
   }
 
-  return selectFirstTouch(source.appId, candidates, { windowDays, handles: options.handles });
+  return selectFirstTouch(source.appId, candidates, {
+    windowDays,
+    handles: options.handles,
+    touch: options.touch,
+  });
 }
 
 export interface AttributeOptions extends SelectionOptions {
