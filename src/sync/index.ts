@@ -9,6 +9,8 @@ import {
   TRANSACTIONS_QUERY,
 } from '../partner/queries.js';
 import { addDays, toUtcIso } from '../metrics/time.js';
+import { warmCurrencyProfiles } from '../metrics/context.js';
+import { warmDashboardMetrics } from '../metrics/registry.js';
 import {
   insertAppEvents,
   insertTransactions,
@@ -19,6 +21,7 @@ import {
 import { rebuildDerivedTables } from './derive.js';
 import { syncReviews, type ReviewSyncResult } from '../appstore/ingest.js';
 import { syncListingEvents, type ListingSyncResult } from '../bigquery/ingest.js';
+import { HEARTBEAT_INTERVAL_MS, SyncReporter, type PhaseEvent } from './progress.js';
 
 /**
  * Transactions and events can be recorded slightly after they occur, so each
@@ -33,16 +36,75 @@ export interface SyncProgress {
 
 const noop: SyncProgress = () => {};
 
-function windowStart(db: Db, key: string, syncStartDate: string): string {
-  const { syncedThrough } = readSyncState(db, key);
+function windowStart(syncedThrough: string | null, syncStartDate: string): string {
   if (!syncedThrough) return toUtcIso(`${syncStartDate}T00:00:00Z`);
   return toUtcIso(addDays(new Date(syncedThrough), -OVERLAP_DAYS));
+}
+
+/**
+ * Where one pass resumes: its stored cursor, but only if that cursor was made
+ * for the window this pass is about to ask for.
+ *
+ * A Relay cursor is an opaque position inside the result set of the query that
+ * produced it. Handed to a query with different arguments it does not mean
+ * "the same place in the new window" — it means whatever the server decides,
+ * and the honest reading of an offset-backed connection is "carry on with the
+ * old walk". A pass that does that reads history it has no reason to read, at
+ * the cost of the rows it was actually started for: reproduced against a fake
+ * Partner API in `scripts/window-probe.ts`, where a cursor from a full-history
+ * pass makes a three-day window walk tens of thousands of rows instead of
+ * hundreds, and never reaches the newest ones.
+ *
+ * A cursor with no recorded window — every cursor written before the column
+ * existed — counts as a mismatch. Re-walking one window once is the cheap
+ * mistake; trusting a cursor whose provenance is unknown is the expensive one.
+ */
+function resumeCursor(state: { cursor: string | null; cursorWindow: string | null }, window: string): string | null {
+  if (!state.cursor) return null;
+  return state.cursorWindow === window ? state.cursor : null;
+}
+
+/**
+ * The watermark a pass leaves behind: the newest row anyone has seen, never
+ * older than what is already recorded.
+ *
+ * Two ways the old code could move it backwards, both of which put the sync
+ * permanently behind its own data — the window is derived from this value, so
+ * a watermark that regresses is re-read forever and a watermark that overshoots
+ * skips rows that are never asked for again.
+ *
+ * The first is a pass that does not reach the newest row. It cannot: the rows
+ * it saw are all it knows, and `max` over them is smaller than the recorded
+ * mark. Seeding from the recorded mark rather than from the window makes the
+ * comparison the right one.
+ *
+ * The second is a pass that returns no rows, which used to stamp the wall clock
+ * — a watermark no row supports, and forward of the data rather than behind it.
+ * On an install whose first pass finds nothing (a scope not yet configured, an
+ * org whose token is not live yet) that writes "synced through now" over history
+ * nobody has read, and everything before it minus the overlap is never fetched.
+ * An empty pass learns nothing, so it now records nothing.
+ */
+function advanceWatermark(recorded: string | null, seen: string | null): string | null {
+  if (!seen) return recorded;
+  if (!recorded) return seen;
+  return seen > recorded ? seen : recorded;
 }
 
 export interface SyncOptions {
   /** Ignore stored watermarks and re-read everything from SYNC_START_DATE. */
   full?: boolean;
   onProgress?: SyncProgress;
+  /**
+   * Phase transitions, heartbeats and failures.
+   *
+   * Separate from `onProgress` because the two have different audiences and
+   * very different volumes: `onProgress` is a line per page of results, which
+   * the CLI prints and a daemon must not, while this is a handful of lines per
+   * run and is the only thing worth logging from a process that has been
+   * running every few minutes for months.
+   */
+  onPhase?: (event: PhaseEvent) => void;
 }
 
 /**
@@ -81,55 +143,72 @@ async function syncTransactionsFor(
   db: Db,
   appId: string | null,
   options: SyncOptions,
+  signal?: AbortSignal,
 ): Promise<number> {
   const { scope } = getConfig();
   const onProgress = options.onProgress ?? noop;
   const key = appId ? `transactions:${appId}` : 'transactions:all';
 
-  if (options.full) writeSyncState(db, key, { cursor: null, syncedThrough: null });
+  if (options.full) {
+    writeSyncState(db, key, { cursor: null, cursorWindow: null, syncedThrough: null });
+  }
 
-  const createdAtMin = windowStart(db, key, scope.syncStartDate);
-  const { cursor } = readSyncState(db, key);
-  const startedAt = new Date().toISOString();
+  const state = readSyncState(db, key);
+  const createdAtMin = windowStart(state.syncedThrough, scope.syncStartDate);
 
   let total = 0;
-  let latest = createdAtMin;
+  // Seeded from the recorded watermark, not from the window, so a pass that
+  // stops short of the newest row leaves the mark where it found it.
+  let latest: string | null = null;
 
   const pages = paginate<TransactionNode>(
     TRANSACTIONS_QUERY,
     transactionVariables(appId, createdAtMin, SALE_TRANSACTION_TYPES),
     (data) => data?.transactions,
-    cursor,
+    resumeCursor(state, createdAtMin),
+    { signal },
   );
 
   for await (const page of pages) {
     total += insertTransactions(db, page.nodes);
     for (const node of page.nodes) {
       const at = toUtcIso(node.createdAt);
-      if (at > latest) latest = at;
+      if (!latest || at > latest) latest = at;
     }
-    writeSyncState(db, key, { cursor: page.endCursor });
+    // The window travels with the cursor, so the next pass can tell whether the
+    // two still belong together.
+    writeSyncState(db, key, { cursor: page.endCursor, cursorWindow: createdAtMin });
     onProgress(`  transactions: ${total} rows`);
   }
 
   // Cursor cleared only after a clean pass, so an interrupted run resumes.
-  writeSyncState(db, key, { cursor: null, syncedThrough: total > 0 ? latest : startedAt });
+  writeSyncState(db, key, {
+    cursor: null,
+    cursorWindow: null,
+    syncedThrough: advanceWatermark(state.syncedThrough, latest),
+  });
   return total;
 }
 
-async function syncEventsFor(db: Db, appId: string, options: SyncOptions): Promise<number> {
+async function syncEventsFor(
+  db: Db,
+  appId: string,
+  options: SyncOptions,
+  signal?: AbortSignal,
+): Promise<number> {
   const { scope } = getConfig();
   const onProgress = options.onProgress ?? noop;
   const key = `events:${appId}`;
 
-  if (options.full) writeSyncState(db, key, { cursor: null, syncedThrough: null });
+  if (options.full) {
+    writeSyncState(db, key, { cursor: null, cursorWindow: null, syncedThrough: null });
+  }
 
-  const occurredAtMin = windowStart(db, key, scope.syncStartDate);
-  const { cursor } = readSyncState(db, key);
-  const startedAt = new Date().toISOString();
+  const state = readSyncState(db, key);
+  const occurredAtMin = windowStart(state.syncedThrough, scope.syncStartDate);
 
   let total = 0;
-  let latest = occurredAtMin;
+  let latest: string | null = null;
 
   const pages = paginate<AppEventNode>(
     APP_EVENTS_QUERY,
@@ -139,28 +218,34 @@ async function syncEventsFor(db: Db, appId: string, options: SyncOptions): Promi
       types: SYNCED_EVENT_TYPES,
     },
     (data) => data?.app?.events,
-    cursor,
+    resumeCursor(state, occurredAtMin),
+    { signal },
   );
 
   for await (const page of pages) {
     total += insertAppEvents(db, appId, page.nodes);
     for (const node of page.nodes) {
       const at = toUtcIso(node.occurredAt);
-      if (at > latest) latest = at;
+      if (!latest || at > latest) latest = at;
     }
-    writeSyncState(db, key, { cursor: page.endCursor });
+    writeSyncState(db, key, { cursor: page.endCursor, cursorWindow: occurredAtMin });
     onProgress(`  events: ${total} rows`);
   }
 
-  writeSyncState(db, key, { cursor: null, syncedThrough: total > 0 ? latest : startedAt });
+  writeSyncState(db, key, {
+    cursor: null,
+    cursorWindow: null,
+    syncedThrough: advanceWatermark(state.syncedThrough, latest),
+  });
   return total;
 }
 
 /** Confirms an allowlisted app id exists and records its name locally. */
-async function confirmApp(db: Db, appId: string): Promise<boolean> {
+async function confirmApp(db: Db, appId: string, signal?: AbortSignal): Promise<boolean> {
   const data = await partnerQuery<{ app: { id: string; name: string; apiKey: string } | null }>(
     APP_QUERY,
     { appId: `gid://partners/App/${appId}` },
+    { signal },
   );
   if (!data.app) return false;
   upsertApp(db, data.app);
@@ -180,30 +265,70 @@ export interface SyncResult {
 }
 
 export async function runSync(options: SyncOptions = {}): Promise<SyncResult> {
+  // The heartbeat cadence is readable from the environment for the same reason
+  // the timeouts are: so it can be turned down to watch a run without waiting
+  // out half-minute silences, and up on an install that finds it chatty.
+  const beat = Number(process.env.SYNC_HEARTBEAT_MS);
+  const reporter = new SyncReporter(
+    { onProgress: options.onProgress, onPhase: options.onPhase },
+    Number.isFinite(beat) && beat > 0 ? beat : HEARTBEAT_INTERVAL_MS,
+  );
+  try {
+    return await runSyncReported(options, reporter);
+  } finally {
+    reporter.close();
+  }
+}
+
+async function runSyncReported(options: SyncOptions, reporter: SyncReporter): Promise<SyncResult> {
   const db = getDb();
   const { scope } = getConfig();
-  const onProgress = options.onProgress ?? noop;
+
+  /*
+   * Every step below is handed the reporter's own callback rather than the
+   * caller's, so a detail line updates the heartbeat's "how far has it got"
+   * before it reaches whoever asked for it. The caller still sees each line
+   * unchanged; it just no longer goes straight past the thing narrating the run.
+   */
+  const steps: SyncOptions = { full: options.full, onProgress: reporter.progressCallback() };
+  const onProgress = steps.onProgress ?? noop;
 
   let transactions = 0;
 
   if (scope.appIds.length > 0) {
     onProgress(`Scope: ${scope.appIds.length} app(s) from PARTNER_APP_IDS.`);
-    for (const appId of scope.appIds) {
-      const exists = await confirmApp(db, appId);
-      if (!exists) {
-        throw new Error(
-          `App id ${appId} from PARTNER_APP_IDS was not found in this organization.`,
-        );
-      }
-    }
+    await reporter.phase(
+      'scope',
+      null,
+      async () => {
+        for (const appId of scope.appIds) {
+          if (!(await confirmApp(db, appId))) {
+            throw new Error(
+              `App id ${appId} from PARTNER_APP_IDS was not found in this organization.`,
+            );
+          }
+        }
+        return scope.appIds;
+      },
+      (found) => ({ apps: found.length }),
+    );
     for (const appId of scope.appIds) {
       onProgress(`Syncing transactions for app ${appId}...`);
-      transactions += await syncTransactionsFor(db, appId, options);
+      transactions += await reporter.phase(
+        'transactions',
+        null,
+        () => syncTransactionsFor(db, appId, steps),
+        (rows) => ({ rows }),
+      );
     }
   } else {
     onProgress('Scope: every app with recorded transactions (PARTNER_APP_IDS is empty).');
-    onProgress('Syncing transactions...');
-    transactions += await syncTransactionsFor(db, null, options);
+    transactions += await reporter.phase(
+      'transactions',
+      null,
+      () => syncTransactionsFor(db, null, steps),
+      (rows) => ({ rows }),
+    );
   }
 
   const appIds = resolveScopedAppIds(db);
@@ -214,24 +339,67 @@ export async function runSync(options: SyncOptions = {}): Promise<SyncResult> {
   let events = 0;
   for (const appId of appIds) {
     onProgress(`Syncing events for app ${appId}...`);
-    events += await syncEventsFor(db, appId, options);
+    events += await reporter.phase(
+      'events',
+      null,
+      () => syncEventsFor(db, appId, steps),
+      (rows) => ({ rows }),
+    );
   }
 
   // Before the rebuild, so a review that arrives this run is matched to a
   // customer and compiled onto their timeline in the same pass rather than
   // waiting out a sync.
-  const reviews = await syncReviews(db, { full: options.full, onProgress });
+  const reviews = await reporter.phase(
+    'reviews',
+    null,
+    () => syncReviews(db, steps),
+    (result) => ({ added: result.added, updated: result.updated, removed: result.removed }),
+  );
 
   // The pre-install half of the funnel. Independent of everything above — it is
   // Google's data, not Shopify's — and quiet when BigQuery is not connected,
   // which is every install that has not filled in the settings page.
-  const listing = await syncListingEvents(db, appIds, { full: options.full, onProgress });
+  const listing = await reporter.phase(
+    'listing',
+    null,
+    () => syncListingEvents(db, appIds, steps),
+    (result) => ({ rows: result.rows, apps: result.apps.length, skipped: result.skipped.length }),
+  );
   if (listing.rows > 0) {
     onProgress(`Listing traffic: ${listing.rows} event(s) across ${listing.apps.length} app(s).`);
   }
 
   onProgress('Rebuilding derived subscription and install indexes...');
-  const derived = rebuildDerivedTables(db);
+  const derived = await reporter.phase(
+    'derive',
+    null,
+    async () => rebuildDerivedTables(db, { full: options.full }),
+    (result) => ({
+      subscriptions: result.subscriptions,
+      installs: result.installs,
+      customerEvents: result.customerEvents,
+      // The work, as opposed to the totals above: how many merchants this pass
+      // actually rebuilt.
+      pairs: result.pairs,
+    }),
+  );
+
+  /*
+   * Refill what the rebuild just emptied, here in the worker rather than on the
+   * first request that arrives afterwards.
+   *
+   * `rebuildDerivedTables` clears the metric cache, and the currency profile
+   * lives in it — a full scan of `transactions` that every metric needs before
+   * it can even look for its own cached answer. Leaving it cold hands that scan
+   * to a request thread that is also the health check's only chance to be
+   * answered. Warming it costs one pass here, off the request path, in a
+   * process whose only job is to be busy.
+   */
+  await reporter.phase('warm', null, async () => {
+    warmCurrencyProfiles(db, appIds);
+    warmDashboardMetrics();
+  });
 
   return { apps: appIds, transactions, events, reviews, listing, ...derived };
 }

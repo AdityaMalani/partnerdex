@@ -24,6 +24,10 @@ export function resetEnvironment(overrides: Record<string, string> = {}): void {
   // Explicitly off, so a password exported in the developer's shell cannot
   // decide whether the fixture's API is gated. The auth tests override it.
   process.env.DASHBOARD_PASSWORD = '';
+  // `createApp` refuses to build an ungated server without this — a missing
+  // password is otherwise indistinguishable from a secret that failed to
+  // deploy. A test fixture is exactly the "I mean it" case the flag is for.
+  process.env.ALLOW_NO_AUTH = 'true';
   process.env.SYNC_START_DATE = '2020-01-01';
   process.env.REPORTING_TIMEZONE = 'UTC';
   process.env.CACHE_TTL_SECONDS = '0';

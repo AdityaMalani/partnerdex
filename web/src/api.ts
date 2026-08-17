@@ -56,16 +56,35 @@ export interface SyncStatus {
   lastError: string | null;
   consecutiveFailures: number;
   nextRunAt: string | null;
+  /** The phase in flight, and since when. Null between runs. */
+  phase: string | null;
+  phaseOrg: string | null;
+  phaseStartedAt: string | null;
+  /** The newest detail line the run has produced. */
+  lastMessage: string | null;
+  lastMessageAt: string | null;
+  /** Where the last failure happened, which `lastError` alone never said. */
+  lastErrorPhase: string | null;
+  lastErrorOrg: string | null;
+  lastErrorAt: string | null;
+  lastDurationMs: number | null;
 }
 
 export interface Status {
-  apps: number;
-  shops: number;
-  events: number;
-  transactions: number;
-  subscriptions: number;
-  customerEvents: number;
+  /*
+   * The row counts, present only when `?counts=1` was asked for. Optional in the
+   * type because they are optional on the wire — declaring them required is how
+   * a reader ends up treating an absent count as a zero.
+   */
+  apps?: number;
+  shops?: number;
+  events?: number;
+  transactions?: number;
+  subscriptions?: number;
+  customerEvents?: number;
   lastSyncAt: string | null;
+  /** Whether the store holds anything. Always sent, and cheap. */
+  hasData: boolean;
   sync: SyncStatus;
 }
 
@@ -542,10 +561,28 @@ export interface BigQueryAppSource {
   lastEventAt: string | null;
 }
 
+/**
+ * The manual ingest's own account of itself.
+ *
+ * The server forks the ingest into a child process rather than running it on
+ * the request thread — it used to block the event loop for minutes and fail the
+ * platform health check — so `POST /sync` returns before there is a result and
+ * this is where the result eventually appears.
+ */
+export interface BigQuerySyncJob {
+  running: boolean;
+  full: boolean;
+  startedAt: string | null;
+  finishedAt: string | null;
+  result: ListingSyncResult | null;
+  error: string | null;
+}
+
 export interface BigQuerySettings {
   connection: BigQueryConnection | null;
   sources: BigQueryAppSource[];
   stats: { events: number; earliest: string | null; latest: string | null };
+  job: BigQuerySyncJob;
 }
 
 /** The account check: does the key work, and what datasets can it see. */
@@ -599,9 +636,15 @@ export const saveBigQueryAppSource = (
 ): Promise<BigQueryAppSource> =>
   sendJson('PUT', `${BQ}/apps/${encodeURIComponent(appId)}`, patch);
 
+/**
+ * Starts an ingest. Resolves as soon as the job is accepted (HTTP 202), not
+ * when it has finished — read `job` from `fetchBigQuery()` for that. A 409
+ * (a run is already going) arrives here as a thrown error with the server's
+ * message, which is the right thing to show.
+ */
 export const syncBigQuery = (
   full = false,
-): Promise<BigQuerySettings & { result: ListingSyncResult }> =>
+): Promise<BigQuerySettings & { accepted: boolean }> =>
   sendJson('POST', `${BQ}/sync${full ? '?full=1' : ''}`);
 
 /* --------------------------------------------------------- notifications */

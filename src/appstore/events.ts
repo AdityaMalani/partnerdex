@@ -28,7 +28,14 @@ import type { Db } from '../db/index.js';
  *   - **Removal is dated, not deleted.** `review_removed` is emitted from
  *     `removed_at`, and the review row it came from is still there in full.
  *
- * Run after `buildCustomerEvents`, which clears the table; this only inserts.
+ * Self-contained: it clears the three review types out of `customer_events` and
+ * writes them back in one transaction. It used to lean on the lifecycle
+ * compiler, which emptied everything that was not a payment before every rebuild
+ * — and that was what removed a `review_edited` row whose id had moved on,
+ * because the id folds a content hash and a rewritten review compiles to a
+ * *different* row rather than an update of the old one. The compiler now
+ * rewrites one merchant at a time and names the lifecycle types it owns, so
+ * this has to clear its own.
  */
 
 /** Row shape read out of `app_reviews`. */
@@ -144,6 +151,10 @@ export function buildReviewEvents(db: Db): number {
   );
 
   const write = db.transaction((batch: ReviewEvent[]) => {
+    db.prepare(
+      `DELETE FROM customer_events
+        WHERE type IN ('review_posted', 'review_edited', 'review_removed')`,
+    ).run();
     for (const row of batch) statement.run(row);
   });
 

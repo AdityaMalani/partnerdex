@@ -43,6 +43,26 @@ function migrate(db: Db): void {
       ),
     );
 
+  /*
+   * Cursors learned which window they were made for.
+   *
+   * A Relay cursor is an opaque position inside the result set of the query
+   * that issued it, so it is only meaningful to a query with the same
+   * arguments. An interrupted pass stores one; the next pass may compute a
+   * different `createdAtMin` and hand the old cursor to the new query, which
+   * resumes the *old* walk — past the window, through history the pass had no
+   * reason to read, and away from the rows it was started for.
+   *
+   * The column records the window, so the two can be compared and a cursor
+   * whose window has moved can be dropped rather than trusted. NULL on every
+   * row that predates this, which reads as "unknown window" and therefore as
+   * "do not resume" — the safe answer, and it costs one clean re-walk of one
+   * window, once.
+   */
+  if (!columns('sync_state').has('cursor_window')) {
+    db.exec('ALTER TABLE sync_state ADD COLUMN cursor_window TEXT');
+  }
+
   // The GA4 export dataset moved from the connection to the app. A partner
   // running one GA4 property per listing has a dataset per app, so a single
   // connection-level value made the common case the awkward one.
@@ -131,7 +151,43 @@ function migrate(db: Db): void {
       `CREATE INDEX IF NOT EXISTS idx_listing_events_user
          ON listing_events (app_id, type, user_key)`,
     );
+    /*
+     * The funnel's own shape: one app, one date range, every bucket.
+     *
+     * `idx_listing_events_step` is `(app_id, type, occurred_at)`, and the funnel
+     * counts both types in a single pass, so `type` sits between the two columns
+     * it can actually seek on and the range predicate cannot be used at all —
+     * every bucket re-read every event the app has ever collected. Putting
+     * `occurred_at` second makes each bucket a range seek, and carrying the two
+     * visitor columns keeps it index-only: 1.6s -> 0.04s over 480k events,
+     * measured, with identical counts.
+     *
+     * Here rather than in the schema block for the same reason as the index
+     * above: it names `user_key`, which the ALTER above may have only just added.
+     */
+    db.exec(
+      `CREATE INDEX IF NOT EXISTS idx_listing_events_window
+         ON listing_events (app_id, occurred_at, type, user_key, anonymous_id)`,
+    );
   }
+
+  /*
+   * The (app_id, shop_id, occurred_at) index on `customer_events`, superseded
+   * by `idx_cevents_app_shop_seen` in the schema block — see the comment there
+   * for what the extra column buys. Dropped rather than left in place because
+   * the new one is a strict extension of it: keeping both pays for a second
+   * copy of the same keys, and on a table with one row per transaction that
+   * copy is hundreds of megabytes.
+   */
+  db.exec('DROP INDEX IF EXISTS idx_cevents_app_shop');
+
+  /*
+   * Likewise `(type, created_at)` on `transactions`, superseded by
+   * `idx_tx_type_money`. Same reasoning: the replacement starts with the same
+   * two columns, so every plan that used this one still works, and on a table
+   * this size a redundant copy of 7.9M keys is not free.
+   */
+  db.exec('DROP INDEX IF EXISTS idx_tx_type_time');
 }
 
 export function closeDb(): void {
@@ -144,29 +200,64 @@ export function useDb(db: Db): void {
   handle = db;
 }
 
-export function readSyncState(db: Db, key: string): { cursor: string | null; syncedThrough: string | null } {
+export interface SyncState {
+  cursor: string | null;
+  /**
+   * The window `cursor` was produced under, or null when it is not known.
+   *
+   * Null on a cursor written before this column existed, and on the cursors of
+   * callers that do not paginate a time-windowed connection at all. Callers
+   * that do compare it against the window they are about to query, and discard
+   * the cursor when the two differ — see `syncTransactionsFor`.
+   */
+  cursorWindow: string | null;
+  syncedThrough: string | null;
+}
+
+export function readSyncState(db: Db, key: string): SyncState {
   const row = db
-    .prepare('SELECT cursor, synced_through FROM sync_state WHERE key = ?')
-    .get(key) as { cursor: string | null; synced_through: string | null } | undefined;
-  return { cursor: row?.cursor ?? null, syncedThrough: row?.synced_through ?? null };
+    .prepare('SELECT cursor, cursor_window, synced_through FROM sync_state WHERE key = ?')
+    .get(key) as
+    | { cursor: string | null; cursor_window: string | null; synced_through: string | null }
+    | undefined;
+  return {
+    cursor: row?.cursor ?? null,
+    cursorWindow: row?.cursor_window ?? null,
+    syncedThrough: row?.synced_through ?? null,
+  };
 }
 
 export function writeSyncState(
   db: Db,
   key: string,
-  patch: { cursor?: string | null; syncedThrough?: string | null },
+  patch: { cursor?: string | null; cursorWindow?: string | null; syncedThrough?: string | null },
 ): void {
   const current = readSyncState(db, key);
+  /*
+   * A cursor and its window are one fact, so clearing the cursor clears the
+   * window with it unless the caller says otherwise. Left behind, the stale
+   * window would be compared against by the next pass and could match by
+   * coincidence — a cursor with no window is at least honestly unknown.
+   */
+  const cursor = patch.cursor === undefined ? current.cursor : patch.cursor;
+  const cursorWindow =
+    patch.cursorWindow !== undefined
+      ? patch.cursorWindow
+      : cursor === null
+        ? null
+        : current.cursorWindow;
   db.prepare(
-    `INSERT INTO sync_state (key, cursor, synced_through, updated_at)
-     VALUES (@key, @cursor, @syncedThrough, @updatedAt)
+    `INSERT INTO sync_state (key, cursor, cursor_window, synced_through, updated_at)
+     VALUES (@key, @cursor, @cursorWindow, @syncedThrough, @updatedAt)
      ON CONFLICT(key) DO UPDATE SET
        cursor = excluded.cursor,
+       cursor_window = excluded.cursor_window,
        synced_through = excluded.synced_through,
        updated_at = excluded.updated_at`,
   ).run({
     key,
-    cursor: patch.cursor === undefined ? current.cursor : patch.cursor,
+    cursor,
+    cursorWindow,
     syncedThrough: patch.syncedThrough === undefined ? current.syncedThrough : patch.syncedThrough,
     updatedAt: new Date().toISOString(),
   });

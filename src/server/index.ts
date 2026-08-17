@@ -6,7 +6,7 @@ import { getConfig } from '../config.js';
 import { getCustomer, listCustomers, type CustomerSort } from '../customers/index.js';
 import { getDb } from '../db/index.js';
 import { type RawMetricQuery } from '../metrics/context.js';
-import { listMetrics, runMetric } from '../metrics/registry.js';
+import { HEADLINE_METRICS, listMetrics, runMetric } from '../metrics/registry.js';
 import { dispatchPending } from '../notifications/dispatch.js';
 import {
   linkCandidates,
@@ -27,32 +27,6 @@ import { bigqueryRouter } from './bigquery.js';
 import { listAppSources } from '../bigquery/connection.js';
 import { funnelReport } from '../metrics/reports/funnel.js';
 
-/** Everything the dashboard renders, so one request paints the whole page. */
-const HEADLINE_METRICS = [
-  'mrr',
-  'arr',
-  'gross_earnings',
-  'mrr_growth',
-  'mrr_by_app',
-  'arpu',
-  'ltv',
-  'trials',
-  'on_trial',
-  'trial_conversion_rate',
-  'active_subscriptions',
-  'subscribers',
-  'new_subscriptions',
-  'subscription_growth',
-  'active_installs',
-  'churn',
-  'revenue_churn',
-  'subscription_churn',
-  'logo_churn',
-  'reviews_posted',
-  'reviews_live',
-  'reviews_average_rating',
-  'reviews_removed',
-];
 
 function queryOf(request: express.Request): RawMetricQuery {
   const pick = (name: string): string | undefined => {
@@ -191,24 +165,87 @@ export function createApp(): express.Express {
     }
   });
 
-  app.get('/api/status', (_request, response) => {
+  /*
+   * The row counts behind this are memoized, and that is not an optimization —
+   * without it this route takes the whole process down.
+   *
+   * SQLite keeps no row count, so `COUNT(*)` walks the table. Measured on the
+   * live database: `transactions` 56.5s and `customer_events` 85.0s, together
+   * over two minutes of *synchronous* work on the single thread that also serves
+   * every other route and answers the health check. No index can help — there is
+   * nothing to look up, only rows to count.
+   *
+   * The dashboard shell polls this on every page for one footer line, so each
+   * navigation stalled the entire app and Fly pulled the machine from the load
+   * balancer. It presented as "every page hangs", which sent us looking at the
+   * pages rather than at the footer.
+   *
+   * So the counts are now opt-in, behind `?counts=1`, and memoized for a minute
+   * when asked for. The dashboard shell reads only `sync` and `lastSyncAt` —
+   * verified against the frontend, which never renders a row count anywhere —
+   * and both of those are cheap and read fresh on every call, because they are
+   * what tells a reader whether the figures in front of them are stale.
+   */
+  let countsCache: { at: number; value: Record<string, unknown> } | null = null;
+  const COUNTS_TTL_MS = 60_000;
+
+  app.get('/api/status', (request, response) => {
     try {
       const db = getDb();
-      const counts = db
-        .prepare(
-          `SELECT
-             (SELECT COUNT(*) FROM apps) AS apps,
-             (SELECT COUNT(*) FROM shops) AS shops,
-             (SELECT COUNT(*) FROM app_events) AS events,
-             (SELECT COUNT(*) FROM transactions) AS transactions,
-             (SELECT COUNT(*) FROM subscriptions) AS subscriptions,
-             (SELECT COUNT(*) FROM customer_events WHERE suppressed = 0) AS customerEvents,
-             (SELECT MAX(updated_at) FROM sync_state) AS lastSyncAt`,
-        )
-        .get() as Record<string, unknown>;
-      // The dashboard watches `lastSyncAt` to know when its figures went stale,
-      // and `sync` to say so when the background loop is failing.
-      response.json({ ...counts, sync: syncStatus() });
+
+      // Always cheap, and polled on every page.
+      const lastSyncAt = (
+        db.prepare('SELECT MAX(updated_at) AS lastSyncAt FROM sync_state').get() as {
+          lastSyncAt: string | null;
+        }
+      ).lastSyncAt;
+
+      /*
+       * Whether the store holds anything, which the shell needs and used to work
+       * out from the row counts above. Making those opt-in would otherwise take
+       * the answer away with them: the counts stop arriving, `?? 0` reads the
+       * absence as zero, and a store holding millions of rows reports itself
+       * empty and tells its operator to run a sync.
+       *
+       * So the question is answered here instead of reconstructed from figures
+       * that happened to be nearby. `LIMIT 1` stops at the first row, which is
+       * what lets it stay on the cheap path beside a `COUNT(*)` that could not.
+       *
+       * Both tables, because either alone is too narrow: a store can hold
+       * subscriptions rebuilt from events that carried no sale yet, and it is
+       * not empty — it has figures to show.
+       */
+      const hasData =
+        db.prepare('SELECT 1 AS present FROM transactions LIMIT 1').get() !== undefined ||
+        db.prepare('SELECT 1 AS present FROM subscriptions LIMIT 1').get() !== undefined;
+
+      const base = { lastSyncAt, hasData, sync: syncStatus() };
+
+      // The counts are opt-in. Callers that want them ask; the shell does not,
+      // and used to pay for them on every navigation regardless.
+      if (request.query.counts !== '1') {
+        response.json(base);
+        return;
+      }
+
+      if (!countsCache || Date.now() - countsCache.at > COUNTS_TTL_MS) {
+        countsCache = {
+          at: Date.now(),
+          value: db
+            .prepare(
+              `SELECT
+                 (SELECT COUNT(*) FROM apps) AS apps,
+                 (SELECT COUNT(*) FROM shops) AS shops,
+                 (SELECT COUNT(*) FROM app_events) AS events,
+                 (SELECT COUNT(*) FROM transactions) AS transactions,
+                 (SELECT COUNT(*) FROM subscriptions) AS subscriptions,
+                 (SELECT COUNT(*) FROM customer_events WHERE suppressed = 0) AS customerEvents`,
+            )
+            .get() as Record<string, unknown>,
+        };
+      }
+
+      response.json({ ...countsCache.value, ...base });
     } catch (error) {
       sendError(response, error);
     }

@@ -1,8 +1,16 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from 'react';
 import {
   fetchApps,
   fetchFunnelApps,
-  fetchOverview,
   fetchSession,
   fetchStatus,
   logout,
@@ -10,23 +18,58 @@ import {
   type AppSummary,
   type FunnelApp,
   type Granularity,
-  type Overview,
   type QueryState,
   type Session,
   type Status,
+  type SyncStatus,
 } from './api';
+import { useOverviewCards } from './useOverview';
 import { formatDateTime } from './format';
-import { CustomerDetail } from './components/CustomerDetail';
-import { Customers } from './components/Customers';
 import { Login } from './components/Login';
 import { MetricCard } from './components/MetricCard';
 import { Nav } from './components/Nav';
-import { Listings } from './components/Listings';
-import { BigQuery } from './components/BigQuery';
-import { Funnel } from './components/Funnel';
-import { Notifications } from './components/Notifications';
-import { UnmatchedReviews } from './components/Reviews';
 import { DEFAULT_FILTERS, metricsFor, pageById } from './pages';
+
+/*
+ * Page bodies arrive in their own chunks.
+ *
+ * The shell, the navigation and the metric grid are what a reader lands on, and
+ * they are the only things worth downloading before the first paint. Everything
+ * below is a page they may never open — the merchant list, the four settings
+ * screens, the funnel and the whole affiliate section — and each was previously
+ * in the one bundle every visit paid for.
+ *
+ * The `.then` adapters are there because these are named exports and `lazy`
+ * wants a default one. Written out rather than routed through a helper: the
+ * one-line form keeps each component's props inferred, which a generic wrapper
+ * loses.
+ */
+const Customers = lazy(() =>
+  import('./components/Customers').then((m) => ({ default: m.Customers })),
+);
+const CustomerDetail = lazy(() =>
+  import('./components/CustomerDetail').then((m) => ({ default: m.CustomerDetail })),
+);
+const Listings = lazy(() => import('./components/Listings').then((m) => ({ default: m.Listings })));
+const BigQuery = lazy(() => import('./components/BigQuery').then((m) => ({ default: m.BigQuery })));
+const Funnel = lazy(() => import('./components/Funnel').then((m) => ({ default: m.Funnel })));
+const Notifications = lazy(() =>
+  import('./components/Notifications').then((m) => ({ default: m.Notifications })),
+);
+const UnmatchedReviews = lazy(() =>
+  import('./components/Reviews').then((m) => ({ default: m.UnmatchedReviews })),
+);
+/* ------------------------------------------------------------ affiliates */
+/* -------------------------------------------------------- end affiliates */
+
+/**
+ * One boundary per page body rather than one around the whole main column: the
+ * reviews page carries a card grid *and* a list, and the cards should not wait
+ * on the list's chunk to arrive.
+ */
+function Chunk({ children }: { children: ReactNode }) {
+  return <Suspense fallback={<div className="skeleton">Loading…</div>}>{children}</Suspense>;
+}
 
 const PERIODS = [
   { value: 'last_7_days', label: 'Last 7 days' },
@@ -87,6 +130,22 @@ function useTheme(): ['dark' | 'light', () => void] {
  * the page a reader lands on. The hour is the only thing it knows about them,
  * so that is what it uses; the sentence underneath still says what the page is.
  */
+/**
+ * One phrase for what the sync is doing, for the footer.
+ *
+ * The elapsed time is the point of it. "Syncing" on its own is what the footer
+ * said before, and it says the same thing at three seconds and at three hours.
+ */
+function describeSyncPhase(sync: SyncStatus): string {
+  if (!sync.phase) return 'syncing';
+  const where = sync.phaseOrg ? `${sync.phase} (${sync.phaseOrg})` : sync.phase;
+  const started = sync.phaseStartedAt ? Date.parse(sync.phaseStartedAt) : NaN;
+  if (!Number.isFinite(started)) return `syncing: ${where}`;
+  const seconds = Math.max(0, Math.round((Date.now() - started) / 1000));
+  const elapsed = seconds < 90 ? `${seconds}s` : `${Math.round(seconds / 60)}m`;
+  return `syncing: ${where}, ${elapsed}`;
+}
+
 function greeting(): { title: string; blurb: string } {
   const hour = new Date().getHours();
 
@@ -255,7 +314,20 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
   const [defaultsFor, setDefaultsFor] = useState<string | null>(null);
   if (defaultsFor !== page.id) {
     setDefaultsFor(page.id);
-    if (page.defaults) setQuery((current) => ({ ...current, ...page.defaults }));
+    const defaults = page.defaults;
+    if (defaults) {
+      setQuery((current) => {
+        const next = { ...current, ...defaults };
+        // Returning the same object when nothing actually changed. The query is
+        // the identity every metric request is keyed on, so a spread that
+        // rewrote every field to the value it already held would re-issue the
+        // whole grid on entering the page for no change in the question.
+        const changed = (Object.keys(defaults) as Array<keyof typeof defaults>).some(
+          (key) => current[key] !== next[key],
+        );
+        return changed ? next : current;
+      });
+    }
   }
 
   const isCustomers = page.kind === 'customers';
@@ -283,20 +355,29 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
     });
   }, []);
 
-  const [overview, setOverview] = useState<Overview | null>(null);
   const [apps, setApps] = useState<AppSummary[]>([]);
   /** Null until asked for; empty means no app has a GA4 dataset configured. */
   const [funnelApps, setFunnelApps] = useState<FunnelApp[] | null>(null);
   const [status, setStatus] = useState<Status | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
   const [theme, toggleTheme] = useTheme();
 
+  /*
+   * The app list fills one picker, and half the dashboard does not show it —
+   * the settings screens and the whole affiliate section take none of the
+   * shared filters, and the funnel picks from its own shorter list below. So
+   * the request waits until a page that shows the picker is open, and the ref
+   * keeps it to once per session rather than once per visit.
+   */
+  const needsApps = isMetrics && filters.includes('app') && !isFunnel;
+  const askedForApps = useRef(false);
+
   useEffect(() => {
+    if (!needsApps || askedForApps.current) return;
+    askedForApps.current = true;
     fetchApps()
       .then((result) => setApps(result.apps))
       .catch(() => setApps([]));
-  }, []);
+  }, [needsApps]);
 
   /*
    * The funnel picks from its own, shorter list: the apps with a GA4 dataset
@@ -339,6 +420,10 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
   useEffect(() => {
     let cancelled = false;
     const poll = () => {
+      // Nobody is reading a background tab, and a sync that lands while it is
+      // hidden is picked up by the poll on the way back. A dashboard left open
+      // overnight should not be asking anything of the server.
+      if (document.hidden) return;
       fetchStatus()
         .then((next) => {
           if (!cancelled) setStatus(next);
@@ -350,9 +435,13 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
     };
     poll();
     const id = window.setInterval(poll, STATUS_POLL_MS);
+    // Coming back to the tab reads the state now rather than up to a minute
+    // later, which is what makes skipping the hidden ticks free.
+    document.addEventListener('visibilitychange', poll);
     return () => {
       cancelled = true;
       window.clearInterval(id);
+      document.removeEventListener('visibilitychange', poll);
     };
   }, []);
 
@@ -379,46 +468,23 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
 
   const wanted = useMemo(() => metricsFor(page), [page]);
 
-  /**
-   * Changing page changes which metrics exist in the response, so the old
-   * page's data cannot stand in while the new request is in flight — the cards
-   * it does not cover would each render as "not available" for a moment.
-   * Changing a *filter* keeps the same metrics, so that case deliberately holds
-   * the previous figures and updates them in place.
+  /*
+   * One request per card rather than one per page.
+   *
+   * Changing page changes which cards exist, so the old page's figures cannot
+   * stand in while the new requests are in flight — hence the page id as the
+   * reset key. Changing a *filter* keeps the same cards, so that case
+   * deliberately holds the previous figures and replaces each in place as its
+   * own request lands. The customers and settings pages compute nothing over
+   * the shared window and ask for nothing: an empty metric list means
+   * "everything" to the server, so the call is skipped rather than made.
    */
-  useEffect(() => {
-    setOverview(null);
-  }, [page.id]);
-
-  useEffect(() => {
-    // The customers page computes nothing over the shared window, and an empty
-    // metric list means "everything" to the server — so skip the call outright
-    // rather than paying for every metric the dashboard knows about.
-    if (wanted.length === 0) {
-      setLoading(false);
-      return;
-    }
-    let cancelled = false;
-    setLoading(true);
-    fetchOverview(query, wanted)
-      .then((result) => {
-        if (cancelled) return;
-        setOverview(result);
-        setError(null);
-      })
-      .catch((cause: Error) => {
-        if (cancelled) return;
-        setError(cause.message);
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-    // `dataVersion` is the refresh trigger: a completed sync re-runs the same
-    // request so the figures move in place, without a spinner or a reload.
-  }, [query, wanted, dataVersion]);
+  const {
+    cards: cardStates,
+    loading,
+    outage,
+    retry,
+  } = useOverviewCards(query, wanted, page.id, dataVersion);
 
   const patch = useCallback((changes: Partial<QueryState>) => {
     setQuery((current) => ({ ...current, ...changes }));
@@ -427,9 +493,7 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
   // The overview greets; every other page names itself.
   const heading = page.id === 'overview' ? greeting() : { title: page.title, blurb: page.blurb };
 
-  const anyMetric = overview ? Object.values(overview)[0] : undefined;
-  const interval = anyMetric?.timeSeriesInterval === 'day' ? 'Daily' : 'Monthly';
-  const hasData = (status?.subscriptions ?? 0) > 0 || (status?.transactions ?? 0) > 0;
+  const hasData = status?.hasData === true;
   const fixedRange = isFunnel && query.granularity === 'previous_7_days';
 
   return (
@@ -560,10 +624,14 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
           </div>
         )}
 
-        {error && isMetrics ? (
+        {/* Only when *every* card failed, which is the shape a server that is
+            down or a session that lapsed takes. A single card failing is that
+            card's business and is reported inside it, because the rest of the
+            page is still worth reading. */}
+        {outage && isMetrics ? (
           <div className="notice error">
             <h2>Could not load metrics</h2>
-            <p>{error}</p>
+            <p>{outage}</p>
           </div>
         ) : null}
 
@@ -576,7 +644,10 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
         {/* BigQuery is configuration, like notifications. The funnel says for
             itself which of its steps it can measure, and an install with no
             Partner API history at all still has a listing worth counting. */}
-        {!error &&
+        {/* The affiliate pages read their own source tables, which arrive from
+            an import rather than from the Partner API sync — so an account with
+            no transactions yet still has hundreds of affiliates worth showing. */}
+        {!outage &&
         !isNotifications &&
         !isListings &&
         !isReviews &&
@@ -605,18 +676,32 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
         ) : null}
 
         {isCustomers ? (
-          route.param ? (
-            <CustomerDetail shopId={route.param} appId={query.appId} />
-          ) : (
-            <Customers appId={query.appId} />
-          )
+          <Chunk>
+            {route.param ? (
+              <CustomerDetail shopId={route.param} appId={query.appId} />
+            ) : (
+              <Customers appId={query.appId} />
+            )}
+          </Chunk>
         ) : null}
 
-        {isNotifications ? <Notifications /> : null}
+        {isNotifications ? (
+          <Chunk>
+            <Notifications />
+          </Chunk>
+        ) : null}
 
-        {isListings ? <Listings /> : null}
+        {isListings ? (
+          <Chunk>
+            <Listings />
+          </Chunk>
+        ) : null}
 
-        {isBigQuery ? <BigQuery /> : null}
+        {isBigQuery ? (
+          <Chunk>
+            <BigQuery />
+          </Chunk>
+        ) : null}
 
         {/* Three states, and the middle one is the point: an install with no
             dataset configured anywhere cannot draw this report for any app, and
@@ -634,33 +719,41 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
                 above.
               </p>
             </div>
-          ) : query.appId ? (
-            <Funnel
-              appId={query.appId}
-              period={query.period}
-              granularity={query.granularity}
-              key={dataVersion}
-            />
+          ) : /* Only once the selection is one of the apps on this list. An app
+                 carried over from another report is corrected by the effect
+                 above, and rendering the report against it in the meantime
+                 fetches a funnel for an app the page will never show. */
+          funnelApps.some((app) => app.id === query.appId) ? (
+            <Chunk>
+              <Funnel
+                appId={query.appId}
+                period={query.period}
+                granularity={query.granularity}
+                key={dataVersion}
+              />
+            </Chunk>
           ) : null
         ) : null}
 
         {/* Directly under the filters, because an unattributed review is a hole
             in every figure below it — the charts count it, no customer owns it. */}
-        {isReviews ? <UnmatchedReviews appId={query.appId} /> : null}
-
-        {/* The funnel fetches its own shape and shows its own skeleton; it has
-            no cards in the overview response to be waiting on. */}
-        {isMetrics && !isFunnel && loading && !overview ? (
-          <div className="skeleton">Loading metrics…</div>
+        {isReviews ? (
+          <Chunk>
+            <UnmatchedReviews appId={query.appId} />
+          </Chunk>
         ) : null}
 
-        {isMetrics && overview ? (
-          <div className="card-grid">
+        {/* No page-wide "Loading metrics…" any more: the grid is drawn from the
+            first frame and each card carries its own state, so a fast figure is
+            on screen while a slow one is still being computed. */}
+        {isMetrics && !isFunnel && page.cards.length > 0 ? (
+          <div className="card-grid" aria-busy={loading ? true : undefined}>
             {page.cards.map((card) => (
               <MetricCard
                 key={`${page.id}:${card.metric}`}
                 spec={card}
-                metric={overview[card.metric]}
+                state={cardStates[card.metric]}
+                onRetry={retry}
               />
             ))}
           </div>
@@ -670,13 +763,24 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
         {status?.lastSyncAt ? (
           <p className="footnote">
             Last sync {formatDateTime(status.lastSyncAt)}
+            {/* What the sync is doing right now, while it is doing it. A pass
+                that takes minutes used to be indistinguishable here from one
+                that had wedged an hour ago: both showed a timestamp going
+                quietly out of date. */}
+            {status.sync?.running ? <> · {describeSyncPhase(status.sync)}</> : null}
             {/* Silence while the loop is healthy. A failing sync would
                 otherwise read as nothing more than a timestamp going quietly
                 out of date. */}
             {status.sync?.consecutiveFailures > 0 ? (
               <span className="footnote-warn">
                 {' '}
-                · last attempt failed{status.sync.lastError ? `: ${status.sync.lastError}` : ''}
+                · last attempt failed
+                {status.sync.lastErrorPhase
+                  ? ` in ${status.sync.lastErrorPhase}${
+                      status.sync.lastErrorOrg ? `/${status.sync.lastErrorOrg}` : ''
+                    }`
+                  : ''}
+                {status.sync.lastError ? `: ${status.sync.lastError}` : ''}
               </span>
             ) : null}
           </p>

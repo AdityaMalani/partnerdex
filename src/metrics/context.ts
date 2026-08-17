@@ -1,6 +1,8 @@
 import { getConfig, normalizeAppId } from '../config.js';
 import { getDb, type Db } from '../db/index.js';
 import { resolveScopedAppIds } from '../sync/index.js';
+import { cacheKey, readCache, writeCache } from './cache.js';
+import { appIdFilter, rollupReady } from './rollup.js';
 import type { AsOfOptions } from './asof.js';
 import { resolveWindow, type Window } from './time.js';
 
@@ -58,34 +60,145 @@ export interface MetricContext {
   rating: number | null;
 }
 
+export interface CurrencyProfile {
+  currency: string | null;
+  mixed: boolean;
+}
+
+/**
+ * The cache key a currency profile is stored under.
+ *
+ * Sorted, because the scope is a *set*: `?appIds=a,b` and `?appIds=b,a` are the
+ * same question and must not compute the answer twice.
+ */
+export function currencyProfileKey(appIds: string[]): string {
+  return cacheKey('currency_profile', { scope: [...appIds].sort().join(',') });
+}
+
 /**
  * The dominant currency across recorded transactions. Partner payouts are
  * normally single-currency; if an org mixes them the reports would be summing
  * unlike units, so the mix is surfaced in `meta` rather than silently converted.
+ *
+ * This is the uncached form, and it used to be the most expensive statement on
+ * the request path: `currency <> ''` matches nearly every row, so the answer
+ * cost a pass over the whole transactions table however few currencies came
+ * back. `buildContext` calls it for *every* metric, before the metric cache is
+ * even consulted and again for the comparison window, which is what put a floor
+ * of several seconds under every metric on the dashboard including the ones that
+ * only read small tables.
+ *
+ * It is now counted off `transaction_daily`, which carries `txn_count` per
+ * currency for exactly this: thousands of rows instead of millions, and the same
+ * counts, because the rollup groups every transaction and drops none. The raw
+ * scan remains as the answer for a database whose rollup has not been built yet
+ * — correct and slow beats fast and blank, and it is the same cost this always
+ * had.
  */
-export function currencyProfile(
-  db: Db,
-  appIds: string[],
-): { currency: string | null; mixed: boolean } {
-  const params: Record<string, unknown> = {};
-  const names = appIds.map((id, index) => {
-    params[`c${index}`] = id;
-    return `@c${index}`;
-  });
-  const filter = names.length > 0 ? `AND app_id IN (${names.join(', ')})` : '';
+export function computeCurrencyProfile(db: Db, appIds: string[]): CurrencyProfile {
+  const useRollup = rollupReady(db);
+  const apps = appIdFilter(appIds, 'app_id', 'c');
 
   const rows = db
     .prepare(
-      `SELECT currency, COUNT(*) AS n
-       FROM transactions
-       WHERE currency <> '' ${filter}
-       GROUP BY currency
-       ORDER BY n DESC`,
+      useRollup
+        ? `SELECT currency, SUM(txn_count) AS n
+             FROM transaction_daily
+            WHERE currency <> '' ${apps.sql ? `AND ${apps.sql}` : ''}
+            GROUP BY currency
+            ORDER BY n DESC`
+        : `SELECT currency, COUNT(*) AS n
+             FROM transactions
+            WHERE currency <> '' ${apps.sql ? `AND ${apps.sql}` : ''}
+            GROUP BY currency
+            ORDER BY n DESC`,
     )
-    .all(params) as Array<{ currency: string; n: number }>;
+    .all(apps.params) as Array<{ currency: string; n: number }>;
 
   if (rows.length === 0) return { currency: null, mixed: false };
   return { currency: rows[0]!.currency, mixed: rows.length > 1 };
+}
+
+/**
+ * The same answer, read through the metric cache.
+ *
+ * It belongs in that table rather than in a variable for the reason every other
+ * figure does: the cache is cleared by the rebuild at the end of each sync, so
+ * the profile is invalidated by exactly the event that can change it — new
+ * transactions — and by nothing else. A process-local memo would additionally
+ * have to survive the fact that the sync runs in a *different* process, and
+ * could not be warmed from there.
+ *
+ * A miss falls through to the scan, so a database that has never been synced,
+ * or one running with the cache disabled, still answers correctly. It is slow
+ * exactly once per sync, and `warmCurrencyProfiles` moves even that off the
+ * request path.
+ */
+export function currencyProfile(db: Db, appIds: string[]): CurrencyProfile {
+  const key = currencyProfileKey(appIds);
+  const cached = readCache<CurrencyProfile>(db, key);
+  if (cached) return cached;
+
+  const profile = computeCurrencyProfile(db, appIds);
+  writeCache(db, key, profile);
+  return profile;
+}
+
+/**
+ * Fill the cache for the scopes the dashboard actually asks for, in one pass.
+ *
+ * Called by the sync, in the sync's own process, immediately after the rebuild
+ * has cleared the cache — so the first dashboard request after a sync reads a
+ * stored answer instead of paying for a full table scan on the request thread
+ * of a single-threaded server.
+ *
+ * One `GROUP BY app_id, currency` covers every scope worth warming: the whole
+ * scope (what an unfiltered dashboard asks for) and each app on its own (what
+ * the app picker asks for). A reader who selects some other combination still
+ * gets a correct answer the slow way.
+ */
+export function warmCurrencyProfiles(db: Db, appIds: string[]): number {
+  const rows = db
+    .prepare(
+      rollupReady(db)
+        ? `SELECT app_id, currency, SUM(txn_count) AS n
+             FROM transaction_daily
+            WHERE currency <> ''
+            GROUP BY app_id, currency`
+        : `SELECT app_id, currency, COUNT(*) AS n
+             FROM transactions
+            WHERE currency <> ''
+            GROUP BY app_id, currency`,
+    )
+    .all() as Array<{ app_id: string; currency: string; n: number }>;
+
+  const profileOf = (scope: string[]): CurrencyProfile => {
+    const totals = new Map<string, number>();
+    for (const row of rows) {
+      if (scope.length > 0 && !scope.includes(row.app_id)) continue;
+      totals.set(row.currency, (totals.get(row.currency) ?? 0) + row.n);
+    }
+    // Highest count wins, and ties keep the order SQLite returned — the same
+    // rule `computeCurrencyProfile`'s `ORDER BY n DESC` applies.
+    let best: string | null = null;
+    let bestCount = 0;
+    for (const [currency, n] of totals) {
+      if (n > bestCount) {
+        best = currency;
+        bestCount = n;
+      }
+    }
+    return { currency: best, mixed: totals.size > 1 };
+  };
+
+  // Deduplicated by key, because a partner with one app in scope asks the same
+  // question twice: "every app" and "that app" are the same set.
+  const scopes = new Map<string, string[]>();
+  for (const scope of [appIds, ...appIds.map((id) => [id])]) {
+    scopes.set(currencyProfileKey(scope), scope);
+  }
+  for (const [key, scope] of scopes) writeCache(db, key, profileOf(scope));
+  return scopes.size;
 }
 
 export function buildContext(query: RawMetricQuery, now?: Date): MetricContext {

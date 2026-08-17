@@ -146,22 +146,72 @@ export function explain(error: unknown, context: { dataset?: string } = {}): Big
  * `assertIdentifier`. Hyphens are legal in a Google project id and illegal in a
  * bare BigQuery identifier, which is why every reference is backquoted.
  */
+/**
+ * How long one BigQuery job may take before it is treated as a hang.
+ *
+ * The Partner API got a timeout after a hung socket froze a whole sync pass; the
+ * BigQuery client kept none. It is just as capable of the same thing — the
+ * client polls a job to completion with no ceiling of its own, and the GA4
+ * attribution query at the end of a run is the last thing standing between a
+ * pass and the affiliate ledger being updated at all.
+ *
+ * Ten minutes is not a latency budget. A year-wide scan of a daily-sharded
+ * export is minutes, and jobs are already capped by `maximumBytesBilled`, so
+ * nothing legitimate approaches this. It exists so a job that will never finish
+ * cannot take the pass with it.
+ */
+function queryTimeoutMs(): number {
+  const raw = Number(process.env.BIGQUERY_QUERY_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : 10 * 60_000;
+}
+
+/**
+ * Reject when `work` outlives `ms`.
+ *
+ * The job itself is not cancelled — the client exposes no handle to do that
+ * from here, and a query already sent is Google's to finish or abandon. What
+ * this bounds is *this process's* willingness to wait, which is the part that
+ * was stalling the sync. The worker exits after the pass either way, so nothing
+ * is left holding the abandoned promise.
+ */
+async function withTimeout<T>(work: Promise<T>, ms: number, what: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(
+          () => reject(new BigQueryError(`${what} did not finish within ${Math.round(ms / 1000)}s.`, 504)),
+          ms,
+        );
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 export async function runQuery(
   connected: Connected,
   query: string,
   params: Record<string, unknown> = {},
-  options: { location?: string; dataset?: string } = {},
+  options: { location?: string; dataset?: string; timeoutMs?: number } = {},
 ): Promise<QueryRow[]> {
   try {
-    const [rows] = await connected.client.query({
-      query,
-      params,
-      // Per call, not per connection: two GA4 properties can export to two
-      // regions, and a job sent to the wrong one reports the dataset as missing
-      // rather than as misplaced.
-      location: options.location ?? connected.connection.location,
-      maximumBytesBilled: MAX_BYTES_BILLED,
-    });
+    const [rows] = await withTimeout(
+      connected.client.query({
+        query,
+        params,
+        // Per call, not per connection: two GA4 properties can export to two
+        // regions, and a job sent to the wrong one reports the dataset as missing
+        // rather than as misplaced.
+        location: options.location ?? connected.connection.location,
+        maximumBytesBilled: MAX_BYTES_BILLED,
+      }),
+      options.timeoutMs ?? queryTimeoutMs(),
+      'The BigQuery job',
+    );
     return rows;
   } catch (error) {
     throw explain(error, { dataset: options.dataset });

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   checkBigQuery,
   checkBigQueryApp,
@@ -87,6 +87,20 @@ function Account({
 
   const { busy, error, note, setError, setNote, run } = useAction();
 
+  /**
+   * The job watcher below is a loop, not an interval, so nothing unsubscribes
+   * it. Without this it keeps asking the server every two seconds — and keeps
+   * writing to state through `onChanged` — for the rest of the tab's life if
+   * the operator navigates away mid-ingest, which is a multi-minute window.
+   */
+  const mounted = useRef(true);
+  useEffect(
+    () => () => {
+      mounted.current = false;
+    },
+    [],
+  );
+
   const save = () =>
     run('save', async () => {
       onChanged(
@@ -117,14 +131,41 @@ function Account({
       }
     });
 
+  /**
+   * Start the ingest, then watch the job.
+   *
+   * There is no result to await any more: the server forks the ingest so that a
+   * multi-minute pull cannot hold the event loop and fail the platform health
+   * check. So this starts it, then polls the settings surface — which carries
+   * the job — until the run reports. The button stays busy throughout, which is
+   * the same thing it did before and the same thing it means.
+   */
   const sync = () =>
     run('sync', async () => {
-      const { result, ...next } = await syncBigQuery(false);
-      onChanged(next);
-      setNote(
-        `Pulled ${result.rows} event(s) for ${result.apps.length} app(s).` +
-        (result.skipped.length > 0 ? ` Skipped ${result.skipped.length}.` : ''),
-      );
+      const { accepted: _accepted, ...started } = await syncBigQuery(false);
+      onChanged(started);
+      setNote('Pulling listing traffic in the background…');
+
+      for (;;) {
+        await new Promise((resolve) => setTimeout(resolve, 2_000));
+        if (!mounted.current) return;
+        const next = await fetchBigQuery();
+        if (!mounted.current) return;
+        onChanged(next);
+        if (next.job.running) continue;
+        if (next.job.error) {
+          setError(next.job.error);
+          return;
+        }
+        const result = next.job.result;
+        setNote(
+          result
+            ? `Pulled ${result.rows} event(s) for ${result.apps.length} app(s).` +
+              (result.skipped.length > 0 ? ` Skipped ${result.skipped.length}.` : '')
+            : 'The sync finished.',
+        );
+        return;
+      }
     });
 
   const disconnect = () =>

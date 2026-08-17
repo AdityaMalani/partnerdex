@@ -80,7 +80,7 @@ export function wallClockIn(instant: Date, timeZone: string): WallClock {
   };
 }
 
-function offsetMs(instant: Date, timeZone: string): number {
+export function offsetMs(instant: Date, timeZone: string): number {
   const wall = wallClockIn(instant, timeZone);
   const asUtc = Date.UTC(wall.year, wall.month - 1, wall.day, wall.hour, wall.minute, wall.second);
   // The wall clock has no milliseconds, so compare against a floored instant.
@@ -143,6 +143,49 @@ export function addInterval(
 
 export function addDays(instant: Date, days: number): Date {
   return new Date(instant.getTime() + days * MS_PER_DAY);
+}
+
+/**
+ * A calendar date in the reporting timezone, `YYYY-MM-DD`.
+ *
+ * This is the key the transaction rollup is stored under, so it and
+ * `dayKeyStart` below are the only definition of "what day is this row in"
+ * that exists. Anything that reads the rollup must go through the same pair, or
+ * the rollup's days and the reader's days are two different things that happen
+ * to have the same name.
+ */
+export function dayKeyOf(instant: Date, timeZone: string): string {
+  const wall = wallClockIn(instant, timeZone);
+  const month = String(wall.month).padStart(2, '0');
+  const day = String(wall.day).padStart(2, '0');
+  return `${wall.year}-${month}-${day}`;
+}
+
+/** Calendar arithmetic on a day key. UTC only ever touches the digits here. */
+export function addDayKey(dayKey: string, days: number): string {
+  const [year, month, day] = dayKey.split('-').map(Number) as [number, number, number];
+  const shifted = new Date(Date.UTC(year, month - 1, day + days));
+  return shifted.toISOString().slice(0, 10);
+}
+
+/**
+ * The instant at which the reporting timezone enters `dayKey`.
+ *
+ * Day `D` owns the half-open span `[dayKeyStart(D), dayKeyStart(D + 1))`, which
+ * is 23, 24 or 25 hours long across a DST edge. That is the point of keying the
+ * rollup on local days rather than UTC ones: a bucket boundary produced by
+ * `startOfInterval` *is* one of these instants, so a bucket's interior is an
+ * exact whole number of rollup days with nothing left over at the seam.
+ *
+ * The one shape this cannot express is a zone that skips midnight itself (a
+ * transition at 00:00 moving the clock forward). `instantFromWallClock` settles
+ * on the instant just after the gap there, which is still a single consistent
+ * answer — and because the rollup builder resolves days through this same
+ * function, builder and reader stay in agreement even then.
+ */
+export function dayKeyStart(dayKey: string, timeZone: string): Date {
+  const [year, month, day] = dayKey.split('-').map(Number) as [number, number, number];
+  return instantFromWallClock({ year, month, day, hour: 0, minute: 0, second: 0 }, timeZone);
 }
 
 /**
