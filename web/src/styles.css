@@ -114,9 +114,14 @@
   /* --- the shell ----------------------------------------------------------
    * The rail's two widths, named because the grid and the rail itself both
    * state them and a disagreement is a visible seam.
+   *
+   * `--measure` is a ceiling on the report, not a target: wide enough that no
+   * ordinary display reaches it, and there only so a row of cards on very wide
+   * glass stops before it stops reading as a row.
    */
   --rail: 256px;
   --rail-collapsed: 64px;
+  --measure: 2400px;
 }
 
 /*
@@ -401,10 +406,32 @@ h3,
   outline-offset: -2px;
 }
 
+/*
+ * The report, which takes the width it is given.
+ *
+ * This was capped at a fixed measure, on the reasoning that a table running the
+ * full width of a 27-inch display is hard to read across — which is true of
+ * prose and of a single wide table, and false of this page. What is actually on
+ * it is a grid of cards that reflow: more width means another card on the row,
+ * not a longer line. The cap was answering a question the layout does not ask,
+ * and everything past it became a gap on the right that got wider with the
+ * display.
+ *
+ * Collapsing the rail is what made that visible. It moves 192px from the rail
+ * to the column beside it, and under a fixed cap the report ignored all of them:
+ * the content kept its width and the 192px opened as dead space on the right, so
+ * the one control whose entire purpose is to give the report more room gave it
+ * none. With nothing capping the report, the column grows and the content grows
+ * with it.
+ *
+ * `--measure` survives as a ceiling rather than a target, and it is deliberately
+ * far out: past about 2400px a row of cards stops reading as a row. Anyone
+ * inside that — every laptop and nearly every desktop — sees the full width.
+ */
 .main {
   min-width: 0;
-  max-width: 1240px;
-  padding: 24px 20px 64px;
+  max-width: var(--measure);
+  padding: var(--space-5) 20px 64px;
 }
 
 /* Under a tablet the rail goes horizontal so the report keeps the full width. */
