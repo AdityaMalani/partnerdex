@@ -69,6 +69,54 @@
 
   --shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.06);
   --shadow-md: 0 1px 3px rgba(15, 23, 42, 0.08), 0 4px 12px rgba(15, 23, 42, 0.05);
+
+  /* --- the rule ----------------------------------------------------------
+   * `--border` draws the edge of a *thing* — a card, a field, a pill — and has
+   * to be found by the eye. A rule *between* rows of one thing has the opposite
+   * job: the eye should be able to run down a column without counting the lines
+   * it crosses. It is a separate token because it is a separate job, and every
+   * row divider in the dashboard is drawn in it.
+   *
+   * `--grid` is the chart gridline and `--border` is a card's edge; both were
+   * standing in for this, and both were chosen for something else.
+   */
+  --rule: #edf1f6;
+
+  /* --- spacing ------------------------------------------------------------
+   * One scale, six steps, used everywhere a gap is deliberate. Colour here is
+   * already a system — every value is a role, maintained in both themes — and
+   * spacing was not: the same idea is written as 10, 12, 14, 16, 18 and 20 in
+   * different files, so two forms side by side never agree on what "a gap
+   * between fields" is.
+   *
+   *   1  4px   inside a control: a label and the hint under it
+   *   2  8px   between siblings that belong together
+   *   3 12px   between fields on one row
+   *   4 16px   between rows of a form, between cards
+   *   5 24px   between sections of a form or a page
+   *   6 32px   between a page's major bands
+   */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+
+  /* The card's own padding, named so that anything wanting to sit flush with a
+     card's content — or to bleed past it — can measure against the real value
+     instead of repeating the number. */
+  --card-px: 16px;
+  --card-py: 14px;
+
+  --radius: 8px;
+
+  /* --- the shell ----------------------------------------------------------
+   * The rail's two widths, named because the grid and the rail itself both
+   * state them and a disagreement is a visible seam.
+   */
+  --rail: 256px;
+  --rail-collapsed: 64px;
 }
 
 /*
@@ -117,6 +165,9 @@
   /* Elevation is carried by surface value in dark mode, not by shadow. */
   --shadow-sm: none;
   --shadow-md: none;
+
+  /* One step up from the card it is drawn on, not five. */
+  --rule: #2b2b2a;
 }
 
 * {
@@ -152,12 +203,12 @@ h3,
  */
 .shell {
   display: grid;
-  grid-template-columns: 256px minmax(0, 1fr);
+  grid-template-columns: var(--rail) minmax(0, 1fr);
   min-height: 100vh;
 }
 
 .shell.collapsed {
-  grid-template-columns: 64px minmax(0, 1fr);
+  grid-template-columns: var(--rail-collapsed) minmax(0, 1fr);
 }
 
 /* A column, so the sign-out item can claim the foot of the rail rather than
@@ -757,7 +808,7 @@ th,
 td {
   text-align: right;
   padding: 6px 10px;
-  border-bottom: 1px solid var(--grid);
+  border-bottom: 1px solid var(--rule);
   white-space: nowrap;
 }
 
@@ -1218,9 +1269,9 @@ button.primary:disabled,
 }
 
 .topic+.topic {
-  margin-top: 14px;
-  padding-top: 14px;
-  border-top: 1px solid var(--border);
+  margin-top: var(--space-4);
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--rule);
 }
 
 /*
@@ -1497,8 +1548,8 @@ button.primary:disabled,
 }
 
 .review {
-  padding: 16px 0;
-  border-bottom: 1px solid var(--border);
+  padding: var(--space-4) 0;
+  border-bottom: 1px solid var(--rule);
 }
 
 .review:first-child {
@@ -2141,7 +2192,7 @@ button.primary:disabled,
   text-align: right;
   vertical-align: top;
   white-space: nowrap;
-  border-bottom: 1px solid var(--grid);
+  border-bottom: 1px solid var(--rule);
 }
 
 .funnel-table thead th {
