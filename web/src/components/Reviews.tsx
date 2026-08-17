@@ -171,7 +171,7 @@ function UnmatchedRow({ review, onLinked }: { review: ReviewSummary; onLinked: (
   );
 }
 
-export function UnmatchedReviews({ appId }: { appId: string }) {
+export function UnmatchedReviews({ appId, orgId = '' }: { appId: string; orgId?: string }) {
   const [reviews, setReviews] = useState<ReviewSummary[]>([]);
   const [total, setTotal] = useState(0);
   const [open, setOpen] = useState(false);
@@ -189,7 +189,7 @@ export function UnmatchedReviews({ appId }: { appId: string }) {
   const generation = useRef(0);
   const load = useCallback((): Promise<number | null> => {
     const mine = (generation.current += 1);
-    return fetchReviews({ appId, linked: 'unmatched', sort: 'newest', limit: 100 })
+    return fetchReviews({ appId, orgId, linked: 'unmatched', sort: 'newest', limit: 100 })
       .then((result) => {
         if (generation.current !== mine) return null;
         setReviews(result.reviews);
@@ -204,7 +204,7 @@ export function UnmatchedReviews({ appId }: { appId: string }) {
         setTotal(0);
         return null;
       });
-  }, [appId]);
+  }, [appId, orgId]);
 
   useEffect(() => {
     void load();

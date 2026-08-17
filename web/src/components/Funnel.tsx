@@ -301,10 +301,12 @@ function FunnelChart({
 
 export function Funnel({
   appId,
+  orgId = '',
   period,
   granularity,
 }: {
   appId: string;
+  orgId?: string;
   period: string;
   granularity: Granularity;
 }) {
@@ -333,7 +335,7 @@ export function Funnel({
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
-    fetchFunnel({ appId, period, granularity })
+    fetchFunnel({ appId, orgId, period, granularity })
       .then((result) => {
         if (cancelled) return;
         setData(result);
@@ -348,7 +350,7 @@ export function Funnel({
     return () => {
       cancelled = true;
     };
-  }, [appId, period, granularity]);
+  }, [appId, orgId, period, granularity]);
 
   const toggle = useCallback(
     (key: string) => {

@@ -11,12 +11,14 @@ import {
 import {
   fetchApps,
   fetchFunnelApps,
+  fetchOrganizations,
   fetchSession,
   fetchStatus,
   logout,
   SIGNED_OUT_EVENT,
   type AppSummary,
   type FunnelApp,
+  type Organization,
   type Granularity,
   type QueryState,
   type Session,
@@ -52,6 +54,9 @@ const CustomerDetail = lazy(() =>
 );
 const Listings = lazy(() => import('./components/Listings').then((m) => ({ default: m.Listings })));
 const BigQuery = lazy(() => import('./components/BigQuery').then((m) => ({ default: m.BigQuery })));
+const Organizations = lazy(() =>
+  import('./components/Organizations').then((m) => ({ default: m.Organizations })),
+);
 const Funnel = lazy(() => import('./components/Funnel').then((m) => ({ default: m.Funnel })));
 const Notifications = lazy(() =>
   import('./components/Notifications').then((m) => ({ default: m.Notifications })),
@@ -290,6 +295,9 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
   const [query, setQuery] = useState<QueryState>({
     period: 'last_12_months',
     appId: '',
+    // Empty is every organization, which is what every figure meant before this
+    // selector existed and what it still means for anyone who never touches it.
+    orgId: '',
     includeUsage: true,
     includeTrials: false,
     rating: 0,
@@ -335,6 +343,7 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
   const isReviews = page.kind === 'reviews';
   const isListings = page.kind === 'listings';
   const isBigQuery = page.kind === 'bigquery';
+  const isOrganizations = page.kind === 'organizations';
   const isFunnel = page.kind === 'funnel';
   // Only a grid of cards reads the shared window, so only it shows the filters
   // that drive one — and only it has figures that could go stale. Reviews
@@ -342,7 +351,7 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
   //
   // The funnel is the odd one: it takes the same filters but fetches its own
   // shape, so it shows the controls without joining the overview request.
-  const isMetrics = !isCustomers && !isNotifications && !isListings && !isBigQuery;
+  const isMetrics = !isCustomers && !isNotifications && !isListings && !isBigQuery && !isOrganizations;
   const filters = page.filters ?? DEFAULT_FILTERS;
 
   const [collapsed, setCollapsed] = useState(
@@ -356,6 +365,15 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
   }, []);
 
   const [apps, setApps] = useState<AppSummary[]>([]);
+  /**
+   * Every organization, for the selector. Null until asked for.
+   *
+   * Fetched once per session and only when a page that could show the selector
+   * is open — the same bargain the app list makes. One organization means the
+   * control is not rendered at all, so an instance that has never used this
+   * feature has an unchanged filter row.
+   */
+  const [orgs, setOrgs] = useState<Organization[] | null>(null);
   /** Null until asked for; empty means no app has a GA4 dataset configured. */
   const [funnelApps, setFunnelApps] = useState<FunnelApp[] | null>(null);
   const [status, setStatus] = useState<Status | null>(null);
@@ -369,15 +387,48 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
    * keeps it to once per session rather than once per visit.
    */
   const needsApps = isMetrics && filters.includes('app') && !isFunnel;
-  const askedForApps = useRef(false);
+
+  /*
+   * Re-fetched when the organization changes, not once per session: the picker
+   * offers the apps of the selected organization, and an app list left over from
+   * "all organizations" would offer apps the current scope would then 403 on.
+   */
+  useEffect(() => {
+    if (!needsApps) return;
+    let cancelled = false;
+    fetchApps(query.orgId)
+      .then((result) => {
+        if (!cancelled) setApps(result.apps);
+      })
+      .catch(() => {
+        if (!cancelled) setApps([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [needsApps, query.orgId]);
+
+  const askedForOrgs = useRef(false);
 
   useEffect(() => {
-    if (!needsApps || askedForApps.current) return;
-    askedForApps.current = true;
-    fetchApps()
-      .then((result) => setApps(result.apps))
-      .catch(() => setApps([]));
-  }, [needsApps]);
+    if (!isMetrics || askedForOrgs.current) return;
+    askedForOrgs.current = true;
+    fetchOrganizations()
+      .then((result) => setOrgs(result.organizations))
+      .catch(() => setOrgs([]));
+  }, [isMetrics]);
+
+  /*
+   * An app selected under one organization is not necessarily in the next one.
+   * Cleared rather than carried, because carrying it asks the server for an app
+   * outside the scope and gets a 403 across the whole grid.
+   */
+  useEffect(() => {
+    if (!needsApps || !query.appId) return;
+    if (apps.length > 0 && !apps.some((app) => app.id === query.appId)) {
+      setQuery((current) => ({ ...current, appId: '' }));
+    }
+  }, [apps, needsApps, query.appId]);
 
   /*
    * The funnel picks from its own, shorter list: the apps with a GA4 dataset
@@ -387,7 +438,7 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
   useEffect(() => {
     if (!isFunnel) return;
     let cancelled = false;
-    fetchFunnelApps()
+    fetchFunnelApps(query.orgId)
       .then((result) => {
         if (!cancelled) setFunnelApps(result.apps);
       })
@@ -397,7 +448,7 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
     return () => {
       cancelled = true;
     };
-  }, [isFunnel]);
+  }, [isFunnel, query.orgId]);
 
   /*
    * The funnel is always about one app, so an empty or ineligible selection is
@@ -514,6 +565,27 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
             a star rating says nothing about revenue. */}
         {!isMetrics ? null : (
           <div className="controls">
+            {/* Absent, not disabled, on an instance with one organization: a
+                control with a single option is a control that only takes up
+                room and invites a click that changes nothing. */}
+            {filters.includes('org') && (orgs?.length ?? 0) > 1 ? (
+              <div className="control">
+                <label htmlFor="org">Organization</label>
+                <select
+                  id="org"
+                  value={query.orgId}
+                  onChange={(event) => patch({ orgId: event.target.value })}
+                >
+                  <option value="">All organizations</option>
+                  {(orgs ?? []).map((org) => (
+                    <option key={org.id} value={org.id}>
+                      {org.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            ) : null}
+
             {filters.includes('app') ? (
               <div className="control">
                 <label htmlFor="app">App</label>
@@ -652,6 +724,7 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
         !isListings &&
         !isReviews &&
         !isBigQuery &&
+        !isOrganizations &&
         !isFunnel &&
         status &&
         !hasData ? (
@@ -678,9 +751,9 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
         {isCustomers ? (
           <Chunk>
             {route.param ? (
-              <CustomerDetail shopId={route.param} appId={query.appId} />
+              <CustomerDetail shopId={route.param} appId={query.appId} orgId={query.orgId} />
             ) : (
-              <Customers appId={query.appId} />
+              <Customers appId={query.appId} orgId={query.orgId} />
             )}
           </Chunk>
         ) : null}
@@ -700,6 +773,12 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
         {isBigQuery ? (
           <Chunk>
             <BigQuery />
+          </Chunk>
+        ) : null}
+
+        {isOrganizations ? (
+          <Chunk>
+            <Organizations />
           </Chunk>
         ) : null}
 
@@ -727,6 +806,7 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
             <Chunk>
               <Funnel
                 appId={query.appId}
+                orgId={query.orgId}
                 period={query.period}
                 granularity={query.granularity}
                 key={dataVersion}
@@ -739,7 +819,7 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
             in every figure below it — the charts count it, no customer owns it. */}
         {isReviews ? (
           <Chunk>
-            <UnmatchedReviews appId={query.appId} />
+            <UnmatchedReviews appId={query.appId} orgId={query.orgId} />
           </Chunk>
         ) : null}
 
