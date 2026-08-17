@@ -165,24 +165,68 @@ export function createApp(): express.Express {
     }
   });
 
-  app.get('/api/status', (_request, response) => {
+  /*
+   * The row counts behind this are memoized, and that is not an optimization —
+   * without it this route takes the whole process down.
+   *
+   * SQLite keeps no row count, so `COUNT(*)` walks the table. Measured on the
+   * live database: `transactions` 56.5s and `customer_events` 85.0s, together
+   * over two minutes of *synchronous* work on the single thread that also serves
+   * every other route and answers the health check. No index can help — there is
+   * nothing to look up, only rows to count.
+   *
+   * The dashboard shell polls this on every page for one footer line, so each
+   * navigation stalled the entire app and Fly pulled the machine from the load
+   * balancer. It presented as "every page hangs", which sent us looking at the
+   * pages rather than at the footer.
+   *
+   * So the counts are now opt-in, behind `?counts=1`, and memoized for a minute
+   * when asked for. The dashboard shell reads only `sync` and `lastSyncAt` —
+   * verified against the frontend, which never renders a row count anywhere —
+   * and both of those are cheap and read fresh on every call, because they are
+   * what tells a reader whether the figures in front of them are stale.
+   */
+  let countsCache: { at: number; value: Record<string, unknown> } | null = null;
+  const COUNTS_TTL_MS = 60_000;
+
+  app.get('/api/status', (request, response) => {
     try {
       const db = getDb();
-      const counts = db
-        .prepare(
-          `SELECT
-             (SELECT COUNT(*) FROM apps) AS apps,
-             (SELECT COUNT(*) FROM shops) AS shops,
-             (SELECT COUNT(*) FROM app_events) AS events,
-             (SELECT COUNT(*) FROM transactions) AS transactions,
-             (SELECT COUNT(*) FROM subscriptions) AS subscriptions,
-             (SELECT COUNT(*) FROM customer_events WHERE suppressed = 0) AS customerEvents,
-             (SELECT MAX(updated_at) FROM sync_state) AS lastSyncAt`,
-        )
-        .get() as Record<string, unknown>;
-      // The dashboard watches `lastSyncAt` to know when its figures went stale,
-      // and `sync` to say so when the background loop is failing.
-      response.json({ ...counts, sync: syncStatus() });
+
+      // Always cheap: this is the whole of what the dashboard shell reads, and
+      // it polls this route on every page.
+      const lastSyncAt = (
+        db.prepare('SELECT MAX(updated_at) AS lastSyncAt FROM sync_state').get() as {
+          lastSyncAt: string | null;
+        }
+      ).lastSyncAt;
+      const base = { lastSyncAt, sync: syncStatus() };
+
+      // The counts are opt-in. Callers that want them ask; the shell does not,
+      // and used to pay for them on every navigation regardless.
+      if (request.query.counts !== '1') {
+        response.json(base);
+        return;
+      }
+
+      if (!countsCache || Date.now() - countsCache.at > COUNTS_TTL_MS) {
+        countsCache = {
+          at: Date.now(),
+          value: db
+            .prepare(
+              `SELECT
+                 (SELECT COUNT(*) FROM apps) AS apps,
+                 (SELECT COUNT(*) FROM shops) AS shops,
+                 (SELECT COUNT(*) FROM app_events) AS events,
+                 (SELECT COUNT(*) FROM transactions) AS transactions,
+                 (SELECT COUNT(*) FROM subscriptions) AS subscriptions,
+                 (SELECT COUNT(*) FROM customer_events WHERE suppressed = 0) AS customerEvents`,
+            )
+            .get() as Record<string, unknown>,
+        };
+      }
+
+      response.json({ ...countsCache.value, ...base });
     } catch (error) {
       sendError(response, error);
     }

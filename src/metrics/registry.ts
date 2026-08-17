@@ -253,12 +253,52 @@ export function runMetric(
 
   const context = buildContext(query, options.now);
 
+  /*
+   * Keyed on the RESOLVED context, not the raw query, so two spellings of the
+   * same question share one entry.
+   *
+   * The raw query was the identity before, and it made the cache miss whenever a
+   * caller phrased itself differently. `{}`, `{period:'last_12_months'}` and the
+   * dashboard's own
+   * `period=last_12_months&includeUsage=true&includeTrials=false` are the same
+   * question — the second and third only spell out what the first inherits from
+   * config — yet each produced a different key. That is how the warmer came to
+   * warm entries nothing ever read: it wrote one spelling and the browser asked
+   * in another, twice, with the miss costing minutes of blocking recompute and
+   * looking from the outside like a warm cache.
+   *
+   * Every dimension a query can vary survives into the context — the window,
+   * the app scope, the as-of flags, byShop, rating, and the churn and
+   * plan-change windows — so this is a normalisation, not a narrowing. `currency`
+   * is deliberately left out: it is derived from `appIds`, which is already here.
+   */
+  /*
+   * The window bounds are rounded to the minute *in the key only*.
+   *
+   * A relative period ends at `now`, so the resolved end carries millisecond
+   * precision. Keyed raw, two requests three milliseconds apart are two
+   * different keys and the cache never hits once — it only writes. Measured
+   * exactly that way before this rounding went in.
+   *
+   * The stored value is still computed for the true window; only the identity is
+   * coarsened, so requests inside the same minute share an answer. That is the
+   * definition of caching here, and it is a far smaller staleness than the TTL
+   * this entry already lives under.
+   */
+  const minute = (at: Date): string => new Date(Math.floor(at.getTime() / 60_000) * 60_000).toISOString();
+
   const key = cacheKey(metricKey, {
-    ...query,
-    nocache: undefined,
-    // Resolved scope is part of the identity: "all apps" today may mean a
-    // different set tomorrow.
     scope: context.appIds.join(','),
+    from: minute(context.window.start),
+    to: minute(context.window.end),
+    interval: context.window.interval,
+    includeAnnual: context.asOf.includeAnnual,
+    includeTrials: context.asOf.includeTrials,
+    includeUsage: context.includeUsage,
+    byShop: context.byShop,
+    rating: context.rating ?? '',
+    churnWindowDays: context.churnWindowDays,
+    planChangeWindowDays: context.planChangeWindowDays,
   });
 
   const bypass = query.nocache === '1' || query.nocache === 'true';
@@ -312,7 +352,24 @@ export const HEADLINE_METRICS = [
  * The query the dashboard opens on (`web/src/App.tsx`): every app in scope, the
  * last twelve months. Warming anything else would be guessing.
  */
-const DASHBOARD_DEFAULT_QUERY: RawMetricQuery = { period: 'last_12_months' };
+/**
+ * The shapes the dashboard actually asks for, and both are needed.
+ *
+ * `{}` is the one that matters and the one this used to miss. A bare
+ * `GET /api/overview` sends no period at all and lets the server resolve its own
+ * defaults, which produces a *different* cache key from an explicit
+ * `period=last_12_months` — so warming only the explicit form left the opening
+ * page cold every time while reporting that it had warmed 23 metrics.
+ *
+ * That failure is quiet and expensive: the reader pays the full recompute on the
+ * single thread that also answers the health check, and at this data size that
+ * is minutes, during which every other route times out and the machine is pulled
+ * from the load balancer. Warming the wrong key looks identical to warming the
+ * right one from everywhere except the page.
+ *
+ * The explicit form is kept because the range control emits it.
+ */
+const DASHBOARD_WARM_QUERIES: RawMetricQuery[] = [{}, { period: 'last_12_months' }];
 
 /**
  * Recompute the dashboard's opening page into the cache, off the request path.
@@ -333,12 +390,14 @@ const DASHBOARD_DEFAULT_QUERY: RawMetricQuery = { period: 'last_12_months' };
  */
 export function warmDashboardMetrics(): number {
   let warmed = 0;
-  for (const metric of HEADLINE_METRICS) {
-    try {
-      runMetric(metric, DASHBOARD_DEFAULT_QUERY);
-      warmed += 1;
-    } catch (cause) {
-      console.warn(`[partnerdex] could not warm ${metric}:`, cause);
+  for (const query of DASHBOARD_WARM_QUERIES) {
+    for (const metric of HEADLINE_METRICS) {
+      try {
+        runMetric(metric, query);
+        warmed += 1;
+      } catch (cause) {
+        console.warn(`[partnerdex] could not warm ${metric}:`, cause);
+      }
     }
   }
   return warmed;

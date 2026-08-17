@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { beforeEach, describe, it } from 'node:test';
 import { APP_ID, pointAt, resetEnvironment, seed, seedForApp } from './helpers.js';
+import { getConfig, resetConfig } from '../src/config.js';
 import { runMetric } from '../src/metrics/registry.js';
 import { monthlyAmountFor } from '../src/sync/derive.js';
 import { autoInterval, resolveWindow } from '../src/metrics/time.js';
@@ -1300,5 +1301,82 @@ describe('currency profile: cached, warmed, and identical either way', () => {
       currencyProfileKey([APP_ID]),
     );
     assert.equal(currencyProfile(db, [APP_ID]).currency, 'EUR');
+  });
+});
+
+describe('the metric cache keys on the question, not its spelling', () => {
+  /*
+   * Regression. The key used to be built from the raw query, so
+   * `{ period: 'last_12_months' }` and the dashboard's fully-spelled
+   * `period=last_12_months&includeUsage=true&includeTrials=false` were two
+   * different keys for one question — the second only stating explicitly what
+   * the first inherits from config.
+   *
+   * Note these must share an entry, while a genuinely different window must not:
+   * the server's own default period is `last_30_days`, so an empty query is a
+   * different question and is expected to key separately.
+   *
+   * That is what made the cache warmer useless twice: it wrote one spelling and
+   * the browser asked in another, and the miss cost a full recompute on the
+   * request thread while every log said the warm had succeeded.
+   */
+  it('serves one cached entry to every spelling of the same query', () => {
+    resetEnvironment();
+    // The suite runs with the cache off; this test is about the cache, so it
+    // turns it on for itself and puts it back afterwards.
+    const previousTtl = process.env.CACHE_TTL_SECONDS;
+    process.env.CACHE_TTL_SECONDS = '600';
+    resetConfig();
+    seed([
+      {
+        chargeRef: 'c1',
+        shopId: '1',
+        amount: 40,
+        activatedAt: '2024-01-10T00:00:00Z',
+        firstSaleAt: '2024-01-10T00:00:00Z',
+      },
+    ]);
+
+    const db = getDb();
+    const cachedKeys = () =>
+      (db.prepare('SELECT key FROM metric_cache').all() as Array<{ key: string }>).map(
+        (row) => row.key,
+      );
+
+    db.prepare('DELETE FROM metric_cache').run();
+
+    // Two calls a few seconds apart, which is what two page loads are. A
+    // relative period ends at `now`, so without rounding these are different
+    // keys and the cache writes twice and hits never.
+    const t0 = new Date('2026-06-01T12:00:03.123Z');
+    const t1 = new Date('2026-06-01T12:00:41.876Z');
+
+    // The minimal spelling: just the period, which is what the warmer writes.
+    const bare = runMetric('mrr', { period: 'last_12_months' }, { now: t0 });
+    const afterBare = cachedKeys().filter((key) => key.startsWith('mrr?'));
+    assert.equal(afterBare.length, 1, 'one entry after the first spelling');
+
+    // The same question, spelled out the way the dashboard spells it. If this
+    // writes a second entry the warmer can never help the page.
+    // Spelled out with exactly the values the first call inherits from config.
+    // Stating a *different* value would be a different question, correctly.
+    const { reporting } = getConfig();
+    const spelled = runMetric(
+      'mrr',
+      {
+        period: 'last_12_months',
+        includeUsage: String(reporting.includeUsage),
+        includeTrials: String(reporting.includeTrials),
+      },
+      { now: t1 },
+    );
+    const afterSpelled = cachedKeys().filter((key) => key.startsWith('mrr?'));
+
+    assert.equal(afterSpelled.length, 1, 'the second spelling must reuse the first entry');
+    assert.equal(spelled.value, bare.value);
+
+    if (previousTtl === undefined) delete process.env.CACHE_TTL_SECONDS;
+    else process.env.CACHE_TTL_SECONDS = previousTtl;
+    resetConfig();
   });
 });
