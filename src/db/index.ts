@@ -45,15 +45,17 @@ export function getDb(): Db {
  * Take the group and world bits off the database and its WAL sidecars.
  *
  * SQLite creates these with the process umask, which on a default system means
- * 0644 — readable by every local account. What is in the file now includes live
- * Partner API tokens, one per organization, and the plaintext BigQuery
- * service-account key. On a single-tenant machine that is a local-only
+ * 0644 — readable by every local account. What is in the file: live Partner API
+ * tokens, the plaintext BigQuery service-account key, every affiliate's scrypt
+ * hash and salt, live reset-token digests, and hundreds of email addresses and
+ * their PayPal addresses. On a single-tenant machine this is a local-only
  * exposure, but `chmod` costs nothing and the same file gets copied onto
  * laptops for debugging, where "every local account" is a much bigger set.
  *
  * Best effort on purpose. A volume mounted from a filesystem that does not
- * carry Unix modes must not stop the process starting over a hardening
- * measure — refusing to boot is a worse failure than a mode of 0644.
+ * carry Unix modes (or a database that is a symlink somewhere odd) must not
+ * stop the process starting over a hardening measure — refusing to boot is a
+ * worse failure than a mode of 0644.
  */
 function restrictFileMode(databasePath: string): void {
   if (databasePath === ':memory:') return;
@@ -199,11 +201,11 @@ function migrate(db: Db): void {
     })();
   }
 
-  // Unconditional and idempotent, outside the guard above and deliberately so:
-  // inside it a *new* database would never get the index, because its table
-  // arrives with the column already present and the branch never runs. And not
-  // in the schema block, because that runs before this and would name a column
-  // an old database lacks.
+  // Unconditional and idempotent, outside the guard above, for the same reason
+  // as `idx_aff_comm_payout` below: inside the guard a *new* database would
+  // never get the index, because its table arrives with the column already
+  // present and the branch never runs. And not in the schema block, because
+  // that runs before this and would name a column an old database lacks.
   db.exec('CREATE INDEX IF NOT EXISTS idx_apps_org ON apps (org_id)');
 
   // The GA4 export dataset moved from the connection to the app. A partner
@@ -277,6 +279,87 @@ function migrate(db: Db): void {
                              AND e.type = 'RELATIONSHIP_INSTALLED')`,
     );
     db.exec('DELETE FROM metric_cache');
+  }
+
+  /*
+   * The affiliate ledger, which now has two entries — and the rule they obey is
+   * worth stating before them, because these tables hold the only copy of who is
+   * owed what: a migration that reaches them may add and backfill columns, and
+   * may not drop, rewrite or clear a row. Anything that would has to be a data
+   * fix someone runs deliberately, not a side effect of opening the database.
+   *
+   * Both below are additive columns on tables that already exist in a database
+   * imported before payouts were modelled. `affiliate_payouts` itself needs no
+   * entry — `CREATE TABLE IF NOT EXISTS` creates it complete — but the two
+   * columns that point at it do, since the create above leaves an existing table
+   * exactly as it was.
+   *
+   * Neither is backfilled here. `payout_id` is filled by
+   * `linkCommissionsToPayouts()` on the next import, which is where the
+   * `payment_reference` → payout join lives and where the result gets counted
+   * and reported; doing it silently on open would move money-shaped data with
+   * nobody reading the outcome.
+   */
+  const commissions = columns('affiliate_commissions');
+  if (commissions.size > 0) {
+    if (!commissions.has('payout_id')) {
+      db.exec(`ALTER TABLE affiliate_commissions ADD COLUMN payout_id TEXT NOT NULL DEFAULT ''`);
+    }
+    // Created here rather than in the schema block, and unconditionally rather
+    // than only alongside the ALTER. The schema block runs first, so an index
+    // naming `payout_id` cannot live there — on a database that predates the
+    // column it fails and takes the process down. Creating it only inside the
+    // `!has` branch would then leave a *new* database without the index, since
+    // its table arrives with the column already present and the branch never
+    // runs. Unconditional and idempotent covers both.
+    db.exec(
+      `CREATE INDEX IF NOT EXISTS idx_aff_comm_payout
+         ON affiliate_commissions (payout_id) WHERE payout_id <> ''`,
+    );
+  }
+
+  const programs = columns('affiliate_programs');
+  if (programs.size > 0 && !programs.has('listing_url')) {
+    db.exec(`ALTER TABLE affiliate_programs ADD COLUMN listing_url TEXT NOT NULL DEFAULT ''`);
+  }
+
+  /*
+   * Terms acceptance, which self-signup records and the import never could.
+   *
+   * Added, never backfilled — and that is the whole point of the columns. The
+   * imported affiliates get a blank URL and a NULL timestamp and keep them:
+   * Mantle's `termsUrl` was never configured, so none of them was shown terms
+   * and none of them agreed to anything. A default of `now` here would turn
+   * opening the database into the act of manufacturing consent records.
+   */
+  const affiliates = columns('affiliates');
+  if (affiliates.size > 0) {
+    if (!affiliates.has('terms_url')) {
+      db.exec(`ALTER TABLE affiliates ADD COLUMN terms_url TEXT NOT NULL DEFAULT ''`);
+    }
+    if (!affiliates.has('terms_accepted_at')) {
+      db.exec(`ALTER TABLE affiliates ADD COLUMN terms_accepted_at TEXT`);
+    }
+  }
+
+  /*
+   * The handle index the security review asked for (finding 10).
+   *
+   * `idx_aff_memberships_handle` is `(program_id, handle)`, so a lookup by
+   * handle alone — which is what `/r/:handle` and the GA4 attribution pipeline
+   * both do — cannot seek and scans the table instead. Cheap at today's row
+   * count and still a full scan on the request thread of a single-threaded
+   * process, on the one route that is public by design. Self-signup only makes that table grow.
+   *
+   * Here rather than in the schema block for the same reason as the two above:
+   * unconditional and idempotent covers both a new database and an old one.
+   */
+  const memberships = columns('affiliate_memberships');
+  if (memberships.size > 0) {
+    db.exec(
+      `CREATE INDEX IF NOT EXISTS idx_aff_memberships_handle_only
+         ON affiliate_memberships (handle)`,
+    );
   }
 
   // Who a listing event belongs to became a resolved value rather than always

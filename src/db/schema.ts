@@ -12,10 +12,12 @@
  *                         which holds the only surviving copy of a review once
  *                         the App Store stops serving it; and the BigQuery
  *                         connection, whose credential nothing else can supply
+ *   5. affiliate ledger — the `affiliate_*` cluster: who refers merchants, which
+ *                         merchant each one referred, and what that has earned
  *
- * Roles 1 and 2 are disposable: both are rebuilt from the API on demand. Role 4
- * is the only place in this store holding state that cannot be recovered by
- * re-syncing, which is why its tables are written to rather than rebuilt.
+ * Roles 1 and 2 are disposable: both are rebuilt from the API on demand. Roles 4
+ * and 5 hold the state that cannot be recovered by re-syncing, which is why
+ * their tables are written to rather than rebuilt.
  *
  * Every timestamp column holds a canonical UTC ISO-8601 string, so lexical
  * comparison is chronological comparison and the as-of predicate is plain SQL.
@@ -872,4 +874,534 @@ CREATE TABLE IF NOT EXISTS drift_snapshots (
   value       REAL NOT NULL,
   PRIMARY KEY (metric, captured_at, bucket_date)
 ) WITHOUT ROWID;
+
+/* ---------------------------------------------------------------------------
+ * The affiliate ledger (role 5).
+ *
+ * Everything above this line is either a copy of something the Partner API will
+ * hand back again or a function of such a copy. Nothing below it is. An
+ * affiliate is a person we owe money to, an attribution is the claim that they
+ * are owed it, and no API anywhere can be asked to re-state either — the
+ * originals are being imported out of a platform that shuts down on 2026-08-14.
+ *
+ * So these tables are written to and never rebuilt, and in particular they are
+ * invisible to \`rebuildDerivedTables()\`, which drops and rewrites its own
+ * tables on every sync. Commission *amounts* are safe to recompute, because the
+ * transactions they are computed from are re-fetchable; the attribution they
+ * hang off, and the record that one was paid, are not.
+ *
+ * Deletion is soft throughout, for the same reason. \`deleted_at\` on an
+ * attribution unassigns a merchant without destroying the evidence that they
+ * were once assigned, which is what a disputed commission is argued from.
+ *
+ * The joins outward — \`shop_id\` to \`shops\`, \`app_id\` to \`apps\` — carry no
+ * foreign key on purpose. Shopify shop and app ids are globally unique so the
+ * join is exact, but an attribution can legitimately arrive before the sync has
+ * ever seen the shop: the Mantle import lands its referrals against whatever
+ * fraction of the shop table exists that day. A constraint there would turn a
+ * known-good referral into an import failure, so the column is left blank and
+ * \`myshopify_domain\` is kept beside it as the key a later pass re-resolves from.
+ * ------------------------------------------------------------------------- */
+
+-- One row per partner who refers merchants to us.
+--
+-- \`external_id\` is their id in the system they were imported from, and it is
+-- what makes the import idempotent and re-reconcilable against Mantle's export
+-- for as long as that export exists. It is blank for anyone who signs up here.
+--
+-- Email is indexed but deliberately not unique: the Mantle data contains one
+-- address held by two affiliates, and refusing the import over it would be this
+-- schema inventing a rule the business never had.
+CREATE TABLE IF NOT EXISTS affiliates (
+  id           TEXT PRIMARY KEY,
+  name         TEXT NOT NULL DEFAULT '',
+  email        TEXT NOT NULL DEFAULT '',
+  -- Where they asked to be paid. Payout processing happens outside this system;
+  -- this is recorded so the person doing it does not have to go looking.
+  paypal_email TEXT,
+  -- 'active' | 'disabled'
+  status       TEXT NOT NULL DEFAULT 'active',
+  -- Set by us, not by them: commissions keep accruing, payment does not happen.
+  payout_hold  INTEGER NOT NULL DEFAULT 0,
+  -- 'imported' | 'signup'
+  source       TEXT NOT NULL DEFAULT 'signup',
+  external_id  TEXT NOT NULL DEFAULT '',
+  -- What this person agreed to, and when they said so.
+  --
+  -- Blank and NULL for all the imported affiliates, permanently, and that is the
+  -- honest state rather than a gap to backfill: Mantle's \`termsUrl\` was never
+  -- configured, so not one of them was ever shown terms and none of them agreed
+  -- to anything. Writing a date here for them would manufacture a consent record
+  -- out of an import, which is the one thing a consent record must never be.
+  --
+  -- \`terms_url\` stores the URL that was actually presented rather than a
+  -- version number, because the URL is the only thing we can point at afterwards
+  -- and say "that is what they saw". If the document behind it changes without
+  -- the URL changing, this column records less than it appears to — which is an
+  -- argument for versioned URLs, not for a second column that repeats the claim.
+  terms_url         TEXT NOT NULL DEFAULT '',
+  terms_accepted_at TEXT,
+  created_at   TEXT NOT NULL,
+  updated_at   TEXT NOT NULL
+) WITHOUT ROWID;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_affiliates_external
+  ON affiliates (external_id) WHERE external_id <> '';
+CREATE INDEX IF NOT EXISTS idx_affiliates_email ON affiliates (email);
+
+-- The terms one app offers its affiliates. One row per app, in practice.
+--
+-- \`commission_rate\` is a fraction rather than a percentage — 0.2, not 20 —
+-- because multiplying is the only thing anyone ever does with it, and a column
+-- that has to be divided by 100 before use eventually is not.
+--
+-- \`duration_months\` NULL means lifetime. The window it opens is measured from
+-- the first commission rather than from the referral; that rule belongs to the
+-- engine, but it is stated here because the column is where someone will look.
+--
+-- \`revenue_components\` is a JSON array ('["subscription"]'), which is the shape
+-- the source platform used and the shape the settings screen will edit. Nothing
+-- queries inside it.
+-- \`listing_url\` is the App Store page this program's referral links point at,
+-- and it is here rather than only in \`app_listings\` because a program can need
+-- one before its app is resolved locally: the Mantle import lands hundreds of
+-- live links on day one, and \`app_id\` is blank until the Partner API sync has met the app.
+-- \`app_listings\` still wins when it has an entry — that is the operator's own
+-- mapping — and this is what a program falls back to instead of a route
+-- hardcoding a slug.
+CREATE TABLE IF NOT EXISTS affiliate_programs (
+  id                            TEXT PRIMARY KEY,
+  -- \`apps.id\`. Blank until the app is known locally, which is possible on an
+  -- import that runs before the first sync finishes.
+  app_id                        TEXT NOT NULL DEFAULT '',
+  name                          TEXT NOT NULL DEFAULT '',
+  listing_url                   TEXT NOT NULL DEFAULT '',
+  commission_rate               REAL NOT NULL DEFAULT 0,
+  revenue_components            TEXT NOT NULL DEFAULT '["subscription"]',
+  duration_months               INTEGER,
+  unassign_after_uninstall_days INTEGER,
+  require_approval              INTEGER NOT NULL DEFAULT 0,
+  -- 'active' | 'closed'
+  status                        TEXT NOT NULL DEFAULT 'active',
+  external_id                   TEXT NOT NULL DEFAULT '',
+  created_at                    TEXT NOT NULL,
+  updated_at                    TEXT NOT NULL
+) WITHOUT ROWID;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_aff_programs_external
+  ON affiliate_programs (external_id) WHERE external_id <> '';
+CREATE INDEX IF NOT EXISTS idx_aff_programs_app ON affiliate_programs (app_id);
+
+-- An affiliate's enrolment in one program, and the link code that carries it.
+--
+-- \`handle\` is the \`?mref=\` value. It is unique per program and NOT globally:
+-- two affiliates in the imported data hold a membership in both programs under
+-- one handle, so a global unique index would reject them. Which program a click
+-- belongs to is never ambiguous — it is the listing that was clicked.
+--
+-- The column collates NOCASE, so the unique index and every lookup agree on
+-- case. A handle arrives from a URL somebody may have retyped, and the codes
+-- are lowercase eight-character strings that a person will capitalise.
+--
+-- \`status\` is 'enrolled' | 'pending' | 'rejected'. Pending and rejected rows are
+-- kept rather than dropped: pending is the approval queue for a program that
+-- requires approval, and rejected is the record of a decision — without it the
+-- same applicant reappears as new.
+CREATE TABLE IF NOT EXISTS affiliate_memberships (
+  id           TEXT PRIMARY KEY,
+  affiliate_id TEXT NOT NULL REFERENCES affiliates (id) ON DELETE CASCADE,
+  program_id   TEXT NOT NULL REFERENCES affiliate_programs (id),
+  handle       TEXT NOT NULL COLLATE NOCASE,
+  status       TEXT NOT NULL DEFAULT 'pending',
+  joined_at    TEXT NOT NULL,
+  approved_at  TEXT,
+  rejected_at  TEXT,
+  external_id  TEXT NOT NULL DEFAULT '',
+  created_at   TEXT NOT NULL,
+  updated_at   TEXT NOT NULL
+) WITHOUT ROWID;
+
+-- The unique constraint self-signup's handle generator has to satisfy: unique
+-- per program, not globally. A second index on \`handle\` alone is created by the
+-- migration step, because \`/r/:handle\` and the GA4 parser both look a handle up
+-- without knowing its program and this composite one cannot seek for them.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_aff_memberships_handle
+  ON affiliate_memberships (program_id, handle);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_aff_memberships_pair
+  ON affiliate_memberships (affiliate_id, program_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_aff_memberships_external
+  ON affiliate_memberships (external_id) WHERE external_id <> '';
+
+-- The claim that this affiliate is why this merchant installed this app.
+--
+-- The durable fact of the whole feature. Commissions are recomputed from it;
+-- it is recomputed from nothing.
+--
+-- \`source\` says how the claim arose and is 'ga4' | 'manual' | 'imported'.
+-- The distinction is not decorative: only 'ga4' is automated, 'manual' is an
+-- admin assigning a merchant retroactively, and roughly two in five of the
+-- imported referrals were manual in the platform they came from. A rebuilt
+-- pipeline that reproduces only the automated half is under-attributing, and
+-- this column is how that is measured rather than guessed at.
+--
+-- \`shop_id\` may be blank, and \`myshopify_domain\` is why that is survivable —
+-- see the note at the top of this section. \`external_page_view_id\` is the
+-- imported platform's own evidence of a GA4 listing view, kept for the
+-- reconciliation that compares its attribution decisions against ours.
+CREATE TABLE IF NOT EXISTS affiliate_attributions (
+  id                   TEXT PRIMARY KEY,
+  affiliate_id         TEXT NOT NULL REFERENCES affiliates (id),
+  program_id           TEXT NOT NULL REFERENCES affiliate_programs (id),
+  shop_id              TEXT NOT NULL DEFAULT '',
+  myshopify_domain     TEXT NOT NULL DEFAULT '',
+  app_id               TEXT NOT NULL DEFAULT '',
+  referred_at          TEXT NOT NULL,
+  source               TEXT NOT NULL DEFAULT 'manual',
+  -- The membership handle credited, when one was. Audit, not a join key: a
+  -- handle can be reissued, and this records what was actually followed.
+  handle               TEXT NOT NULL DEFAULT '' COLLATE NOCASE,
+  external_id          TEXT NOT NULL DEFAULT '',
+  external_page_view_id TEXT NOT NULL DEFAULT '',
+  created_at           TEXT NOT NULL,
+  deleted_at           TEXT
+) WITHOUT ROWID;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_aff_attr_external
+  ON affiliate_attributions (external_id) WHERE external_id <> '';
+
+-- One live claim per merchant per program. Enforced on the domain rather than
+-- on \`shop_id\` because the domain is the column that is always populated, and
+-- the two are one-to-one. Soft-deleted rows are excluded, which is what lets a
+-- merchant be reassigned without first destroying the previous claim.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_aff_attr_live
+  ON affiliate_attributions (program_id, myshopify_domain)
+  WHERE deleted_at IS NULL AND myshopify_domain <> '';
+
+CREATE INDEX IF NOT EXISTS idx_aff_attr_affiliate
+  ON affiliate_attributions (affiliate_id, referred_at);
+CREATE INDEX IF NOT EXISTS idx_aff_attr_shop ON affiliate_attributions (shop_id);
+-- The work list for re-resolving referrals whose shop had not synced yet.
+CREATE INDEX IF NOT EXISTS idx_aff_attr_unresolved
+  ON affiliate_attributions (myshopify_domain) WHERE shop_id = '';
+
+-- What one transaction earned one affiliate.
+--
+-- Half recomputable, half not, and the split is the reason for the column list.
+-- \`amount\` is a pure function of the transaction and the program's rules, so
+-- the engine may rewrite it whenever either changes. The payment columns are
+-- not a function of anything: they record that money left the building, which
+-- happens outside this system entirely and can never be re-derived from it.
+-- Recomputation therefore updates in place, keyed on (attribution, transaction),
+-- and never deletes a row that carries \`paid_at\`.
+--
+-- \`transaction_id\` is \`transactions.id\` and is blank on imported rows, because
+-- the source platform identified transactions by its own ids and none of them
+-- are ours. \`external_transaction_id\` keeps its id, and \`earned_at\` plus
+-- \`basis_amount\` keep enough of the transaction to match it back to a Partner
+-- API row later — which is exactly the diff that proves the engine correct.
+CREATE TABLE IF NOT EXISTS affiliate_commissions (
+  id                      TEXT PRIMARY KEY,
+  attribution_id          TEXT NOT NULL REFERENCES affiliate_attributions (id),
+  -- Denormalized from the attribution: who is owed this. An attribution can be
+  -- reassigned, and a commission already earned does not move with it.
+  affiliate_id            TEXT NOT NULL,
+  program_id              TEXT NOT NULL,
+  transaction_id          TEXT NOT NULL DEFAULT '',
+  amount                  REAL NOT NULL DEFAULT 0,
+  currency                TEXT NOT NULL DEFAULT 'USD',
+  -- The gross the rate was applied to, and the rate applied, as of computation.
+  -- Stored rather than looked up so a statement issued last year still explains
+  -- itself after the program's terms change.
+  basis_amount            REAL,
+  rate                    REAL,
+  -- When the underlying transaction happened, which is what a duration window
+  -- and a statement period are measured on. \`computed_at\` is when we last did
+  -- the arithmetic, and the two are years apart on the imported rows.
+  earned_at               TEXT NOT NULL,
+  computed_at             TEXT NOT NULL,
+  -- 'computed' | 'imported'
+  source                  TEXT NOT NULL DEFAULT 'computed',
+  external_id             TEXT NOT NULL DEFAULT '',
+  external_transaction_id TEXT NOT NULL DEFAULT '',
+  -- Paid elsewhere, recorded here. \`payment_reference\` is whatever the payer's
+  -- system calls the payment — a payout id on import, a PayPal batch id after.
+  paid_at                 TEXT,
+  paid_amount             REAL,
+  payment_reference       TEXT,
+  -- The payout that settled this commission, once one exists locally.
+  --
+  -- Resolved from \`payment_reference\` rather than replacing it: the reference
+  -- is what the payer's system said, which is a fact, and this is our own row id
+  -- for the same payment, which is a join. Keeping both means a payout that was
+  -- never imported still leaves the evidence of the payment behind.
+  --
+  -- Blank is a real state and not an error. Most of the imported
+  -- commissions were never part of any payout — they are simply unpaid — and a
+  -- commission paid by some later PayPal batch will carry a reference that names
+  -- no payout at all.
+  payout_id               TEXT NOT NULL DEFAULT '',
+  payment_note            TEXT,
+  -- A commission withdrawn after the fact (a refunded charge, a fraudulent
+  -- referral). Soft, so the affiliate's statement can still explain the change.
+  cancelled_at            TEXT,
+  cancel_reason           TEXT
+) WITHOUT ROWID;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_aff_comm_external
+  ON affiliate_commissions (external_id) WHERE external_id <> '';
+-- One commission per transaction per attribution. Partial, because imported
+-- rows carry no local transaction id and would otherwise all collide on ''.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_aff_comm_txn
+  ON affiliate_commissions (attribution_id, transaction_id)
+  WHERE transaction_id <> '';
+CREATE INDEX IF NOT EXISTS idx_aff_comm_affiliate
+  ON affiliate_commissions (affiliate_id, earned_at);
+CREATE INDEX IF NOT EXISTS idx_aff_comm_attribution
+  ON affiliate_commissions (attribution_id);
+CREATE INDEX IF NOT EXISTS idx_aff_comm_unpaid
+  ON affiliate_commissions (affiliate_id) WHERE paid_at IS NULL AND cancelled_at IS NULL;
+-- The index on \`payout_id\` is created by the migration step rather than here,
+-- for the same reason as \`idx_listing_events_visitor\` above. This block runs
+-- before the migration on every open, and on a database whose
+-- \`affiliate_commissions\` predates the column an index naming it fails
+-- outright — taking the whole process down, including the routes that never
+-- touch a payout.
+
+-- One payment to one affiliate, for a period of their commissions.
+--
+-- A record of something that happened elsewhere, and nothing more. This system
+-- does not pay anybody: it has no rails, no schedule, no threshold and no status
+-- machine, and none of those belong here later either. What it has is a small
+-- number of rows of Mantle's history, which would otherwise have survived only as
+-- three columns on the commissions they settled — enough to answer "was this
+-- paid" and not enough to answer "what was in that payment", which is the
+-- question an affiliate asks when a number on their statement is unfamiliar.
+--
+-- Role 5 and durable for the same reason as everything else in this cluster: no
+-- API will restate that money left the building. Deletion is soft.
+--
+-- \`status\` carries Mantle's word for it, and there are exactly two in the data:
+-- 'paid' (nearly all of them) and 'requested' (a single row, which Mantle shut
+-- down before settling). It is descriptive, not a workflow — nothing here transitions
+-- a payout, because nothing here pays one.
+--
+-- \`amount\` is what the payout was raised for and \`amount_paid\` is what the
+-- payer recorded actually sending, NULL while unpaid. They are separate columns
+-- rather than one because a payment that went out short is a discrepancy someone
+-- has to see, and a single column would hide it by construction.
+--
+-- \`number\` is Mantle's human-facing reference (a contiguous range here) and is
+-- what an affiliate quotes in an email. It is stored as text and never re-used as a key:
+-- it is an outside system's counter, and ours starts wherever it starts.
+--
+-- \`period_start\`/\`period_end\` are the window the payout claimed to cover. They
+-- are Mantle's own bounds and are not always the extent of the commissions
+-- actually attached — the link is \`affiliate_commissions.payout_id\`, and that,
+-- not this window, is what the payout paid for.
+-- \`program_id\` is nullable, unlike everywhere else in this cluster, because a
+-- handful of Mantle's payouts carry no program at all — they are the earliest
+-- ones, the lowest reference numbers, raised before payouts were scoped to a
+-- program. The import fills those in from the commissions they paid for, but
+-- only where every
+-- one of those commissions agrees on a single program, which is the difference
+-- between reading the answer off the ledger and guessing it. NULL is what a
+-- payout gets when they do not agree, and it means "not recorded", not "none".
+CREATE TABLE IF NOT EXISTS affiliate_payouts (
+  id             TEXT PRIMARY KEY,
+  affiliate_id   TEXT NOT NULL REFERENCES affiliates (id),
+  program_id     TEXT REFERENCES affiliate_programs (id),
+  number         TEXT NOT NULL DEFAULT '',
+  -- 'paid' | 'requested'
+  status         TEXT NOT NULL DEFAULT 'requested',
+  amount         REAL NOT NULL DEFAULT 0,
+  amount_paid    REAL,
+  currency       TEXT NOT NULL DEFAULT 'USD',
+  period_start   TEXT,
+  period_end     TEXT,
+  paid_at        TEXT,
+  -- 'paypal', 'stripe', … as the payer's system named it. Free text on purpose:
+  -- constraining it would be this schema having an opinion about rails it does
+  -- not operate.
+  payment_method TEXT,
+  notes          TEXT,
+  external_id    TEXT NOT NULL DEFAULT '',
+  created_at     TEXT NOT NULL,
+  updated_at     TEXT NOT NULL,
+  deleted_at     TEXT
+) WITHOUT ROWID;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_aff_payouts_external
+  ON affiliate_payouts (external_id) WHERE external_id <> '';
+CREATE INDEX IF NOT EXISTS idx_aff_payouts_affiliate
+  ON affiliate_payouts (affiliate_id, paid_at);
+CREATE INDEX IF NOT EXISTS idx_aff_payouts_program ON affiliate_payouts (program_id);
+
+-- How an affiliate proves they are themselves, and nothing else.
+--
+-- Separate from \`affiliates\` on purpose. That table is a ledger record imported
+-- from elsewhere and rewritten by every re-import; this one is a credential that
+-- an import must never touch, and keeping them apart makes that structural
+-- rather than a rule someone has to remember. It also means the row simply does
+-- not exist for the affiliates who have never set a password, which is the
+-- honest representation of that state — no sentinel hash, nothing to mistake for
+-- one.
+--
+-- \`password_hash\` is scrypt over a per-row 16-byte salt, both hex. Per-row
+-- because a shared salt would let one rainbow table cover hundreds of people;
+-- scrypt because it is in \`node:crypto\` and this project's dependency list is four
+-- entries by choice.
+--
+-- The reset columns hold a *digest* of the outstanding token, never the token.
+-- A database that leaks must not hand over the ability to take over accounts,
+-- which is exactly what a stored plaintext token is. \`reset_expires_at\` bounds
+-- it in time and clearing \`reset_token_hash\` on redemption bounds it to one
+-- use; both are checked, because either alone leaves a hole.
+CREATE TABLE IF NOT EXISTS affiliate_credentials (
+  affiliate_id       TEXT PRIMARY KEY REFERENCES affiliates (id) ON DELETE CASCADE,
+  -- Blank until the affiliate completes a set-password flow. A blank hash never
+  -- verifies: see \`verifyPassword\` — it is not a password anyone can present.
+  password_hash      TEXT NOT NULL DEFAULT '',
+  password_salt      TEXT NOT NULL DEFAULT '',
+  password_set_at    TEXT,
+  reset_token_hash   TEXT NOT NULL DEFAULT '',
+  reset_expires_at   TEXT,
+  -- When the current outstanding token was issued, so a flood of requests for
+  -- one address is visible without keeping a separate log.
+  reset_requested_at TEXT,
+  last_login_at      TEXT,
+  created_at         TEXT NOT NULL,
+  updated_at         TEXT NOT NULL
+) WITHOUT ROWID;
+
+-- Which affiliate has been sent which transactional email, and when.
+--
+-- The same shape and the same job as \`notification_deliveries\`: a durable
+-- record of the *fact* of a delivery, so that a run which stops halfway can be
+-- resumed without asking the same person twice. Onboarding hundreds of partners
+-- is one bulk send that takes a quarter of an hour, and a failure part way
+-- through must cost only the remainder, not the whole run — the ledger is what
+-- makes the difference.
+--
+-- What is recorded is the fact, the address it went to, and the outcome.
+-- **Never the token, never the link.** The link is a 24-hour account-takeover
+-- credential; a table that stored one would be a strictly worse version of the
+-- log line the security review removed, because a table persists.
+--
+-- Keyed on (affiliate, kind) rather than appended to, so "has this person been
+-- sent their invite" is a primary-key lookup rather than a scan with a MAX over
+-- it. \`attempts\` carries what an append-only log would have carried that is
+-- actually worth keeping: how many times we have tried. A failed row is left in
+-- place with \`ok = 0\` and is retried by the next run; only \`ok = 1\` stops a
+-- resend, because an email that never left is not a delivery.
+CREATE TABLE IF NOT EXISTS affiliate_email_deliveries (
+  affiliate_id TEXT NOT NULL REFERENCES affiliates (id) ON DELETE CASCADE,
+  -- 'set_password' today. A column rather than a table per message type,
+  -- because the next one will want exactly these five fields.
+  kind         TEXT NOT NULL,
+  -- The address as it was at send time. An affiliate who changes their email
+  -- later leaves this alone: it answers "where did it go", not "where do they
+  -- live now".
+  email        TEXT NOT NULL,
+  attempted_at TEXT NOT NULL,
+  -- NULL until one attempt has actually been accepted by the relay.
+  delivered_at TEXT,
+  attempts     INTEGER NOT NULL DEFAULT 1,
+  ok           INTEGER NOT NULL DEFAULT 0,
+  -- The relay's own refusal text, trimmed. Ours never contains a link.
+  error        TEXT,
+  PRIMARY KEY (affiliate_id, kind)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS idx_affiliate_email_deliveries_at
+  ON affiliate_email_deliveries (kind, attempted_at);
+/* --- affiliate attribution claims (role 5) -------------------------------- */
+
+-- An affiliate asserting "this merchant was mine", waiting for a decision.
+--
+-- A request, not a fact, and the distinction is the whole table. Everything else
+-- in this cluster records something that happened; this records something
+-- somebody says happened and that nobody has ruled on yet. It therefore earns no
+-- commission, appears in no balance, and is joined to by nothing in the
+-- engine — a claim only ever becomes money by an operator approving it, which
+-- writes an ordinary \`source='manual'\` row in \`affiliate_attributions\` through
+-- the same path a hand assignment uses.
+--
+-- Hundreds of these were carried out of Mantle, and a pending queue of them is
+-- still undecided.
+-- They are imported *as pending*: the operator has deliberately not decided
+-- them, and an import that inferred a decision would be making that call on
+-- their behalf and silently moving money to do it.
+--
+-- \`status\` is stored, and in Mantle it was not — there it was derived from two
+-- nullable timestamps, \`rejectedAt\` winning over \`approvedAt\`. Deriving it at
+-- read time here would spread that precedence rule across every query that
+-- filters on it, so it is resolved once on the way in and the timestamps are
+-- kept beside it as the evidence.
+--
+-- \`shop_id\` may be blank, for exactly the reason it may be blank on an
+-- attribution: the claim names a merchant by \`myshopify_domain\` and the Partner
+-- API sync may not have reached them yet. \`resolveClaimShops()\` fills it in
+-- later, and nothing here waits on it.
+--
+-- \`attribution_id\` is the referral this claim corresponds to, where one exists.
+-- It is a link and never a creation: the imported ledger already holds a large
+-- minority of manual attributions that these approvals almost certainly
+-- produced, and pointing at them is what stops a re-import writing the same
+-- referral twice.
+-- Blank is a real and expected answer — an approval whose attribution was later
+-- unassigned, or never made, has nothing to point at, and inventing one would be
+-- this import deciding that a merchant belongs to somebody.
+--
+-- \`decided_by\` is free text and is the *name Mantle recorded*, not a local user:
+-- this dashboard authenticates with one shared password and has no user table,
+-- so there is no identity to resolve it against. A decision made here carries
+-- whatever the operator chose to sign it with, or nothing.
+CREATE TABLE IF NOT EXISTS affiliate_attribution_claims (
+  id                   TEXT PRIMARY KEY,
+  affiliate_id         TEXT NOT NULL REFERENCES affiliates (id),
+  program_id           TEXT NOT NULL REFERENCES affiliate_programs (id),
+  -- Blank until the merchant has synced; the domain is the durable identity.
+  shop_id              TEXT NOT NULL DEFAULT '',
+  myshopify_domain     TEXT NOT NULL DEFAULT '',
+  -- The merchant as the claimant named them. Kept because it is what the
+  -- affiliate typed, which is not always what the installation is called.
+  customer_name        TEXT NOT NULL DEFAULT '',
+  -- When the affiliate says the referral happened, which is not when they asked.
+  claimed_at           TEXT NOT NULL,
+  notes                TEXT,
+  -- 'pending' | 'approved' | 'rejected'
+  status               TEXT NOT NULL DEFAULT 'pending',
+  decided_at           TEXT,
+  decided_by           TEXT NOT NULL DEFAULT '',
+  decision_notes       TEXT,
+  approved_at          TEXT,
+  rejected_at          TEXT,
+  -- The referral this claim corresponds to. Blank when none does.
+  attribution_id       TEXT REFERENCES affiliate_attributions (id),
+  external_id          TEXT NOT NULL DEFAULT '',
+  -- Mantle's installation id, kept so a claim can be re-joined to its export.
+  external_installation_id TEXT NOT NULL DEFAULT '',
+  -- Mantle's user id for the decision maker. Meaningless here on its own, which
+  -- is why the human-readable name is stored beside it rather than instead.
+  decided_by_external_id   TEXT NOT NULL DEFAULT '',
+  created_at           TEXT NOT NULL,
+  updated_at           TEXT NOT NULL,
+  deleted_at           TEXT
+) WITHOUT ROWID;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_aff_claims_external
+  ON affiliate_attribution_claims (external_id) WHERE external_id <> '';
+-- The queue, in the order it is worked: oldest claim first, within a status.
+CREATE INDEX IF NOT EXISTS idx_aff_claims_status
+  ON affiliate_attribution_claims (status, claimed_at);
+CREATE INDEX IF NOT EXISTS idx_aff_claims_affiliate
+  ON affiliate_attribution_claims (affiliate_id, claimed_at);
+CREATE INDEX IF NOT EXISTS idx_aff_claims_program
+  ON affiliate_attribution_claims (program_id, status);
+CREATE INDEX IF NOT EXISTS idx_aff_claims_attribution
+  ON affiliate_attribution_claims (attribution_id);
+-- The work list for re-resolving claims whose merchant had not synced yet, the
+-- same shape as \`idx_aff_attr_unresolved\` and drained by the same sync pass.
+CREATE INDEX IF NOT EXISTS idx_aff_claims_unresolved
+  ON affiliate_attribution_claims (myshopify_domain) WHERE shop_id = '';
 `;
