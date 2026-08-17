@@ -41,9 +41,9 @@ function state(claim: Claim): { label: string; tone: string; hint: string } {
             '  ',
             ' ',
           )
-        : // Approved but with no referral against it. Eight of the imported
-          // approvals are in this state, so it is a real one and saying
-          // "approved" alone would be misleading about what it earned.
+        : // Approved but with no referral against it. Some imported approvals
+          // are in this state, so it is a real one and saying "approved" alone
+          // would be misleading about what it earned.
           'Approved, but no referral is currently credited to you for it. Get in touch and we will look at it.',
     };
   }

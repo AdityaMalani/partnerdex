@@ -12,11 +12,11 @@ import { Logo } from '../components/Logo';
  *
  * **The approval difference is shown before the form is submitted, not after.**
  * A program that requires approval says so on its checkbox, and the confirmation
- * repeats what happens next. Stoq applicants become pending and get no referral
- * link until an admin approves them; if the first they hear of that is a portal
- * with nothing in it, they will assume the link is broken and either promote
- * nothing or ask support. `requiresApproval` is read from the server's program
- * row, so a third program with different rules needs no change here.
+ * repeats what happens next. An applicant to such a program becomes pending and
+ * gets no referral link until an admin approves them; if the first they hear of
+ * that is a portal with nothing in it, they will assume the link is broken and
+ * either promote nothing or ask support. `requiresApproval` is read from the
+ * server's program row, so a program with different rules needs no change here.
  *
  * **The confirmation says the same sentence to everybody.** The server answers
  * identically whether or not the address is already an affiliate, and this page

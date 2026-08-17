@@ -65,6 +65,27 @@ const UnmatchedReviews = lazy(() =>
   import('./components/Reviews').then((m) => ({ default: m.UnmatchedReviews })),
 );
 /* ------------------------------------------------------------ affiliates */
+const AffiliatePrograms = lazy(() =>
+  import('./components/AffiliatePrograms').then((m) => ({ default: m.AffiliatePrograms })),
+);
+const AffiliateList = lazy(() =>
+  import('./components/AffiliateList').then((m) => ({ default: m.AffiliateList })),
+);
+const AffiliateDetail = lazy(() =>
+  import('./components/AffiliateDetail').then((m) => ({ default: m.AffiliateDetail })),
+);
+const AffiliateReferrals = lazy(() =>
+  import('./components/AffiliateReferrals').then((m) => ({ default: m.AffiliateReferrals })),
+);
+const AffiliateClaims = lazy(() =>
+  import('./components/AffiliateClaims').then((m) => ({ default: m.AffiliateClaims })),
+);
+const AffiliatePayouts = lazy(() =>
+  import('./components/AffiliatePayouts').then((m) => ({ default: m.AffiliatePayouts })),
+);
+const AffiliatePayoutDetail = lazy(() =>
+  import('./components/AffiliatePayouts').then((m) => ({ default: m.AffiliatePayoutDetail })),
+);
 /* -------------------------------------------------------- end affiliates */
 
 /**
@@ -151,7 +172,7 @@ function describeSyncPhase(sync: SyncStatus): string {
   return `syncing: ${where}, ${elapsed}`;
 }
 
-function greeting(): { title: string; blurb: string } {
+function greeting(): { title: string; blurb?: string } {
   const hour = new Date().getHours();
 
   if (hour < 5) {
@@ -345,13 +366,32 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
   const isBigQuery = page.kind === 'bigquery';
   const isOrganizations = page.kind === 'organizations';
   const isFunnel = page.kind === 'funnel';
+  /* ---------------------------------------------------------- affiliates */
+  // Four pages over the affiliate source tables. None of them is a metric over
+  // the shared window, so they take the whole main column and none of the
+  // filters — and none of them is empty just because the Partner API sync has
+  // not landed, so they sit outside the "no data yet" notice too.
+  const isAffiliatePrograms = page.kind === 'affiliate-programs';
+  const isAffiliates = page.kind === 'affiliates';
+  const isReferrals = page.kind === 'referrals';
+  const isClaims = page.kind === 'claims';
+  const isPayouts = page.kind === 'payouts';
+  const isAffiliate =
+    isAffiliatePrograms || isAffiliates || isReferrals || isClaims || isPayouts;
+  /* ------------------------------------------------------ end affiliates */
   // Only a grid of cards reads the shared window, so only it shows the filters
   // that drive one — and only it has figures that could go stale. Reviews
   // qualifies: it carries cards over that window, with its own list underneath.
   //
   // The funnel is the odd one: it takes the same filters but fetches its own
   // shape, so it shows the controls without joining the overview request.
-  const isMetrics = !isCustomers && !isNotifications && !isListings && !isBigQuery && !isOrganizations;
+  const isMetrics =
+    !isCustomers &&
+    !isNotifications &&
+    !isListings &&
+    !isBigQuery &&
+    !isOrganizations &&
+    !isAffiliate;
   const filters = page.filters ?? DEFAULT_FILTERS;
 
   const [collapsed, setCollapsed] = useState(
@@ -555,7 +595,8 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
         <header className="masthead">
           <div>
             <h1>{heading.title}</h1>
-            <p className="subtitle">{heading.blurb}</p>
+            {/* A page that declares no blurb gets no empty line held for one. */}
+            {heading.blurb ? <p className="subtitle">{heading.blurb}</p> : null}
           </div>
           <ThemeToggle theme={theme} onToggle={toggleTheme} />
         </header>
@@ -726,6 +767,7 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
         !isBigQuery &&
         !isOrganizations &&
         !isFunnel &&
+        !isAffiliate &&
         status &&
         !hasData ? (
           <div className="notice">
@@ -757,6 +799,49 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
             )}
           </Chunk>
         ) : null}
+
+        {/* -------------------------------------------------- affiliates */}
+        {/* Two of the five take a second path segment, on the same one-deep
+            rule the customer pages follow: `#/affiliates/<id>` is one partner
+            and `#/payouts/<id>` is one payment. */}
+        {isAffiliatePrograms ? (
+          <Chunk>
+            <AffiliatePrograms />
+          </Chunk>
+        ) : null}
+
+        {isAffiliates ? (
+          <Chunk>
+            {route.param ? (
+              <AffiliateDetail affiliateId={route.param} key={route.param} />
+            ) : (
+              <AffiliateList />
+            )}
+          </Chunk>
+        ) : null}
+
+        {isReferrals ? (
+          <Chunk>
+            <AffiliateReferrals />
+          </Chunk>
+        ) : null}
+
+        {isClaims ? (
+          <Chunk>
+            <AffiliateClaims />
+          </Chunk>
+        ) : null}
+
+        {isPayouts ? (
+          <Chunk>
+            {route.param ? (
+              <AffiliatePayoutDetail payoutId={route.param} key={route.param} />
+            ) : (
+              <AffiliatePayouts />
+            )}
+          </Chunk>
+        ) : null}
+        {/* ---------------------------------------------- end affiliates */}
 
         {isNotifications ? (
           <Chunk>

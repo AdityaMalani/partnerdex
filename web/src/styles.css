@@ -593,6 +593,12 @@ h3,
   color: var(--text-secondary);
 }
 
+/* A full-width card names itself and goes straight into its table: no subtitle
+   to hold the gap open, so the label carries it. */
+.card.full > .card-label {
+  margin-bottom: 12px;
+}
+
 /*
  * Two lines are reserved whether or not the subtitle needs them, so the big
  * numbers in a row share a baseline. Without the floor, one card whose subtitle
@@ -997,8 +1003,15 @@ thead th {
   margin-bottom: 20px;
 }
 
+/* Three figures, three columns. A page with nothing worth putting in a fourth
+   tile should not pad one out to keep the grid square. */
+.stat-row.three {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
 @media (max-width: 900px) {
-  .stat-row {
+  .stat-row,
+  .stat-row.three {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
@@ -1423,6 +1436,19 @@ button.primary:disabled,
   margin-top: 24px;
   color: var(--muted);
   font-size: 12px;
+}
+
+/*
+ * Nothing to show, said in one line.
+ *
+ * Not a `.notice`: a bordered box with a heading draws the eye of somebody
+ * scanning for the table, and an empty list is not an incident. It sits where
+ * the table would have been, at the table's own text size, and stops there.
+ */
+.empty-line {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 13px;
 }
 
 /* Carries the word "failed" as well as the colour, so the warning does not
@@ -2771,4 +2797,362 @@ button.primary:disabled,
 /* A second heading inside the panel needs air above it; the first does not. */
 .funnel-settings-title.spaced {
   margin-top: 14px;
+}
+
+/* ------------------------------------------------------------- affiliates
+ *
+ * Four pages, and almost no new furniture: the tables, pills, stat tiles,
+ * pagers and banners are the dashboard's own. What is below is the handful of
+ * cases the existing rules do not cover — a terms list read as label/value
+ * rather than as columns, cells that hold several handles, and the row that
+ * carries a referral link beside the control that copies it.
+ */
+
+/* One program is a page-sized object, so its name is set as a heading rather
+   than as the 12px label a card's contents get. */
+.program-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  /* Sits directly above the tiles now that the card carries no subtitle. */
+  margin-bottom: 14px;
+  font-size: 16px;
+  letter-spacing: -0.01em;
+  color: var(--text-primary);
+}
+
+/* Label on the left, value on the right, both left-aligned: this is a
+   definition list wearing a table's markup, not a data grid. */
+.program-terms th[scope='row'] {
+  width: 210px;
+  color: var(--muted);
+  font-weight: 600;
+  vertical-align: top;
+}
+
+.program-terms td {
+  text-align: left;
+  color: var(--text-secondary);
+  /* Terms wrap. A listing URL is longer than a column and must not push the
+     table into a horizontal scroll of its own. */
+  white-space: normal;
+}
+
+.program-terms code {
+  font-size: 11px;
+  color: var(--text-primary);
+}
+
+/* An affiliate can hold a handle per program, so the cell holds several codes
+   and they need to sit apart rather than run together. */
+.handle-cell code {
+  display: inline-block;
+  margin-right: 6px;
+  font-size: 11px;
+}
+
+/* The live referral link, and the control that copies it. The URL is set
+   recessive because it is there to be recognised, not read. */
+.link-cell {
+  white-space: nowrap;
+}
+
+.link-cell .muted-cell {
+  margin-right: 8px;
+  font-size: 11px;
+}
+
+/* The onboarding action sits under the memberships table, with its warning
+   banner directly beneath it when a link has been minted. */
+.affiliate-link-action {
+  margin-top: 14px;
+}
+
+.affiliate-link-action .banner {
+  margin: 12px 0 0;
+}
+
+/* A minted link is a credential. It takes the same monospace treatment as the
+   masked webhook hint, and wraps rather than overflowing its banner. */
+.affiliate-link-action .channel-hint {
+  margin-top: 6px;
+  word-break: break-all;
+  white-space: normal;
+}
+
+/*
+ * Deciding a claim, inline in the queue.
+ *
+ * Two buttons side by side, and only one of them is filled. Approve is the
+ * action that writes a referral and moves money, so it takes the single filled
+ * control the design system allows on a page; Reject is a real decision too but
+ * it creates nothing, and giving both the same weight would make a long queue
+ * of them read as a coin toss.
+ *
+ * They are not `.channel-actions`, which they would otherwise borrow, because
+ * that class carries a `danger` variant and neither of these is destructive in
+ * the way that word means here — a rejection is reversible by a conversation,
+ * and an approval's displacement is soft.
+ */
+.claim-actions {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.claim-actions button:not(.primary) {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 14px;
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.claim-actions button:not(.primary):hover:not(:disabled) {
+  background: var(--hover-wash);
+}
+
+.claim-actions button:not(.primary):focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 2px;
+}
+
+.claim-actions button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/* The claimant's own words. Bounded so one long note cannot push the decide
+   column off the screen, and wrapped rather than clipped so it stays readable —
+   the note is often the whole basis for the decision. */
+/* A row of a queue is not a form: the two decisions are pressed hundreds of
+   times down a page, and at form size they were the widest column on it. */
+.affiliate-table .claim-actions button {
+  padding: 5px 11px;
+  font-size: 12px;
+}
+
+.claim-note {
+  white-space: normal;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/*
+ * The note's own row: attached to the claim above it, not a row in its own
+ * right. It carries the claim's border and drops its own, so the pair reads as
+ * one block — and it is indented to the merchant column so the eye knows which
+ * claim is speaking.
+ */
+.claim-note-row td {
+  padding: 0 10px 8px 10px;
+  border-bottom: 1px solid var(--grid);
+}
+
+.affiliate-table tr:has(+ .claim-note-row) td {
+  border-bottom: none;
+}
+
+/*
+ * Three lines of it, and no more.
+ *
+ * `max-width` alone was not a bound: a column with a maximum still takes its
+ * *height* from the text, and the longest note in the migrated queue is a
+ * paragraph. Set in a 90px-wide ribbon it ran twenty lines deep and made one
+ * claim 700px tall, so four rows filled a screen on a queue of 187. Clamped, a
+ * row is a row; the full text is on the cell's tooltip, and the detail view is
+ * where a note is read in full.
+ */
+/* One line, with the whole of it on the tooltip. Two lines of somebody else's
+   prose on every second row is what made the queue read as a thread rather than
+   as a table; one line still shows what the claim is about, and a note that
+   needs reading in full is read on the tooltip or the detail view. */
+.claim-note-body {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 1;
+  line-clamp: 1;
+  overflow: hidden;
+  max-width: 900px;
+}
+
+/* Install state over what they pay, in one cell. Stacked rather than inline:
+   the pill and the amount are two facts about the merchant, not a sentence. */
+.merchant-state {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+}
+
+/* --------------------------------------------------- the affiliate tables
+ *
+ * `.affiliate-table` is the dashboard's `.customer-table` with two changes, and
+ * both of them come from opening these pages with the real 614 rows in them.
+ *
+ * **Text reads from the left, figures from the right.** The dashboard's tables
+ * right-align every column but the first, which is right for Customers — six
+ * short columns of pills, money and dates. These carry prose: an affiliate's
+ * name over their handle, a program, a claimant's note, "Not synced yet". Fifty
+ * rows of ragged right-aligned sentences give the eye no edge to run down. So
+ * text sits left and `.num` marks the columns that are genuinely figures, which
+ * keep the right edge and the tabular numerals that make a money column
+ * scannable.
+ *
+ * **Under 640px they stop being tables**, exactly as the portal's do. Sideways
+ * scrolling is defensible for an operator comparing forty merchants on a
+ * laptop; it is not readable on a phone, where these tables were 1,300px wide.
+ * Each row becomes a labelled block, the label coming from `data-label` on the
+ * cell so the markup stays a real table for anything reading it as one.
+ */
+.affiliate-table th,
+.affiliate-table td {
+  text-align: left;
+  /* Two pixels a side against the dashboard's tables. These carry nine columns
+     where Customers carries six, and 16px per column boundary is the difference
+     between the decide buttons landing on the page and landing past its edge. */
+  padding-left: 8px;
+  padding-right: 8px;
+}
+
+.affiliate-table th.num,
+.affiliate-table td.num {
+  text-align: right;
+}
+
+/*
+ * The identity column is capped.
+ *
+ * A myshopify domain runs to 36 characters and there is one of them on every
+ * row; uncapped, the merchant column took 300px and pushed the earnings off the
+ * right edge of a 1440px screen. Truncated it still identifies the store — the
+ * distinguishing part of a store handle is at the front — and the full string
+ * is on the cell's title and one click away on the merchant's own page.
+ */
+.affiliate-table td .customer-link {
+  max-width: 260px;
+}
+
+.affiliate-table .customer-name,
+.affiliate-table .customer-domain {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* A row of the queue is a unit of work, so it gets a little more air than a
+   row of a report — an operator is aiming at its buttons, not scanning it. */
+.affiliate-table.roomy td {
+  padding-top: 9px;
+  padding-bottom: 9px;
+}
+
+@media (max-width: 640px) {
+
+  .affiliate-table,
+  .affiliate-table tbody,
+  .affiliate-table tr,
+  .affiliate-table td {
+    display: block;
+    width: 100%;
+  }
+
+  .affiliate-table thead {
+    /* Hidden from sight, not from assistive technology. */
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+  }
+
+  .affiliate-table tbody tr {
+    padding: 10px 0;
+    border-bottom: 1px solid var(--grid);
+  }
+
+  .affiliate-table td {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: 4px 16px;
+    text-align: right;
+    padding: 4px 0;
+    border: none;
+    white-space: normal;
+  }
+
+  .affiliate-table td::before {
+    content: attr(data-label);
+    flex: none;
+    color: var(--muted);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+  }
+
+  /* The merchant or the affiliate leads the block, so it keeps its weight and
+     loses its label — nobody needs to be told a store name is a store name. */
+  .affiliate-table td:first-child:not(.claim-note) {
+    font-weight: 600;
+  }
+
+  .affiliate-table td:first-child:not(.claim-note)::before,
+  .affiliate-table td:empty {
+    display: none;
+  }
+
+  /* Two-line identity cells and the merchant state sit against the value edge
+     of their block rather than floating in the middle of it. */
+  .affiliate-table td .customer-link,
+  .affiliate-table td .merchant-state {
+    align-items: flex-end;
+    text-align: right;
+  }
+
+  /* Except the leading cell, which has no label to sit opposite: it is the
+     block's heading and reads from the left margin like one. */
+  .affiliate-table td:first-child .customer-link {
+    align-items: flex-start;
+    text-align: left;
+    max-width: 100%;
+  }
+
+  /* A note is a paragraph, not a value: it takes the line under its label and
+     is shown at length, because on a phone there is no tooltip to reach for. */
+  .affiliate-table td.claim-note {
+    text-align: left;
+    padding: 4px 0 6px;
+  }
+
+  .affiliate-table td.claim-note .claim-note-body {
+    flex-basis: 100%;
+    -webkit-line-clamp: 6;
+    line-clamp: 6;
+  }
+
+  /* Stacked, the note is already inside its claim's block, so it must not draw
+     a second divider across it. */
+  .affiliate-table tr.claim-note-row {
+    padding-top: 0;
+    border-bottom: none;
+  }
+
+  .affiliate-table tr:has(+ .claim-note-row) {
+    padding-bottom: 0;
+    border-bottom: none;
+  }
+
+  /* The decide buttons are the reason the page exists on a phone at all, so
+     they take a full-width line of their own rather than a corner. */
+  .affiliate-table td .claim-actions,
+  .affiliate-table td .channel-actions {
+    flex-basis: 100%;
+    justify-content: flex-end;
+  }
 }

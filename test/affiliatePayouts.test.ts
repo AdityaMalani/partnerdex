@@ -454,12 +454,17 @@ describe('the portal payout list', () => {
     const body = await (await get('/portal/api/payouts?limit=200', aliceCookie)).json();
     const serialized = JSON.stringify(body);
 
-    for (const forbidden of [ids.bob, ids.bobPayout, 'Bob', 'bob@example.com', 'stripe', '999']) {
+    for (const forbidden of [ids.bob, ids.bobPayout, 'Bob', 'bob@example.com', 'stripe']) {
       assert.ok(
         !serialized.includes(forbidden),
         `Alice's payouts should not mention ${forbidden}`,
       );
     }
+    // Bob's amount is checked on the parsed rows rather than the serialized
+    // body. As a bare substring `999` also matches a slice of a random UUID,
+    // which payout ids are, so the string form failed a few percent of runs on
+    // a response that was entirely correct.
+    assert.ok(body.payouts.every((row: any) => Number(row.amount) !== 999));
     assert.ok(body.payouts.every((row: any) => row.number !== '1002'));
   });
 

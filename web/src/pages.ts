@@ -32,7 +32,13 @@ export interface PageSpec {
   id: string;
   label: string;
   title: string;
-  blurb: string;
+  /**
+   * One line under the title, where the page is a report and the line says
+   * what is being measured. Working pages — a queue, a ledger, a list with its
+   * own figures at the top — leave it off: the tiles say more in less space,
+   * and a sentence between the title and them is a sentence in the way.
+   */
+  blurb?: string;
   cards: CardSpec[];
   /**
    * Metric pages are a grid of cards over a shared time window. Customers and
@@ -51,7 +57,14 @@ export interface PageSpec {
     | 'listings'
     | 'funnel'
     | 'bigquery'
-    | 'organizations';
+    | 'organizations'
+    // The affiliate program: five views over one set of source tables, none of
+    // which is a metric over the shared time window.
+    | 'affiliate-programs'
+    | 'affiliates'
+    | 'referrals'
+    | 'claims'
+    | 'payouts';
   /**
    * Which shared filters this page shows, in order.
    *
@@ -337,7 +350,6 @@ const ORGANIZATIONS: PageSpec = {
   id: 'organizations',
   label: 'Organizations',
   title: 'Organizations',
-  blurb: 'The Shopify Partner organizations this instance syncs, and how each one is doing.',
   kind: 'organizations',
   cards: [],
 };
@@ -361,9 +373,62 @@ const BIGQUERY: PageSpec = {
   cards: [],
 };
 
+/* ------------------------------------------------------------ affiliates
+ *
+ * A group of its own rather than entries under Reports: these are not reports
+ * over the shared time window but a working area — two approval queues, a
+ * ledger and two lists — and the shared filters mean nothing in it.
+ *
+ * None of the five carries a blurb. Each opens on its own figures, and the
+ * title already repeats the nav entry that was just clicked; a third statement
+ * of the same noun, set as a sentence, only pushed the tiles down the page.
+ */
+
+const AFFILIATE_PROGRAMS: PageSpec = {
+  id: 'affiliate-programs',
+  label: 'Programs',
+  title: 'Programs',
+  kind: 'affiliate-programs',
+  cards: [],
+};
+
+const AFFILIATES: PageSpec = {
+  id: 'affiliates',
+  label: 'Affiliates',
+  title: 'Affiliates',
+  kind: 'affiliates',
+  cards: [],
+};
+
+const REFERRALS: PageSpec = {
+  id: 'referrals',
+  label: 'Referrals',
+  title: 'Referrals',
+  kind: 'referrals',
+  cards: [],
+};
+
+/** Directly after Referrals, because a claim is the thing that becomes one. */
+const CLAIMS: PageSpec = {
+  id: 'claims',
+  label: 'Claims',
+  title: 'Claims',
+  kind: 'claims',
+  cards: [],
+};
+
+const PAYOUTS: PageSpec = {
+  id: 'payouts',
+  label: 'Payouts',
+  title: 'Payouts',
+  kind: 'payouts',
+  cards: [],
+};
+
 export const NAV: NavGroup[] = [
   { label: '', pages: [OVERVIEW, CUSTOMERS] },
   { label: 'Reports', pages: [REVENUE, SUBSCRIPTIONS, CHURN, FUNNEL, REVIEWS] },
+  { label: 'Affiliates', pages: [AFFILIATE_PROGRAMS, AFFILIATES, REFERRALS, CLAIMS, PAYOUTS] },
   { label: 'Settings', pages: [ORGANIZATIONS, LISTINGS, BIGQUERY, NOTIFICATIONS] },
 ];
 

@@ -80,7 +80,7 @@ export interface OpenProgram {
   /** Null means for as long as the merchant keeps paying. */
   durationMonths: number | null;
   unassignAfterUninstallDays: number | null;
-  /** True for Stoq today, false for Filemonk. Read from the program, never assumed. */
+  /** Per program, and read from the program row rather than assumed. */
   requiresApproval: boolean;
   listingUrl: string;
 }

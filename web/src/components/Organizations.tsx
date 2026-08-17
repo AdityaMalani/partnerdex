@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import {
   checkOrganization,
   createOrganization,
@@ -9,30 +9,7 @@ import {
   type OrganizationCheck,
 } from '../api';
 import { formatDateTime } from '../format';
-
-/**
- * One figure with its label: the tile this page is built out of.
- *
- * Local for now because this is its only caller; it moves somewhere shared the
- * moment a second page wants the same tile.
- */
-function Stat({
-  label,
-  value,
-  note,
-}: {
-  label: string;
-  value: string;
-  note?: ReactNode;
-}) {
-  return (
-    <div className="stat">
-      <div className="stat-label">{label}</div>
-      <div className="stat-value">{value}</div>
-      {note ? <div className="stat-note">{note}</div> : null}
-    </div>
-  );
-}
+import { Stat } from './AffiliateCommon';
 
 /**
  * The Partner organizations this instance syncs.
