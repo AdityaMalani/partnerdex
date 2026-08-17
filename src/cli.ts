@@ -145,7 +145,8 @@ async function main(): Promise<void> {
           `${result.subscriptions} subscription(s), ${result.installs} install interval(s), ` +
           `${result.customerEvents} customer event(s), ` +
           `${result.reviewEvents} review event(s), ` +
-          `${result.transactionDays} day(s) of transaction rollup.`,
+          `${result.transactionDays} day(s) of transaction rollup, ` +
+          `${result.pairs} merchant(s) rebuilt.`,
       );
       break;
     }

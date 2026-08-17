@@ -379,6 +379,9 @@ async function runSyncReported(options: SyncOptions, reporter: SyncReporter): Pr
       subscriptions: result.subscriptions,
       installs: result.installs,
       customerEvents: result.customerEvents,
+      // The work, as opposed to the totals above: how many merchants this pass
+      // actually rebuilt.
+      pairs: result.pairs,
     }),
   );
 

@@ -115,7 +115,7 @@ const ORDER: Record<string, number> = {
   RELATIONSHIP_UNINSTALLED: 10,
 };
 
-interface RawEventRow {
+export interface RawEventRow {
   app_id: string;
   shop_id: string;
   type: string;
@@ -126,7 +126,7 @@ interface RawEventRow {
   charge_currency: string | null;
 }
 
-interface SubRow {
+export interface SubRow {
   charge_id: string;
   app_id: string;
   shop_id: string;
@@ -186,8 +186,23 @@ function derivedEventId(sub: SubRow, kind: string, at: string): string {
   return `${sub.app_id}|${sub.shop_id}|${kind}|${at}|${sub.charge_id}`;
 }
 
-/** Unrecognized raw types are collected and reported, never thrown on. */
+/**
+ * Unrecognized raw types are collected and reported, never thrown on.
+ *
+ * Accumulated across a whole pass rather than per call: the compiler runs once
+ * per slice of merchants now, and reporting inside it would print the same line
+ * hundreds of times for one unmapped type.
+ */
 const unknownTypes = new Set<string>();
+
+/** Report and forget what this pass could not map. Called once, at the end. */
+export function reportUnknownEventTypes(): void {
+  if (unknownTypes.size === 0) return;
+  console.warn(
+    `[partnerdex] Skipped unmapped app event types: ${[...unknownTypes].sort().join(', ')}`,
+  );
+  unknownTypes.clear();
+}
 
 /**
  * What this subscription contributes to MRR at an instant. The gate is the
@@ -592,132 +607,203 @@ function derivedItems(sub: SubRow): TimelineItem[] {
 const PAYMENT_CHUNK = 25_000;
 
 /**
- * How far back a payment event is recompiled even though it already exists.
+ * Above this many marked transactions, compile every row instead.
  *
- * A transaction is not immutable: `insertTransactions` updates `gross_amount`,
- * `net_amount` and `shopify_fee` in place, and the sync re-reads `OVERLAP_DAYS`
- * (3) behind its watermark on every run, so a correction can land on a row that
- * was already compiled — flipping a payment to a refund, or moving the figure
- * in `detail`. Nothing older than the overlap can be rewritten, because nothing
- * older is ever re-read, and a `--full` run asks for `full` instead.
- *
- * Twice the overlap plus a day, so a run that fails and retries an hour later,
- * or a machine that was down over a weekend, still recompiles everything its
- * next sync could have corrected. Wider costs a few thousand no-op upserts per
- * sync; narrower costs a figure that is never corrected at all, so the slack
- * sits on the safe side deliberately.
+ * The marked path costs one seek per transaction and the full path costs one
+ * sequential walk of the table, so past a few hundred thousand marks the seeks
+ * lose. A first backfill marks every row it imports, so this is also what stops
+ * the initial build from taking the slow road.
  */
-const PAYMENT_RECHECK_DAYS = 7;
-
-const MS_PER_DAY = 86_400_000;
+const FULL_REBUILD_MARK_THRESHOLD = 250_000;
 
 /**
- * The payment half of the table, compiled from transactions in id order.
+ * The one way a compiled event reaches the table, shared by both halves.
+ *
+ * Every non-key column is refreshed, not a chosen subset. A compiled event is a
+ * pure function of the raw rows behind it, so if those are corrected the event
+ * has to move with them; no column here may keep an older reading than its
+ * neighbours.
+ *
+ * The narrower list this replaces updated the type and net_change but not the
+ * amount or the currency. That was harmless for exactly as long as the table was
+ * emptied before every insert: nothing conflicted, so the clause never ran.
+ * Rebuilding one merchant at a time makes the conflict the normal case for the
+ * lifecycle half too, and a sale restated at a different gross would have
+ * updated a row's type while leaving the money on it stale.
+ */
+export const CUSTOMER_EVENT_UPSERT = `INSERT INTO customer_events (
+     event_id, app_id, shop_id, type, occurred_at, charge_id, prev_charge_id,
+     plan_name, plan_amount, billing_interval, currency, net_change, amount,
+     suppressed, detail
+   ) VALUES (
+     @event_id, @app_id, @shop_id, @type, @occurred_at, @charge_id, @prev_charge_id,
+     @plan_name, @plan_amount, @billing_interval, @currency, @net_change, @amount,
+     @suppressed, @detail
+   )
+   ON CONFLICT(event_id) DO UPDATE SET
+     app_id = excluded.app_id,
+     shop_id = excluded.shop_id,
+     type = excluded.type,
+     occurred_at = excluded.occurred_at,
+     charge_id = excluded.charge_id,
+     prev_charge_id = excluded.prev_charge_id,
+     plan_name = excluded.plan_name,
+     plan_amount = excluded.plan_amount,
+     billing_interval = excluded.billing_interval,
+     currency = excluded.currency,
+     net_change = excluded.net_change,
+     amount = excluded.amount,
+     suppressed = excluded.suppressed,
+     detail = excluded.detail`;
+
+/**
+ * Record that a transaction's payment event has to be compiled or recompiled.
+ *
+ * Called on every write, not only on writes that changed a figure, for the
+ * reason `transaction_daily_dirty` gives: telling a restatement that moved money
+ * from one that did not would mean reading the old row back, recompiling a row
+ * that turned out to be unchanged is one upsert, and missing one that did change
+ * is a figure that is never corrected at all.
+ */
+export function markTransactionEvents(db: Db, ids: Iterable<string>): void {
+  const statement = db.prepare(
+    'INSERT OR IGNORE INTO transaction_events_dirty (id) VALUES (?)',
+  );
+  for (const id of ids) statement.run(id);
+}
+
+/**
+ * The payment half of the table, compiled from the transactions that moved.
  *
  * Returns how many events were written, not how many exist: in the steady state
  * this pass touches only the handful of transactions the sync just brought in.
  *
- * `full` forces every transaction to be recompiled. It is what `rebuild` and
- * `sync --full` ask for — the two commands whose job is to distrust what is
- * already stored — and it costs one pass over the table rather than one row.
+ * **How it finds its work.** A transaction is not immutable — `insertTransactions`
+ * updates `gross_amount`, `net_amount` and `shopify_fee` in place, and the sync
+ * re-reads behind its watermark on every run — so a correction can land on a row
+ * that was already compiled, flipping a payment to a refund or moving the figure
+ * in `detail`. Every write therefore marks its id in `transaction_events_dirty`,
+ * insert and correction alike, and this compiles exactly what is marked.
+ *
+ * What that replaces was a walk of the *whole* table asking `customer_events`
+ * whether each row had been compiled yet, widened by a rolling recheck window
+ * for the corrections that walk could not see. At a few million transactions
+ * that is a few million index probes on every sync to discover a few hundred
+ * rows, and it was the single most expensive thing in this file.
+ *
+ * `full` forces every transaction to be recompiled, and so does a mark set large
+ * enough that seeking to each one would cost more than one sequential pass. It
+ * is what `rebuild` and `sync --full` ask for — the two commands whose job is to
+ * distrust what is already stored — and what a first backfill gets for free.
  */
-function rebuildPaymentEvents(
-  db: Db,
-  statement: ReturnType<Db['prepare']>,
-  full: boolean,
-): number {
-  const recheckFrom = new Date(Date.now() - PAYMENT_RECHECK_DAYS * MS_PER_DAY).toISOString();
-
-  /*
-   * Keyset pagination on the primary key rather than LIMIT/OFFSET, which would
-   * re-walk the whole prefix for every chunk and turn one pass into a quadratic
-   * one. `transactions` is WITHOUT ROWID on `id`, so `id > @after ORDER BY id`
-   * is a seek into the table's own b-tree and each chunk resumes exactly where
-   * the last stopped.
-   */
-  const select = db.prepare(
-    `SELECT t.id, t.type, t.app_id, t.shop_id, t.charge_ref, t.created_at,
-            t.gross_amount, t.net_amount, t.currency
-       FROM transactions t
-      WHERE t.id > @after
-        AND t.shop_id <> '' AND t.gross_amount <> 0
-        AND (@full = 1
-             OR t.created_at >= @recheckFrom
-             OR NOT EXISTS (
-                  SELECT 1 FROM customer_events c WHERE c.event_id = 'tx|' || t.id
-                ))
-      ORDER BY t.id
-      LIMIT @chunk`,
-  );
+export function rebuildPaymentEvents(db: Db, full: boolean): number {
+  const statement = db.prepare(CUSTOMER_EVENT_UPSERT);
+  const marked = (
+    db.prepare('SELECT COUNT(*) AS n FROM transaction_events_dirty').get() as { n: number }
+  ).n;
+  const sequential = full || marked > FULL_REBUILD_MARK_THRESHOLD;
 
   const write = db.transaction((rows: CleanEvent[]) => {
     for (const row of rows) statement.run(row);
   });
 
-  let after = '';
   let written = 0;
 
-  for (;;) {
-    const batch = select.all({
-      after,
-      full: full ? 1 : 0,
-      recheckFrom,
-      chunk: PAYMENT_CHUNK,
-    }) as TransactionRow[];
-    if (batch.length === 0) break;
+  if (sequential) {
+    /*
+     * Keyset pagination on the primary key rather than LIMIT/OFFSET, which would
+     * re-walk the whole prefix for every chunk and turn one pass into a
+     * quadratic one. `transactions` is WITHOUT ROWID on `id`, so
+     * `id > @after ORDER BY id` is a seek into the table's own b-tree and each
+     * chunk resumes exactly where the last stopped.
+     */
+    const select = db.prepare(
+      `SELECT t.id, t.type, t.app_id, t.shop_id, t.charge_ref, t.created_at,
+              t.gross_amount, t.net_amount, t.currency
+         FROM transactions t
+        WHERE t.id > @after AND t.shop_id <> '' AND t.gross_amount <> 0
+        ORDER BY t.id
+        LIMIT @chunk`,
+    );
 
+    let after = '';
+    for (;;) {
+      const batch = select.all({ after, chunk: PAYMENT_CHUNK }) as TransactionRow[];
+      if (batch.length === 0) break;
+      const events: CleanEvent[] = [];
+      paymentEvents(batch, events);
+      write(events);
+      written += events.length;
+      after = batch[batch.length - 1]!.id;
+    }
+
+    db.prepare('DELETE FROM transaction_events_dirty').run();
+    return written;
+  }
+
+  /*
+   * The marked path. Marks are dropped in the same transaction that writes the
+   * events they asked for, so a pass that dies half way leaves the rest of the
+   * work claimed and the next pass finishes it.
+   */
+  const take = db.prepare('SELECT id FROM transaction_events_dirty ORDER BY id LIMIT ?');
+  const select = db.prepare(
+    `SELECT t.id, t.type, t.app_id, t.shop_id, t.charge_ref, t.created_at,
+            t.gross_amount, t.net_amount, t.currency
+       FROM transactions t
+      WHERE t.id = ? AND t.shop_id <> '' AND t.gross_amount <> 0`,
+  );
+  const clear = db.prepare('DELETE FROM transaction_events_dirty WHERE id = ?');
+  /*
+   * A marked transaction that no longer qualifies had an event and must lose it.
+   * A sale refunded to a gross of zero is the case: the row stays in the ledger,
+   * the filter above stops matching it, and without this its payment event would
+   * outlive the payment. Cheap — one delete per mark that found nothing, which
+   * in the ordinary sync is none of them.
+   */
+  const drop = db.prepare(`DELETE FROM customer_events WHERE event_id = 'tx|' || ?`);
+
+  for (;;) {
+    const ids = (take.all(PAYMENT_CHUNK) as Array<{ id: string }>).map((row) => row.id);
+    if (ids.length === 0) break;
+
+    const rows: TransactionRow[] = [];
+    const gone: string[] = [];
+    for (const id of ids) {
+      const row = select.get(id) as TransactionRow | undefined;
+      if (row) rows.push(row);
+      else gone.push(id);
+    }
     const events: CleanEvent[] = [];
-    paymentEvents(batch, events);
-    write(events);
+    paymentEvents(rows, events);
+
+    db.transaction(() => {
+      for (const event of events) statement.run(event);
+      for (const id of gone) drop.run(id);
+      for (const id of ids) clear.run(id);
+    })();
 
     written += events.length;
-    after = batch[batch.length - 1]!.id;
   }
 
   return written;
 }
 
 /**
- * Compile the clean event feed.
+ * Compile the lifecycle half of the clean event feed for one slice of merchants.
  *
- * Two halves, rebuilt differently on purpose. The lifecycle half is small — one
- * row per install and per subscription movement — and every row of it can move
- * when a late correction lands, so it is dropped and rebuilt in one atomic
- * transaction exactly as before. The payment half is one row per transaction,
- * millions of them, and each row depends on nothing but the transaction it was
- * compiled from; rewriting all of it every five minutes was the single most
- * expensive thing this process did.
+ * Pure, and that is the point: every input is an argument, so "a merchant is a
+ * rebuildable unit" is a property that can be read off the signature rather than
+ * trusted. `subs` are that slice's subscription rows as `derive.ts` has just
+ * derived them — not read back out of the table — which makes the ordering
+ * dependency on the subscription index explicit instead of a comment.
  *
- * The trade the chunking makes: the payment half is no longer replaced
- * atomically, so a reader during a rebuild can see a customer's timeline with
- * the newest payments missing. In the steady state that window is milliseconds
- * wide and holds events the reader could not have seen a moment earlier anyway,
- * which is a far smaller cost than the process being killed mid-rebuild and the
- * table never being built at all.
+ * The payment half is not here. A payment event is a pure function of the one
+ * transaction it was compiled from, so it is repaired per transaction rather
+ * than per merchant; see `rebuildPaymentEvents`.
  */
-export function buildCustomerEvents(db: Db, options: { full?: boolean } = {}): number {
-  unknownTypes.clear();
-
-  const subs = db
-    .prepare(
-      `SELECT charge_id, app_id, shop_id, plan_name, currency, billing_interval,
-              monthly_amount, activated_at, conversion_at, churn_at, churn_reason,
-              trial_started_at, trial_ends_at, trial_status, is_plan_change
-       FROM subscriptions
-       WHERE is_test = 0 AND shop_id <> ''`,
-    )
-    .all() as SubRow[];
-
+export function compileLifecycle(subs: SubRow[], raw: RawEventRow[]): CleanEvent[] {
   const subsByCharge = new Map(subs.map((sub) => [sub.charge_id, sub]));
-
-  const raw = db
-    .prepare(
-      `SELECT app_id, shop_id, type, occurred_at, charge_id, charge_name,
-              charge_amount, charge_currency
-       FROM app_events
-       WHERE shop_id <> '' AND charge_test = 0`,
-    )
-    .all() as RawEventRow[];
 
   // Build one timeline per install, merging the feed with the derived
   // movements, so a single ordered fold sees every change in sequence.
@@ -752,64 +838,5 @@ export function buildCustomerEvents(db: Db, options: { full?: boolean } = {}): n
     foldInstall(items, events);
   }
 
-  if (unknownTypes.size > 0) {
-    console.warn(
-      `[partnerdex] Skipped unmapped app event types: ${[...unknownTypes].sort().join(', ')}`,
-    );
-  }
-
-  const statement = db.prepare(
-    `INSERT INTO customer_events (
-       event_id, app_id, shop_id, type, occurred_at, charge_id, prev_charge_id,
-       plan_name, plan_amount, billing_interval, currency, net_change, amount,
-       suppressed, detail
-     ) VALUES (
-       @event_id, @app_id, @shop_id, @type, @occurred_at, @charge_id, @prev_charge_id,
-       @plan_name, @plan_amount, @billing_interval, @currency, @net_change, @amount,
-       @suppressed, @detail
-     )
-     -- Every non-key column is refreshed, not a chosen subset. A compiled event
-     -- is a pure function of the raw rows behind it, so if those are corrected
-     -- the event has to move with them; no column here may keep an older
-     -- reading than its neighbours.
-     --
-     -- The narrower list this replaces updated the type and net_change but not
-     -- the amount or the currency. That was harmless for exactly as long as the
-     -- table was emptied before every insert: nothing conflicted, so the clause
-     -- never ran. Chunking the rebuild let payment rows survive between passes,
-     -- which promoted this from dead code to the only path a corrected
-     -- transaction can take — and a sale restated at a different gross would
-     -- have updated the row's type while leaving the money on it stale.
-     ON CONFLICT(event_id) DO UPDATE SET
-       app_id = excluded.app_id,
-       shop_id = excluded.shop_id,
-       type = excluded.type,
-       occurred_at = excluded.occurred_at,
-       charge_id = excluded.charge_id,
-       prev_charge_id = excluded.prev_charge_id,
-       plan_name = excluded.plan_name,
-       plan_amount = excluded.plan_amount,
-       billing_interval = excluded.billing_interval,
-       currency = excluded.currency,
-       net_change = excluded.net_change,
-       amount = excluded.amount,
-       suppressed = excluded.suppressed,
-       detail = excluded.detail`,
-  );
-
-  /*
-   * The lifecycle rows only. Deleting the payment rows here too would throw
-   * away the very work the incremental pass below exists to avoid, and they
-   * cannot go stale on their own: a payment event is a pure function of a
-   * transaction row, and `rebuildPaymentEvents` re-derives every row that could
-   * still be moving.
-   */
-  const write = db.transaction((rows: CleanEvent[]) => {
-    db.prepare(`DELETE FROM customer_events WHERE type NOT IN ('payment', 'refund')`).run();
-    for (const row of rows) statement.run(row);
-  });
-
-  write(events);
-
-  return events.length + rebuildPaymentEvents(db, statement, options.full ?? false);
+  return events;
 }

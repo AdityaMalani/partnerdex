@@ -706,19 +706,29 @@ describe('customer events: compiling payments without rewriting them', () => {
     assert.equal(paymentEvent(id)?.type, 'refund');
   });
 
-  /** The lifecycle half is still replaced wholesale, every time. */
-  it('rebuilds lifecycle events wholesale even on an incremental pass', () => {
+  /**
+   * The lifecycle half is rebuilt per merchant now, so an incremental pass
+   * leaves a merchant nothing has happened to exactly as it found it — and a
+   * `--full` pass, which is what `rebuild` asks for, rewrites it anyway.
+   */
+  it('leaves a merchant alone when nothing marked it, and rewrites it on a full pass', () => {
     seedOne();
+    const sentinel = () =>
+      (
+        getDb()
+          .prepare(`SELECT detail FROM customer_events WHERE type = 'subscribed'`)
+          .get() as { detail: string | null }
+      ).detail;
+
     getDb()
       .prepare(`UPDATE customer_events SET detail = 'sentinel' WHERE type = 'subscribed'`)
       .run();
 
     rebuildDerivedTables(getDb());
+    assert.equal(sentinel(), 'sentinel');
 
-    const row = getDb()
-      .prepare(`SELECT detail FROM customer_events WHERE type = 'subscribed'`)
-      .get() as { detail: string | null };
-    assert.notEqual(row.detail, 'sentinel');
+    rebuildDerivedTables(getDb(), { full: true });
+    assert.notEqual(sentinel(), 'sentinel');
   });
 });
 

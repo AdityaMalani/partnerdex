@@ -288,6 +288,138 @@ CREATE TABLE IF NOT EXISTS stock_daily_seen (
   PRIMARY KEY (kind, id)
 ) WITHOUT ROWID;
 
+-- ---------------------------------------------------------------------------
+-- The charge index: what makes the three derived subscription tables
+-- rebuildable one merchant at a time.
+--
+-- \`subscriptions\`, \`install_intervals\` and \`customer_events\` are
+-- reconstructions rather than sums. A subscription's life, an install's span and
+-- a lifecycle timeline are all produced by walking one merchant's events in
+-- order, so the unit that can be invalidated is not a day — it is an
+-- (app_id, shop_id) pair. Rebuilding one pair needs three things that a pair
+-- cannot supply on its own, and the tables below are those three things,
+-- maintained beside the pair so the rebuild never has to read the whole ledger
+-- to find them.
+
+-- The settled-sale aggregate per charge, lifted out of \`transactions\`.
+--
+-- \`buildSubscriptions\` needs, for each charge, when it first and last settled,
+-- how many times, and what cadence the sale stated. Computing that inline is a
+-- GROUP BY over every transaction ever ingested — millions of rows to answer a
+-- question about the handful of charges a sync actually touched. Here it is a
+-- table with one row per charge, and a sync recomputes only the charges whose
+-- money moved.
+--
+-- Restatement-safe by the same rule as \`transaction_daily\`: a dirty charge is
+-- recomputed from the raw rows rather than adjusted, so a correction applied
+-- twice lands where applying it once lands, and a sale that disappears takes its
+-- contribution with it.
+CREATE TABLE IF NOT EXISTS charge_sales (
+  charge_ref       TEXT PRIMARY KEY,
+  first_sale_at    TEXT NOT NULL,
+  last_sale_at     TEXT NOT NULL,
+  paid_sale_count  INTEGER NOT NULL DEFAULT 0,
+  billing_interval TEXT
+) WITHOUT ROWID;
+
+-- Which charges owe a recomputation of the aggregate above.
+--
+-- Written by the ingest for every \`AppSubscriptionSale\` it writes, insert and
+-- correction alike, for the reason \`transaction_daily_dirty\` gives: telling a
+-- restatement that moved money from one that did not would mean reading the old
+-- row back, and missing one is wrong forever. Only that one type is marked
+-- because it is the only type the aggregate reads; a usage sale carries its own
+-- unique charge ref and would mark tens of thousands of charges per sync that
+-- no subscription has ever heard of.
+CREATE TABLE IF NOT EXISTS charge_sales_dirty (
+  charge_ref TEXT PRIMARY KEY
+) WITHOUT ROWID;
+
+-- The raw charge dimension, folded out of \`app_events\` one row per charge.
+--
+-- The same GROUP BY \`buildSubscriptions\` used to run over the whole event feed
+-- on every sync, kept instead, so a pass reads the charges of the merchants it
+-- is rebuilding and nothing else. Every column here is a fact the feed stated;
+-- nothing on this table is derived, which is what lets the price book below be
+-- computed from it without a circular dependency on \`subscriptions\`.
+--
+-- \`billing_on\` and \`canceled_at\` are carried even though \`subscriptions\` does
+-- not store them: the first is the only clock-sensitive input the derivation has
+-- (see \`derive.ts\`), and the second is what the churn resolution starts from.
+CREATE TABLE IF NOT EXISTS charge_facts (
+  charge_id    TEXT PRIMARY KEY,
+  charge_ref   TEXT NOT NULL DEFAULT '',
+  app_id       TEXT NOT NULL,
+  shop_id      TEXT NOT NULL DEFAULT '',
+  plan_name    TEXT,
+  amount       REAL,
+  currency     TEXT,
+  is_test      INTEGER NOT NULL DEFAULT 0,
+  accepted_at  TEXT,
+  activated_at TEXT,
+  canceled_at  TEXT,
+  frozen_at    TEXT,
+  unfrozen_at  TEXT,
+  billing_on   TEXT
+) WITHOUT ROWID;
+
+-- The pair lookup is the hot one: every rebuilt merchant reads its charges
+-- through it.
+CREATE INDEX IF NOT EXISTS idx_charge_facts_pair ON charge_facts (app_id, shop_id);
+-- A sale names a charge ref, and the pair it belongs to has to be found from it.
+CREATE INDEX IF NOT EXISTS idx_charge_facts_ref ON charge_facts (charge_ref);
+-- The clock sweep: which charges crossed their next billing date since the last
+-- pass. Without this it is a scan of every charge on every sync.
+CREATE INDEX IF NOT EXISTS idx_charge_facts_billing ON charge_facts (billing_on);
+
+-- The cadence learned per price point — the one input to the derivation that is
+-- not local to a merchant.
+--
+-- \`resolveInterval\` falls back to "what cadence has this app's <plan, price>
+-- been billed at elsewhere", which reads across every shop of the app. That is
+-- the single reason a per-merchant rebuild is not obviously sound, so the book
+-- is stored rather than recomputed in memory: a sync compares the book it just
+-- computed against this one and marks every merchant holding a charge at a price
+-- point whose answer moved. A book that did not move invalidates nobody.
+--
+-- \`key\` is \`priceKey()\`'s string verbatim, built by the same function on both
+-- sides, so a stored key and a fresh one cannot disagree about rounding.
+CREATE TABLE IF NOT EXISTS price_book (
+  key              TEXT PRIMARY KEY,
+  billing_interval TEXT NOT NULL
+) WITHOUT ROWID;
+
+-- Which transactions owe a payment event.
+--
+-- The payment half of \`customer_events\` is not a per-merchant reconstruction at
+-- all: one row per transaction, each a pure function of the transaction it was
+-- compiled from. It was already repaired incrementally, but the way it found its
+-- work was a walk of every transaction ever ingested asking the event table
+-- whether each one had been compiled yet — millions of index probes per sync to
+-- discover the few hundred rows that had actually moved.
+--
+-- The ingest knows. Every write marks its id here, insert and correction alike,
+-- and the sync compiles exactly what is marked. Above a threshold the marks are
+-- abandoned for one sequential pass, which is what stops a first backfill taking
+-- the slow road one seek at a time.
+CREATE TABLE IF NOT EXISTS transaction_events_dirty (
+  id TEXT PRIMARY KEY
+) WITHOUT ROWID;
+
+-- The merchants the derived tables owe a rebuild.
+--
+-- The durable work list, and the whole recovery story. Every step that discovers
+-- a pair commits it here *before* doing anything that depends on having
+-- discovered it, and the rebuild deletes a pair's mark in the same transaction
+-- that rewrites the pair's rows. A pass that dies half way therefore leaves
+-- exactly the merchants it did not finish still marked, and the next pass
+-- finishes them; there is no state in which a merchant is quietly wrong.
+CREATE TABLE IF NOT EXISTS derive_dirty_pairs (
+  app_id  TEXT NOT NULL,
+  shop_id TEXT NOT NULL,
+  PRIMARY KEY (app_id, shop_id)
+) WITHOUT ROWID;
+
 -- One row per subscription charge, rebuilt from app_events + transactions.
 -- monthly_amount is the write-time normalized figure that MRR sums.
 CREATE TABLE IF NOT EXISTS subscriptions (
