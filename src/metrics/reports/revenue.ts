@@ -22,7 +22,7 @@ interface MrrComponents {
 }
 
 function mrrComponents(context: MetricContext, buckets: Bucket[]): MrrComponents {
-  const stock = stockSeries(context.db, buckets, context.asOf);
+  const stock = stockSeries(context.db, buckets, context.asOf, context.window.timeZone);
   const byIndex = new Map(stock.map((point) => [point.idx, point]));
   const usage = context.includeUsage
     ? usageSeries(context.db, buckets, context.appIds, context.window.timeZone)
@@ -138,7 +138,7 @@ const MAX_APP_SERIES = 4;
  */
 export function mrrByAppReport(context: MetricContext): MetricResponse {
   const buckets = context.window.buckets;
-  const points = stockSeriesByApp(context.db, buckets, context.asOf);
+  const points = stockSeriesByApp(context.db, buckets, context.asOf, context.window.timeZone);
 
   const totalByApp = new Map<string, number>();
   const nameByApp = new Map<string, string>();

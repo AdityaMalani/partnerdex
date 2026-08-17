@@ -155,6 +155,139 @@ CREATE TABLE IF NOT EXISTS transaction_daily_dirty (
   day TEXT PRIMARY KEY
 ) WITHOUT ROWID;
 
+-- ---------------------------------------------------------------------------
+-- The subscription-side rollups.
+--
+-- \`transaction_daily\` above rolls up a *flow*: a day's row is a sum of things
+-- that happened inside the day, and a window is a sum of days. MRR is not that.
+-- It is a *stock* — "which subscriptions were live at this instant" — and a
+-- stock is not a sum of anything, so the same table shape cannot carry it.
+--
+-- A stock's rollup is therefore a snapshot rather than a subtotal: one row per
+-- day recording the population as it stood at the instant that day opened. The
+-- two tables below are those snapshots. Their day keys mean the same thing
+-- \`transaction_daily\`'s do — a calendar date in REPORTING_TIMEZONE — but the
+-- row is read at \`dayKeyStart(day)\` instead of summed over \`[day, day+1)\`.
+--
+-- The consequence, which is the whole design: a snapshot can only answer an
+-- instant it actually holds. Bucket boundaries are local midnights, so the
+-- interior boundaries of every window land exactly on a snapshot; the final
+-- bucket ends at *now*, which does not, and falls back to the raw tables. See
+-- \`metrics/stockRollup.ts\`.
+
+-- The live subscription population at the midnight opening \`day\`.
+--
+-- \`gate\` is the as-of flag that cannot be answered by summing columns, so the
+-- table keys on it instead. \`includeTrials\` swaps the predicate's gate from the
+-- first paid charge to activation, which selects a *different population* — not
+-- a superset and not a subset of the other, since a subscription's two gate
+-- instants can straddle any given midnight. Two rows per day is the honest
+-- shape; one row plus an adjustment would be a rollup that quietly answers one
+-- flag combination when asked about another.
+--   0 = gated on conversion_at (includeTrials = false)
+--   1 = gated on activated_at  (includeTrials = true)
+--
+-- \`includeAnnual\`, by contrast, *is* answerable by columns, because it is a
+-- filter on a row attribute rather than a change of predicate: the annual and
+-- non-annual halves are stored apart and the reader adds the ones it wants.
+--
+-- Subscriber counts are stored twice for the reason the split cannot cover:
+-- \`COUNT(DISTINCT shop)\` is not additive across the annual/non-annual split.
+-- One shop holding both an annual and a monthly charge is one subscriber in the
+-- total and would be two if the halves were added. It *is* additive across
+-- \`app_id\`, because a subscriber is a shop-and-app pair, so no third column is
+-- needed for the per-app scopes.
+CREATE TABLE IF NOT EXISTS subscription_daily (
+  day                 TEXT NOT NULL,
+  gate                INTEGER NOT NULL,
+  app_id              TEXT NOT NULL,
+  monthly_mrr         REAL NOT NULL DEFAULT 0,
+  annual_mrr          REAL NOT NULL DEFAULT 0,
+  monthly_subs        INTEGER NOT NULL DEFAULT 0,
+  annual_subs         INTEGER NOT NULL DEFAULT 0,
+  subscribers_all     INTEGER NOT NULL DEFAULT 0,
+  subscribers_monthly INTEGER NOT NULL DEFAULT 0,
+  -- \`day\` leads because every read is a set of days; \`gate\` next because every
+  -- read pins exactly one. No secondary index: a day's rows are a handful.
+  PRIMARY KEY (day, gate, app_id)
+) WITHOUT ROWID;
+
+-- The stocks that no as-of flag touches, at the same midnights.
+--
+-- Active installs read \`install_intervals\` and trials read \`trial_started_at\` /
+-- \`trial_ends_at\`; neither predicate mentions \`includeAnnual\` or
+-- \`includeTrials\`, so keying these on \`gate\` would store the same number twice
+-- and invite a reader to add them. They live beside \`subscription_daily\`
+-- rather than inside it for exactly that reason.
+CREATE TABLE IF NOT EXISTS population_daily (
+  day             TEXT NOT NULL,
+  app_id          TEXT NOT NULL,
+  active_installs INTEGER NOT NULL DEFAULT 0,
+  on_trial        INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (day, app_id)
+) WITHOUT ROWID;
+
+-- Lifecycle movement per day: the flow half of logo churn.
+--
+-- This one *is* a \`transaction_daily\`-shaped rollup, because uninstalls and
+-- reinstalls inside a window are a flow. It exists because \`customer_events\` is
+-- the largest table in the database and logo churn crosses it once per bucket
+-- with a rolling window, so twelve buckets read a month of it twelve times over.
+--
+-- Only \`suppressed = 0\` rows are counted, which is the filter every default
+-- read applies; a suppressed event is a cancellation that turned out to be half
+-- of a plan change, and it is excluded from the rollup for the same reason it is
+-- excluded from the query the rollup replaces.
+CREATE TABLE IF NOT EXISTS customer_event_daily (
+  day         TEXT NOT NULL,
+  app_id      TEXT NOT NULL,
+  type        TEXT NOT NULL,
+  event_count INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (day, type, app_id)
+) WITHOUT ROWID;
+
+-- The watermark the snapshot tables are repaired from.
+--
+-- A flow rollup's dirty mark is a *day*: a transaction that arrives late changes
+-- its own day and no other. A snapshot's is a *floor*: a cancellation backdated
+-- to March changes the live population at every midnight from March until now,
+-- because the subscription is absent from all of them and was present before.
+-- So this table is drained as \`MIN(day)\` and everything from there forward is
+-- recomputed, rather than day by day.
+--
+-- In the ordinary case the floor is yesterday and the repair is two days wide.
+-- A deep restatement widens it, and a restatement older than the table is a full
+-- rebuild — which is the correct amount of work, not a fallback.
+CREATE TABLE IF NOT EXISTS stock_daily_dirty (
+  day TEXT PRIMARY KEY
+) WITHOUT ROWID;
+
+-- What the snapshot builder last saw, so it can tell what changed.
+--
+-- \`subscriptions\` and \`install_intervals\` are rebuilt wholesale by every sync:
+-- they are DELETEd and reinserted, so "which rows changed" is not something the
+-- writer can report without either an upsert path it does not have or a
+-- comparison it does not do. This table is that comparison, kept where it is
+-- used. One row per source row, holding a digest of the fields the snapshots
+-- actually depend on and the earliest instant that row can affect.
+--
+-- Digesting only the load-bearing fields is deliberate: a plan being renamed
+-- moves no snapshot, and marking it dirty would recompute history for nothing.
+-- Every field the as-of predicate or the snapshot's SUMs read is in the digest,
+-- so the converse — a change that moves a number and is not noticed — cannot
+-- happen.
+--
+-- \`kind\` separates the two sources into one table because they are drained
+-- together into one watermark and never queried apart.
+CREATE TABLE IF NOT EXISTS stock_daily_seen (
+  kind   TEXT NOT NULL,
+  id     TEXT NOT NULL,
+  digest TEXT NOT NULL,
+  -- The earliest instant a change to this row can move a snapshot.
+  since  TEXT NOT NULL,
+  PRIMARY KEY (kind, id)
+) WITHOUT ROWID;
+
 -- One row per subscription charge, rebuilt from app_events + transactions.
 -- monthly_amount is the write-time normalized figure that MRR sums.
 CREATE TABLE IF NOT EXISTS subscriptions (
