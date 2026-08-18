@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# A superseded run tells you nothing. Cancel it — the stacked PRs get rebased
+# often, and each rebase would otherwise queue a run against a commit no longer
+# at the head of the branch.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Read-only. `pull_request` already runs fork code without repository secrets;
+# this makes the token itself powerless as well.
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: typecheck + test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Node 20 to match the Dockerfile's `node:20-slim`, so CI exercises the
+      # runtime that actually ships rather than whichever version is current.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      # `npm ci` rather than `npm install`: it installs the lockfile exactly and
+      # fails if package.json and the lock have drifted apart.
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      # The suite sets every environment variable it needs in test/helpers.ts
+      # and runs against an in-memory database, so it needs no secrets and no
+      # .env file. Verified by running it with .env moved aside.
+      - name: Test
+        run: npm test
