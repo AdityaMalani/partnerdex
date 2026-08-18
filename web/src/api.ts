@@ -44,6 +44,8 @@ export type Overview = Record<string, MetricResponse>;
 export interface AppSummary {
   id: string;
   name: string;
+  /** The Partner organization the app was synced from. Labelling only. */
+  orgId?: string;
 }
 
 /** The background sync loop's own account of itself. */
@@ -56,22 +58,47 @@ export interface SyncStatus {
   lastError: string | null;
   consecutiveFailures: number;
   nextRunAt: string | null;
+  /** The phase in flight, and since when. Null between runs. */
+  phase: string | null;
+  phaseOrg: string | null;
+  phaseStartedAt: string | null;
+  /** The newest detail line the run has produced. */
+  lastMessage: string | null;
+  lastMessageAt: string | null;
+  /** Where the last failure happened, which `lastError` alone never said. */
+  lastErrorPhase: string | null;
+  lastErrorOrg: string | null;
+  lastErrorAt: string | null;
+  lastDurationMs: number | null;
 }
 
 export interface Status {
-  apps: number;
-  shops: number;
-  events: number;
-  transactions: number;
-  subscriptions: number;
-  customerEvents: number;
+  /*
+   * The row counts, present only when `?counts=1` was asked for. Optional in the
+   * type because they are optional on the wire — declaring them required is how
+   * a reader ends up treating an absent count as a zero.
+   */
+  apps?: number;
+  shops?: number;
+  events?: number;
+  transactions?: number;
+  subscriptions?: number;
+  customerEvents?: number;
   lastSyncAt: string | null;
+  /** Whether the store holds anything. Always sent, and cheap. */
+  hasData: boolean;
   sync: SyncStatus;
 }
 
 export interface QueryState {
   period: string;
   appId: string;
+  /**
+   * The organization every figure is scoped to. Empty means all of them, which
+   * is the default and the behaviour of every dashboard that predates this
+   * selector.
+   */
+  orgId: string;
   includeUsage: boolean;
   includeTrials: boolean;
   /** A single star rating for the review reports; 0 means every rating. */
@@ -98,6 +125,12 @@ export function toSearchParams(query: QueryState): URLSearchParams {
   // No `end` either: the dashboard always reads as of now. The server still
   // honours the parameter, so an as-of reconstruction stays available to
   // anything calling the API directly.
+  //
+  // The app and the organization are both sent when both are set. The server
+  // resolves the organization to a set of app ids and then checks the named app
+  // against it, so an app that is not in the selected organization is a 403
+  // rather than a silently empty chart.
+  if (query.orgId) params.set('orgId', query.orgId);
   if (query.appId) params.set('appIds', query.appId);
   if (query.rating) params.set('rating', String(query.rating));
   return params;
@@ -152,8 +185,8 @@ export const fetchOverview = (query: QueryState, metrics: string[]): Promise<Ove
   return getJson<Overview>(`/api/overview?${params.toString()}`);
 };
 
-export const fetchApps = (): Promise<{ apps: AppSummary[] }> =>
-  getJson<{ apps: AppSummary[] }>('/api/apps');
+export const fetchApps = (orgId = ''): Promise<{ apps: AppSummary[] }> =>
+  getJson<{ apps: AppSummary[] }>(`/api/apps${orgId ? `?orgId=${encodeURIComponent(orgId)}` : ''}`);
 
 export const fetchStatus = (): Promise<Status> => getJson<Status>('/api/status');
 
@@ -280,8 +313,10 @@ export const fetchCustomers = (options: {
   limit?: number;
   offset?: number;
   appId?: string;
+  orgId?: string;
 }): Promise<CustomerListResult> => {
   const params = new URLSearchParams();
+  if (options.orgId) params.set('orgId', options.orgId);
   if (options.search) params.set('q', options.search);
   if (options.sort) params.set('sort', options.sort);
   if (options.limit) params.set('limit', String(options.limit));
@@ -290,8 +325,13 @@ export const fetchCustomers = (options: {
   return getJson<CustomerListResult>(`/api/customers?${params.toString()}`);
 };
 
-export const fetchCustomer = (shopId: string, appId = ''): Promise<CustomerDetail> => {
+export const fetchCustomer = (
+  shopId: string,
+  appId = '',
+  orgId = '',
+): Promise<CustomerDetail> => {
   const params = new URLSearchParams();
+  if (orgId) params.set('orgId', orgId);
   if (appId) params.set('appIds', appId);
   const query = params.toString();
   return getJson<CustomerDetail>(
@@ -355,6 +395,7 @@ export interface ReviewCandidate {
 export const fetchReviews = (options: {
   search?: string;
   appId?: string;
+  orgId?: string;
   rating?: number | null;
   status?: string;
   linked?: string;
@@ -363,6 +404,7 @@ export const fetchReviews = (options: {
   offset?: number;
 }): Promise<ReviewListResult> => {
   const params = new URLSearchParams();
+  if (options.orgId) params.set('orgId', options.orgId);
   if (options.search) params.set('q', options.search);
   if (options.appId) params.set('appIds', options.appId);
   if (options.rating) params.set('rating', String(options.rating));
@@ -493,15 +535,19 @@ export interface FunnelApp {
   hasTraffic: boolean;
 }
 
-export const fetchFunnelApps = (): Promise<{ apps: FunnelApp[] }> =>
-  getJson<{ apps: FunnelApp[] }>('/api/funnel/apps');
+export const fetchFunnelApps = (orgId = ''): Promise<{ apps: FunnelApp[] }> =>
+  getJson<{ apps: FunnelApp[] }>(
+    `/api/funnel/apps${orgId ? `?orgId=${encodeURIComponent(orgId)}` : ''}`,
+  );
 
 export const fetchFunnel = (options: {
   appId?: string;
+  orgId?: string;
   period: string;
   granularity: Granularity;
 }): Promise<FunnelResponse> => {
   const params = new URLSearchParams({ granularity: options.granularity });
+  if (options.orgId) params.set('orgId', options.orgId);
   // The range is the granularity's own when the columns are a fixed span; the
   // server ignores a period there, and sending one would imply otherwise.
   if (options.granularity !== 'previous_7_days') params.set('period', options.period);
@@ -542,10 +588,28 @@ export interface BigQueryAppSource {
   lastEventAt: string | null;
 }
 
+/**
+ * The manual ingest's own account of itself.
+ *
+ * The server forks the ingest into a child process rather than running it on
+ * the request thread — it used to block the event loop for minutes and fail the
+ * platform health check — so `POST /sync` returns before there is a result and
+ * this is where the result eventually appears.
+ */
+export interface BigQuerySyncJob {
+  running: boolean;
+  full: boolean;
+  startedAt: string | null;
+  finishedAt: string | null;
+  result: ListingSyncResult | null;
+  error: string | null;
+}
+
 export interface BigQuerySettings {
   connection: BigQueryConnection | null;
   sources: BigQueryAppSource[];
   stats: { events: number; earliest: string | null; latest: string | null };
+  job: BigQuerySyncJob;
 }
 
 /** The account check: does the key work, and what datasets can it see. */
@@ -599,9 +663,15 @@ export const saveBigQueryAppSource = (
 ): Promise<BigQueryAppSource> =>
   sendJson('PUT', `${BQ}/apps/${encodeURIComponent(appId)}`, patch);
 
+/**
+ * Starts an ingest. Resolves as soon as the job is accepted (HTTP 202), not
+ * when it has finished — read `job` from `fetchBigQuery()` for that. A 409
+ * (a run is already going) arrives here as a thrown error with the server's
+ * message, which is the right thing to show.
+ */
 export const syncBigQuery = (
   full = false,
-): Promise<BigQuerySettings & { result: ListingSyncResult }> =>
+): Promise<BigQuerySettings & { accepted: boolean }> =>
   sendJson('POST', `${BQ}/sync${full ? '?full=1' : ''}`);
 
 /* --------------------------------------------------------- notifications */
@@ -669,3 +739,86 @@ export const testChannel = (
   id: string,
 ): Promise<{ ok: boolean; error: string | null; channel: NotificationChannel }> =>
   sendJson('POST', `${CHANNELS}/${encodeURIComponent(id)}/test`);
+
+/* --------------------------------------------------------- organizations */
+
+/**
+ * A Shopify Partner organization as the admin API describes it.
+ *
+ * Note the absence of a token. It is posted once and never sent back, so a
+ * stored credential is identified here by four characters of hint — the same
+ * bargain the BigQuery key and the Slack webhook already make. A token that is
+ * set can be replaced without ever being shown.
+ */
+export interface Organization {
+  id: string;
+  label: string;
+  /** Last four characters, or '' when no token is stored. */
+  tokenHint: string;
+  hasToken: boolean;
+  /** 'env' means it was seeded from PARTNER_ORG_<n>_*; editing takes it over. */
+  source: 'env' | 'manual';
+  /** Set when the organization was removed. Its data is kept regardless. */
+  disabledAt: string | null;
+  checkedAt: string | null;
+  checkNote: string | null;
+  lastError: string | null;
+  createdAt: string;
+  updatedAt: string;
+  /* ------------------------------------------------------ sync health */
+  apps: number;
+  lastSyncAt: string | null;
+  phase: string | null;
+  phaseStartedAt: string | null;
+  syncError: string | null;
+  syncErrorPhase: string | null;
+  syncErrorAt: string | null;
+  inEnvironment: boolean;
+  /** The environment names a different token for this one. Reported, not resolved. */
+  envDiffers: boolean;
+}
+
+/** What the Partner API said when the credential was tried. */
+export interface OrganizationCheck {
+  ok: boolean;
+  organizationId: string;
+  apps: Array<{ id: string; name: string }>;
+  transactions: number;
+  error: string | null;
+  note: string | null;
+}
+
+export interface OrganizationList {
+  organizations: Organization[];
+}
+
+const ORGS = '/api/organizations';
+
+export const fetchOrganizations = (): Promise<OrganizationList> =>
+  getJson<OrganizationList>(ORGS);
+
+/** Verifies against the Partner API first; a refusal is a 400 carrying `check`. */
+export const createOrganization = (input: {
+  organizationId: string;
+  label: string;
+  token: string;
+  force?: boolean;
+}): Promise<OrganizationList & { check: OrganizationCheck }> => sendJson('POST', ORGS, input);
+
+/** Omit `token` to keep the stored one — that is how a rename works. */
+export const updateOrganization = (
+  id: string,
+  patch: { label?: string; token?: string; force?: boolean },
+): Promise<OrganizationList & { check?: OrganizationCheck }> =>
+  sendJson('PATCH', `${ORGS}/${encodeURIComponent(id)}`, patch);
+
+/** Soft. The response says what was kept. */
+export const removeOrganization = (
+  id: string,
+): Promise<OrganizationList & { kept: { apps: number; history: string } }> =>
+  sendJson('DELETE', `${ORGS}/${encodeURIComponent(id)}`);
+
+export const checkOrganization = (
+  id: string,
+): Promise<OrganizationList & { check: OrganizationCheck }> =>
+  sendJson('POST', `${ORGS}/${encodeURIComponent(id)}/check`);

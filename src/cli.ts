@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { ConfigError, getConfig } from './config.js';
 import { getDb } from './db/index.js';
+import { activeOrgs } from './orgs/registry.js';
 import { partnerQuery, PartnerApiError } from './partner/client.js';
 import { HEALTHCHECK_QUERY } from './partner/queries.js';
 import { dispatchPending } from './notifications/dispatch.js';
@@ -38,9 +39,20 @@ function parseFlags(argv: string[]): Record<string, string> {
 
 async function doctor(): Promise<void> {
   const config = getConfig();
+  // Opened before the organizations are read, because opening is what seeds the
+  // table from the environment. `doctor` reporting a different list from the one
+  // the sync would use is exactly the confusion it exists to prevent.
+  const store = getDb();
+  const orgs = activeOrgs(store);
   console.log('Configuration');
   console.log(`  Partner API version   ${config.partner.apiVersion}`);
-  console.log(`  Organization          ${config.partner.organizationId}`);
+  if (orgs.length === 0) {
+    console.log('  Organization          none configured');
+  }
+  for (const org of orgs) {
+    const label = org.label === org.organizationId ? '' : ` (${org.label})`;
+    console.log(`  Organization          ${org.organizationId}${label}`);
+  }
   console.log(
     `  App scope             ${
       config.scope.appIds.length > 0
@@ -51,11 +63,28 @@ async function doctor(): Promise<void> {
   console.log(`  Database              ${config.runtime.databasePath}`);
   console.log(`  Timezone              ${config.runtime.timezone}`);
 
-  process.stdout.write('\nPartner API reachable... ');
-  await partnerQuery(HEALTHCHECK_QUERY);
-  console.log('yes');
+  /*
+   * Every organization is checked, and one failure does not hide the rest.
+   *
+   * A bad token is the whole reason to run `doctor`, and with several
+   * configured the useful answer is *which one* — stopping at the first failure
+   * would leave the operator unable to tell a broken second org from an
+   * untested one.
+   */
+  console.log('\nPartner API reachability');
+  let unreachable = 0;
+  for (const org of orgs) {
+    process.stdout.write(`  ${org.label.padEnd(22)}`);
+    try {
+      await partnerQuery(org, HEALTHCHECK_QUERY);
+      console.log('reachable');
+    } catch (cause) {
+      unreachable += 1;
+      console.log(`FAILED - ${cause instanceof Error ? cause.message : String(cause)}`);
+    }
+  }
 
-  const db = getDb();
+  const db = store;
   const counts = db
     .prepare(
       `SELECT
@@ -71,9 +100,23 @@ async function doctor(): Promise<void> {
   for (const [key, value] of Object.entries(counts)) {
     console.log(`  ${key.padEnd(22)}${value}`);
   }
+  const byOrg = db
+    .prepare(`SELECT org_id, COUNT(*) AS apps FROM apps GROUP BY org_id ORDER BY org_id`)
+    .all() as Array<{ org_id: string; apps: number }>;
+  if (byOrg.length > 0) {
+    console.log('\nApps by organization');
+    for (const row of byOrg) {
+      console.log(`  ${(row.org_id || '(unattributed)').padEnd(22)}${row.apps}`);
+    }
+  }
+
   if (counts.events === 0) {
     console.log('\nNo data yet. Run: partnerdex sync');
   }
+
+  // A non-zero exit, so a scripted check notices. Printed above rather than
+  // thrown, so the local-store section still runs when a token is bad.
+  if (unreachable > 0) process.exitCode = 1;
 }
 
 async function main(): Promise<void> {
@@ -137,12 +180,16 @@ async function main(): Promise<void> {
      */
     case 'rebuild': {
       const started = Date.now();
-      const result = rebuildDerivedTables(getDb());
+      // `rebuild` exists to distrust what is stored, so it recompiles every
+      // payment event rather than only the ones the sync has not seen yet.
+      const result = rebuildDerivedTables(getDb(), { full: true });
       console.log(
         `Rebuilt in ${Math.round((Date.now() - started) / 1000)}s: ` +
           `${result.subscriptions} subscription(s), ${result.installs} install interval(s), ` +
           `${result.customerEvents} customer event(s), ` +
-          `${result.reviewEvents} review event(s).`,
+          `${result.reviewEvents} review event(s), ` +
+          `${result.transactionDays} day(s) of transaction rollup, ` +
+          `${result.pairs} merchant(s) rebuilt.`,
       );
       break;
     }

@@ -43,7 +43,15 @@ export interface PageSpec {
    * Reviews is the one page that is both: cards over the shared window, and a
    * searchable list of the documents behind them.
    */
-  kind?: 'metrics' | 'customers' | 'notifications' | 'reviews' | 'listings' | 'funnel' | 'bigquery';
+  kind?:
+    | 'metrics'
+    | 'customers'
+    | 'notifications'
+    | 'reviews'
+    | 'listings'
+    | 'funnel'
+    | 'bigquery'
+    | 'organizations';
   /**
    * Which shared filters this page shows, in order.
    *
@@ -69,10 +77,17 @@ export interface PageDefaults {
   granularity: 'day' | 'week' | 'month' | 'previous_7_days';
 }
 
-export type PageFilter = 'app' | 'range' | 'trials' | 'rating' | 'granularity';
+export type PageFilter = 'org' | 'app' | 'range' | 'trials' | 'rating' | 'granularity';
 
-/** What a metric page shows when it has not asked for anything different. */
-export const DEFAULT_FILTERS: PageFilter[] = ['app', 'range', 'trials'];
+/**
+ * What a metric page shows when it has not asked for anything different.
+ *
+ * The organization comes first because it is the widest of them: it decides
+ * which apps the app picker beside it can even offer. It renders as nothing at
+ * all on an instance with one organization, which is every instance that has
+ * never used this feature.
+ */
+export const DEFAULT_FILTERS: PageFilter[] = ['org', 'app', 'range', 'trials'];
 
 export interface NavGroup {
   label: string;
@@ -286,7 +301,7 @@ const REVIEWS: PageSpec = {
   ],
   // Trials have nothing to do with a listing. The rating filter takes the slot
   // and reaches every card, so the whole page can be read one star at a time.
-  filters: ['app', 'range', 'rating'],
+  filters: ['org', 'app', 'range', 'rating'],
 };
 
 const FUNNEL: PageSpec = {
@@ -300,7 +315,7 @@ const FUNNEL: PageSpec = {
   // No trials toggle: this page is *about* trials as a step, not about whether
   // they count towards revenue. Granularity takes the slot, because the whole
   // report is a matrix and the column width is the reader's main lever.
-  filters: ['app', 'granularity', 'range'],
+  filters: ['org', 'app', 'granularity', 'range'],
   // A day-by-day read of the last month: narrow enough that the columns still
   // fit an eye-sweep, long enough that a trial started at the start of it has
   // had time to decide. The twelve months every other report opens on would be
@@ -315,6 +330,15 @@ const LISTINGS: PageSpec = {
   blurb:
     'Which App Store page belongs to which of your apps.',
   kind: 'listings',
+  cards: [],
+};
+
+const ORGANIZATIONS: PageSpec = {
+  id: 'organizations',
+  label: 'Organizations',
+  title: 'Organizations',
+  blurb: 'The Shopify Partner organizations this instance syncs, and how each one is doing.',
+  kind: 'organizations',
   cards: [],
 };
 
@@ -340,7 +364,7 @@ const BIGQUERY: PageSpec = {
 export const NAV: NavGroup[] = [
   { label: '', pages: [OVERVIEW, CUSTOMERS] },
   { label: 'Reports', pages: [REVENUE, SUBSCRIPTIONS, CHURN, FUNNEL, REVIEWS] },
-  { label: 'Settings', pages: [LISTINGS, BIGQUERY, NOTIFICATIONS] },
+  { label: 'Settings', pages: [ORGANIZATIONS, LISTINGS, BIGQUERY, NOTIFICATIONS] },
 ];
 
 export const PAGES: PageSpec[] = NAV.flatMap((group) => group.pages);

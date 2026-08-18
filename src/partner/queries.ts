@@ -124,6 +124,40 @@ export const APP_QUERY = /* GraphQL */ `
   }
 `;
 
+/**
+ * The check run before an organization is saved: does this token open this
+ * organization, and what does it reach?
+ *
+ * Five newest transactions, for the apps on them and nothing else. The
+ * organization id is in the endpoint path, so a token from elsewhere is refused
+ * before this document is even parsed; what the app names add is the other
+ * mistake — a working credential for an organization that is not the one the
+ * operator meant. See `src/orgs/verify.ts`.
+ *
+ * Deliberately not `HEALTHCHECK_QUERY`: that one asks for an id and a date, and
+ * an id and a date are not something anybody can recognise.
+ */
+export const ORGANIZATION_PROBE_QUERY = /* GraphQL */ `
+  query PartnerdexOrganizationProbe {
+    transactions(first: 5) {
+      edges {
+        node {
+          createdAt
+          ... on AppSubscriptionSale {
+            app { id name }
+          }
+          ... on AppOneTimeSale {
+            app { id name }
+          }
+          ... on AppUsageSale {
+            app { id name }
+          }
+        }
+      }
+    }
+  }
+`;
+
 /** Cheap call used by `partnerdex doctor` to prove credentials and scopes work. */
 export const HEALTHCHECK_QUERY = /* GraphQL */ `
   query PartnerdexHealthcheck {

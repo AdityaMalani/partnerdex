@@ -6,7 +6,7 @@ import { getConfig } from '../config.js';
 import { getCustomer, listCustomers, type CustomerSort } from '../customers/index.js';
 import { getDb } from '../db/index.js';
 import { type RawMetricQuery } from '../metrics/context.js';
-import { listMetrics, runMetric } from '../metrics/registry.js';
+import { HEADLINE_METRICS, listMetrics, runMetric } from '../metrics/registry.js';
 import { dispatchPending } from '../notifications/dispatch.js';
 import {
   linkCandidates,
@@ -24,35 +24,10 @@ import { sendError } from './errors.js';
 import { notificationsRouter } from './notifications.js';
 import { listingsRouter } from './listings.js';
 import { bigqueryRouter } from './bigquery.js';
+import { organizationsRouter } from './organizations.js';
 import { listAppSources } from '../bigquery/connection.js';
 import { funnelReport } from '../metrics/reports/funnel.js';
 
-/** Everything the dashboard renders, so one request paints the whole page. */
-const HEADLINE_METRICS = [
-  'mrr',
-  'arr',
-  'gross_earnings',
-  'mrr_growth',
-  'mrr_by_app',
-  'arpu',
-  'ltv',
-  'trials',
-  'on_trial',
-  'trial_conversion_rate',
-  'active_subscriptions',
-  'subscribers',
-  'new_subscriptions',
-  'subscription_growth',
-  'active_installs',
-  'churn',
-  'revenue_churn',
-  'subscription_churn',
-  'logo_churn',
-  'reviews_posted',
-  'reviews_live',
-  'reviews_average_rating',
-  'reviews_removed',
-];
 
 function queryOf(request: express.Request): RawMetricQuery {
   const pick = (name: string): string | undefined => {
@@ -65,6 +40,7 @@ function queryOf(request: express.Request): RawMetricQuery {
     end: pick('end'),
     interval: pick('interval'),
     appIds: pick('appIds'),
+    orgId: pick('orgId'),
     includeAnnual: pick('includeAnnual'),
     includeUsage: pick('includeUsage'),
     includeTrials: pick('includeTrials'),
@@ -74,9 +50,32 @@ function queryOf(request: express.Request): RawMetricQuery {
   };
 }
 
+/**
+ * The organization a request is scoped to, or undefined for all of them.
+ *
+ * One reading of the parameter, shared by every route that resolves its own app
+ * scope, so `?orgId=` cannot mean one thing on the customer list and another on
+ * the funnel. Empty is normalized to undefined here rather than downstream:
+ * `resolveScopedAppIds(db, '')` would ask for the apps of an organization whose
+ * id is the empty string, which is a different question from "every app".
+ */
+function orgOf(request: express.Request): string | undefined {
+  const value = request.query.orgId;
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
 export function createApp(): express.Express {
   const app = express();
   app.disable('x-powered-by');
+
+  /*
+   * An organization as a list of app ids, for the routes that take an app list
+   * rather than a metric query. An empty list means "every app" to all of them,
+   * which is exactly what an absent organization should mean — so this returns
+   * one, and only narrows when an organization really was named.
+   */
+  const orgScope = (orgId: string | undefined): string[] =>
+    orgId === undefined ? [] : resolveScopedAppIds(getDb(), orgId);
 
   // Behind a TLS-terminating proxy the request arrives as plain HTTP, so
   // `request.protocol` reads "http" and the session cookie would ship without
@@ -109,6 +108,12 @@ export function createApp(): express.Express {
   app.use('/api/notifications', notificationsRouter());
   app.use('/api/listings', listingsRouter());
   app.use('/api/bigquery', bigqueryRouter());
+  /*
+   * Organization management, inside the same gate and for a stronger reason
+   * than most of what is in here: it holds live Partner API credentials, and a
+   * request that reached it could point one at an organization of its choosing.
+   */
+  app.use('/api/organizations', organizationsRouter());
 
   /**
    * The install funnel.
@@ -129,10 +134,10 @@ export function createApp(): express.Express {
    * entry, because summing across apps puts one app's visitors above several
    * apps' installs and produces a conversion rate over 100%.
    */
-  app.get('/api/funnel/apps', (_request, response) => {
+  app.get('/api/funnel/apps', (request, response) => {
     try {
       const db = getDb();
-      const apps = listAppSources(resolveScopedAppIds(db), db)
+      const apps = listAppSources(resolveScopedAppIds(db, orgOf(request)), db)
         .filter((source) => source.dataset !== null)
         .map((source) => ({
           id: source.appId,
@@ -159,7 +164,10 @@ export function createApp(): express.Express {
           start: pick('start'),
           end: pick('end'),
           granularity: pick('granularity'),
-          appIds: pick('appIds'),
+          // The funnel is always about one app, so the organization only ever
+          // narrows the list the picker offered — it cannot change the answer
+          // for an app that was named explicitly.
+          appIds: pick('appIds') || orgScope(orgOf(request)).join(','),
           nocache: pick('nocache'),
         }),
       );
@@ -172,43 +180,118 @@ export function createApp(): express.Express {
     response.json({ metrics: listMetrics() });
   });
 
-  /** Apps in reporting scope, resolved at runtime so no ids live in the code. */
-  app.get('/api/apps', (_request, response) => {
+  /**
+   * Apps in reporting scope, resolved at runtime so no ids live in the code.
+   *
+   * Every organization's apps, in one list. That is the whole point of running
+   * one instance over several organizations, and it is also the answer that
+   * does not change a single existing figure: `resolveScopedAppIds` has always
+   * returned every app this instance covers, and the per-app picker built on
+   * this list is already a finer filter than an organization filter would be.
+   * `orgId` rides along so the UI can *label* an app's organization without
+   * anything being scoped by it.
+   */
+  app.get('/api/apps', (request, response) => {
     try {
       const db = getDb();
-      const scoped = resolveScopedAppIds(db);
+      const scoped = resolveScopedAppIds(db, orgOf(request));
       if (scoped.length === 0) {
         response.json({ apps: [] });
         return;
       }
       const placeholders = scoped.map(() => '?').join(',');
       const rows = db
-        .prepare(`SELECT id, name FROM apps WHERE id IN (${placeholders}) ORDER BY name`)
-        .all(...scoped) as Array<{ id: string; name: string }>;
+        .prepare(
+          `SELECT id, name, org_id AS orgId FROM apps WHERE id IN (${placeholders}) ORDER BY name`,
+        )
+        .all(...scoped) as Array<{ id: string; name: string; orgId: string }>;
       response.json({ apps: rows });
     } catch (error) {
       sendError(response, error);
     }
   });
 
-  app.get('/api/status', (_request, response) => {
+  /*
+   * The row counts behind this are memoized, and that is not an optimization —
+   * without it this route takes the whole process down.
+   *
+   * SQLite keeps no row count, so `COUNT(*)` walks the table. Measured on the
+   * live database: `transactions` 56.5s and `customer_events` 85.0s, together
+   * over two minutes of *synchronous* work on the single thread that also serves
+   * every other route and answers the health check. No index can help — there is
+   * nothing to look up, only rows to count.
+   *
+   * The dashboard shell polls this on every page for one footer line, so each
+   * navigation stalled the entire app and Fly pulled the machine from the load
+   * balancer. It presented as "every page hangs", which sent us looking at the
+   * pages rather than at the footer.
+   *
+   * So the counts are now opt-in, behind `?counts=1`, and memoized for a minute
+   * when asked for. The dashboard shell reads only `sync` and `lastSyncAt` —
+   * verified against the frontend, which never renders a row count anywhere —
+   * and both of those are cheap and read fresh on every call, because they are
+   * what tells a reader whether the figures in front of them are stale.
+   */
+  let countsCache: { at: number; value: Record<string, unknown> } | null = null;
+  const COUNTS_TTL_MS = 60_000;
+
+  app.get('/api/status', (request, response) => {
     try {
       const db = getDb();
-      const counts = db
-        .prepare(
-          `SELECT
-             (SELECT COUNT(*) FROM apps) AS apps,
-             (SELECT COUNT(*) FROM shops) AS shops,
-             (SELECT COUNT(*) FROM app_events) AS events,
-             (SELECT COUNT(*) FROM transactions) AS transactions,
-             (SELECT COUNT(*) FROM subscriptions) AS subscriptions,
-             (SELECT COUNT(*) FROM customer_events WHERE suppressed = 0) AS customerEvents,
-             (SELECT MAX(updated_at) FROM sync_state) AS lastSyncAt`,
-        )
-        .get() as Record<string, unknown>;
-      // The dashboard watches `lastSyncAt` to know when its figures went stale,
-      // and `sync` to say so when the background loop is failing.
-      response.json({ ...counts, sync: syncStatus() });
+
+      // Always cheap, and polled on every page.
+      const lastSyncAt = (
+        db.prepare('SELECT MAX(updated_at) AS lastSyncAt FROM sync_state').get() as {
+          lastSyncAt: string | null;
+        }
+      ).lastSyncAt;
+
+      /*
+       * Whether the store holds anything, which the shell needs and used to work
+       * out from the row counts above. Making those opt-in would otherwise take
+       * the answer away with them: the counts stop arriving, `?? 0` reads the
+       * absence as zero, and a store holding millions of rows reports itself
+       * empty and tells its operator to run a sync.
+       *
+       * So the question is answered here instead of reconstructed from figures
+       * that happened to be nearby. `LIMIT 1` stops at the first row, which is
+       * what lets it stay on the cheap path beside a `COUNT(*)` that could not.
+       *
+       * Both tables, because either alone is too narrow: a store can hold
+       * subscriptions rebuilt from events that carried no sale yet, and it is
+       * not empty — it has figures to show.
+       */
+      const hasData =
+        db.prepare('SELECT 1 AS present FROM transactions LIMIT 1').get() !== undefined ||
+        db.prepare('SELECT 1 AS present FROM subscriptions LIMIT 1').get() !== undefined;
+
+      const base = { lastSyncAt, hasData, sync: syncStatus() };
+
+      // The counts are opt-in. Callers that want them ask; the shell does not,
+      // and used to pay for them on every navigation regardless.
+      if (request.query.counts !== '1') {
+        response.json(base);
+        return;
+      }
+
+      if (!countsCache || Date.now() - countsCache.at > COUNTS_TTL_MS) {
+        countsCache = {
+          at: Date.now(),
+          value: db
+            .prepare(
+              `SELECT
+                 (SELECT COUNT(*) FROM apps) AS apps,
+                 (SELECT COUNT(*) FROM shops) AS shops,
+                 (SELECT COUNT(*) FROM app_events) AS events,
+                 (SELECT COUNT(*) FROM transactions) AS transactions,
+                 (SELECT COUNT(*) FROM subscriptions) AS subscriptions,
+                 (SELECT COUNT(*) FROM customer_events WHERE suppressed = 0) AS customerEvents`,
+            )
+            .get() as Record<string, unknown>,
+        };
+      }
+
+      response.json({ ...countsCache.value, ...base });
     } catch (error) {
       sendError(response, error);
     }
@@ -258,7 +341,12 @@ export function createApp(): express.Express {
           sort: (pick('sort') ?? 'mrr') as CustomerSort,
           limit: Number.isFinite(limit) ? limit : undefined,
           offset: Number.isFinite(offset) ? offset : undefined,
-          appIds: appIds ? appIds.split(',').filter(Boolean) : [],
+          // An explicit app list wins; otherwise the organization, if one was
+          // named; otherwise every app, which is the behaviour this route has
+          // always had and the one an untouched dashboard still gets.
+          appIds: appIds
+            ? appIds.split(',').filter(Boolean)
+            : orgScope(orgOf(request)),
         }),
       );
     } catch (error) {
@@ -270,7 +358,7 @@ export function createApp(): express.Express {
     try {
       const appIds = typeof request.query.appIds === 'string' ? request.query.appIds : '';
       const detail = getCustomer(request.params.shopId, {
-        appIds: appIds ? appIds.split(',').filter(Boolean) : [],
+        appIds: appIds ? appIds.split(',').filter(Boolean) : orgScope(orgOf(request)),
       });
       if (!detail) {
         response.status(404).json({ error: `No customer with shop id ${request.params.shopId}.` });
@@ -300,7 +388,7 @@ export function createApp(): express.Express {
       response.json(
         listReviews({
           search: pick('q') ?? '',
-          appIds: appIds ? appIds.split(',').filter(Boolean) : [],
+          appIds: appIds ? appIds.split(',').filter(Boolean) : orgScope(orgOf(request)),
           rating: Number.isInteger(rating) && rating >= 1 && rating <= 5 ? rating : null,
           status: (pick('status') ?? 'all') as ReviewStatusFilter,
           linked: (pick('linked') ?? 'all') as ReviewLinkFilter,

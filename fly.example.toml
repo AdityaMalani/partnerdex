@@ -27,6 +27,11 @@ primary_region = "<your-region>"
   # https://partners.shopify.com/<PARTNER_ORGANIZATION_ID>/...
   PARTNER_ORGANIZATION_ID = "<your-org-id>"
   PARTNER_API_VERSION = "2026-07"
+  # A second Partner organization, synced into the same database. The id is not
+  # a secret and can live here; its token is a secret and must not
+  # (`fly secrets set PARTNER_ORG_2_TOKEN=...`). Any positive index works.
+  # PARTNER_ORG_2_ID = "<other-org-id>"
+  # PARTNER_ORG_2_LABEL = "Second Org"
 
   # --- Scope ---------------------------------------------------------------
   # Comma-separated app ids to report on; empty includes every app in the org.
@@ -48,14 +53,30 @@ primary_region = "<your-region>"
   PLAN_CHANGE_WINDOW_DAYS = "2"
   CACHE_TTL_SECONDS = "600"
 
-  # --- Credentials ---------------------------------------------------------
-  # Partners Dashboard > Settings > Partner API clients, with the
-  # "View financials" and "Manage apps" permissions.
-  PARTNER_API_TOKEN = "<your-partner-api-token>"
-  # Required. Empty means the dashboard has no login at all, and on Fly that
-  # puts your revenue data on the public internet. 8 chars is the floor the
-  # config enforces, not a recommendation.
-  DASHBOARD_PASSWORD = "<your-dashboard-password>"
+  # --- Credentials: NOT HERE ------------------------------------------------
+  #
+  # This file used to carry PARTNER_API_TOKEN and DASHBOARD_PASSWORD in this
+  # block, and DEPLOY-RUNBOOK.md said to use `fly secrets`. The two disagreed,
+  # and the security review flagged the disagreement: anything under [env] is
+  # baked into the app's config, is readable with `fly config show`, and is
+  # echoed in deploy output. The only thing keeping it out of the public repo
+  # was fly.toml being gitignored, which is one `git add -f` from failing.
+  #
+  # So they are set as secrets instead, once, and never written to a file:
+  #
+  #   fly secrets set \
+  #     PARTNER_API_TOKEN='<your-partner-api-token>' \
+  #     DASHBOARD_PASSWORD='<your-dashboard-password>'
+  #
+  # DASHBOARD_PASSWORD is required. Without it the process now refuses to serve
+  # HTTP at all unless ALLOW_NO_AUTH=true is also set — because an unset
+  # password means every /api route, including the one that mints affiliate
+  # set-password links, is open to anyone who can reach the port. Do not set
+  # ALLOW_NO_AUTH here; it exists for a laptop.
+  #
+  # Same for the mail relay's credentials if EMAIL_ENABLED is turned on:
+  #
+  #   fly secrets set SMTP_USER='…' SMTP_PASSWORD='…'
 
 [mounts]
   source = "partnerdex_data"

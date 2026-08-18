@@ -182,7 +182,12 @@ export function listReviews(options: ReviewListOptions = {}): ReviewListResult {
   const appIds = scope(db, options.appIds ?? []);
   const limit = Math.min(Math.max(options.limit ?? 50, 1), 200);
   const offset = Math.max(options.offset ?? 0, 0);
-  const sort = ORDER_BY[options.sort ?? 'newest'] ? (options.sort ?? 'newest') : 'newest';
+  // See `customers/index.ts` for why this is `hasOwnProperty` and not a
+  // truthiness check on the lookup.
+  const asked = options.sort ?? 'newest';
+  const sort: ReviewSort = Object.prototype.hasOwnProperty.call(ORDER_BY, asked)
+    ? asked
+    : 'newest';
 
   const where = whereFor(options, appIds);
 

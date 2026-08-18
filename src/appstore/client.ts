@@ -29,6 +29,28 @@ const BASE_BACKOFF_MS = 1000;
 /** Minimum gap between two requests to the App Store, in milliseconds. */
 const MIN_SPACING_MS = 1000;
 
+/**
+ * How long one listing page may take before it is treated as a hang.
+ *
+ * This host has no contract with us at all, so a request that is accepted and
+ * never answered is entirely possible and nothing above would notice: the retry
+ * loop below handles errors and bad statuses, and a request that never settles
+ * is neither. The review sweep sits in the middle of the sync, before the
+ * rebuild, so one dead socket here parks everything after it.
+ *
+ * A minute is far more than an HTML page needs and is not a latency budget.
+ */
+function requestTimeoutMs(): number {
+  const raw = Number(process.env.APPSTORE_REQUEST_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : 60_000;
+}
+
+/**
+ * A ceiling on `Retry-After`, for the same reason the Partner client has one:
+ * the header is a request, not an instruction to park a sync indefinitely.
+ */
+const MAX_RETRY_AFTER_MS = 60_000;
+
 const USER_AGENT =
   'PartnerDex/0.1 (+https://github.com/AdityaMalani/partnerdex; self-hosted partner analytics reading its own app listing)';
 
@@ -84,6 +106,7 @@ export async function fetchReviewsPage(handle: string, page: number): Promise<st
       response = await fetch(url, {
         headers: { 'User-Agent': USER_AGENT, Accept: 'text/html' },
         redirect: 'follow',
+        signal: AbortSignal.timeout(requestTimeoutMs()),
       });
     } catch (cause) {
       if (attempt === MAX_ATTEMPTS) {
@@ -103,7 +126,7 @@ export async function fetchReviewsPage(handle: string, page: number): Promise<st
       const retryAfter = Number(response.headers.get('retry-after'));
       const waitMs =
         Number.isFinite(retryAfter) && retryAfter > 0
-          ? retryAfter * 1000
+          ? Math.min(retryAfter * 1000, MAX_RETRY_AFTER_MS)
           : BASE_BACKOFF_MS * 2 ** (attempt - 1);
       await sleep(waitMs);
       continue;

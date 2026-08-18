@@ -19,7 +19,7 @@ import { buildResponse, type MetricResponse } from '../response.js';
  */
 
 export function activeSubscriptionsReport(context: MetricContext): MetricResponse {
-  const stock = stockSeries(context.db, context.bucketsWithLead, context.asOf);
+  const stock = stockSeries(context.db, context.bucketsWithLead, context.asOf, context.window.timeZone);
   const byIndex = new Map(stock.map((point) => [point.idx, point]));
   const values = context.bucketsWithLead.map((_, idx) => byIndex.get(idx)?.subscriptions ?? 0);
   const [leading, ...visible] = values;
@@ -42,7 +42,7 @@ export function activeSubscriptionsReport(context: MetricContext): MetricRespons
  * other.
  */
 export function subscribersReport(context: MetricContext): MetricResponse {
-  const stock = stockSeries(context.db, context.bucketsWithLead, context.asOf);
+  const stock = stockSeries(context.db, context.bucketsWithLead, context.asOf, context.window.timeZone);
   const byIndex = new Map(stock.map((point) => [point.idx, point]));
   const values = context.bucketsWithLead.map((_, idx) => byIndex.get(idx)?.subscribers ?? 0);
   const [leading, ...visible] = values;
@@ -67,7 +67,7 @@ export function subscribersReport(context: MetricContext): MetricResponse {
  * the subscription index.
  */
 export function activeInstallsReport(context: MetricContext): MetricResponse {
-  const series = activeInstallSeries(context.db, context.bucketsWithLead, context.appIds);
+  const series = activeInstallSeries(context.db, context.bucketsWithLead, context.appIds, context.window.timeZone);
   const values = context.bucketsWithLead.map((_, idx) => series.get(idx) ?? 0);
   const [leading, ...visible] = values;
 
@@ -115,7 +115,7 @@ export function newSubscriptionsReport(context: MetricContext): MetricResponse {
 
 /** Subscription growth, derived from the same live counts the stock report reads. */
 export function subscriptionGrowthReport(context: MetricContext): MetricResponse {
-  const stock = stockSeries(context.db, context.bucketsWithLead, context.asOf);
+  const stock = stockSeries(context.db, context.bucketsWithLead, context.asOf, context.window.timeZone);
   const byIndex = new Map(stock.map((point) => [point.idx, point]));
   const levels = context.bucketsWithLead.map((_, idx) => byIndex.get(idx)?.subscriptions ?? 0);
   const growth = growthFrom(levels);
@@ -156,6 +156,7 @@ function churnVariant(
     context.asOf,
     context.churnWindowDays,
     false,
+    context.window.timeZone,
   );
   const byIndex = new Map(points.map((point) => [point.idx, point]));
 
@@ -223,6 +224,7 @@ export function logoChurnReport(context: MetricContext): MetricResponse {
     context.bucketsWithLead,
     context.appIds,
     context.churnWindowDays,
+    context.window.timeZone,
   );
   const byIndex = new Map(points.map((point) => [point.idx, point]));
 
@@ -263,6 +265,7 @@ export function churnReport(context: MetricContext): MetricResponse {
     context.asOf,
     context.churnWindowDays,
     context.byShop,
+    context.window.timeZone,
   );
   const byIndex = new Map(points.map((point) => [point.idx, point]));
 

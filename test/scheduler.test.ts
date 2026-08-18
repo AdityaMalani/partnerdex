@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import { resetEnvironment } from './helpers.js';
+import { partnerQuery } from '../src/partner/client.js';
 import {
   backoffDelayMs,
   onSyncComplete,
@@ -145,5 +146,63 @@ describe('background sync loop', () => {
     const outcome = await runSyncNow();
     assert.equal(outcome.error, null);
     assert.equal(syncStatus().consecutiveFailures, 0);
+  });
+});
+
+describe('the Partner API client cannot be parked by a dead connection', () => {
+  /*
+   * Regression from a real incident. A request the server accepts and never
+   * answers used to hang `await fetch` indefinitely: the retry loop handles
+   * errors and bad statuses, and a request that never settles is neither. A
+   * production backfill sat for over an hour with its cursor parked
+   * mid-pagination, no rows written and no error — and the sync's overlap guard
+   * meant no later run could start either.
+   */
+  it('gives up on a request that never answers, and retries it', async () => {
+    const original = globalThis.fetch;
+    let attempts = 0;
+
+    // Never resolves on its own; only the caller's abort signal ends it. That is
+    // the shape of the failure — not an error, just silence.
+    globalThis.fetch = ((_url: string, init?: RequestInit) => {
+      attempts += 1;
+      if (attempts > 1) {
+        return Promise.resolve(
+          new Response(JSON.stringify({ data: { ok: true } }), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          }),
+        );
+      }
+      return new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () =>
+          reject(Object.assign(new Error('The operation was aborted'), { name: 'TimeoutError' })),
+        );
+      });
+    }) as typeof fetch;
+
+    try {
+      const org = {
+        organizationId: '1',
+        token: 't',
+        label: 'test',
+        apiVersion: '2026-07',
+        endpoint: 'https://partners.example/api/graphql.json',
+      };
+      // A short timeout keeps the test quick; the property under test is that a
+      // hang aborts and is retried at all, not the production duration.
+      process.env.PARTNER_REQUEST_TIMEOUT_MS = '150';
+      const promise = partnerQuery(org, '{ ok }', {});
+      const settled = await Promise.race([
+        promise.then(() => 'resolved' as const),
+        new Promise<'hung'>((resolve) => setTimeout(() => resolve('hung'), 8000)),
+      ]);
+
+      assert.equal(settled, 'resolved', 'a hung request must abort and be retried, not park');
+      assert.ok(attempts >= 2, 'the hung attempt should have been retried');
+    } finally {
+      globalThis.fetch = original;
+      delete process.env.PARTNER_REQUEST_TIMEOUT_MS;
+    }
   });
 });
