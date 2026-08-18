@@ -144,7 +144,11 @@ export function MetricCard({
         {formatValue(metric.value, format, currency, { compact: format !== 'money' })}
       </div>
 
-      <Comparison metric={metric} invert={spec.invertDelta ?? false} />
+      {spec.comparisonNote ? (
+        <div className="card-delta">{spec.comparisonNote}</div>
+      ) : (
+        <Comparison metric={metric} invert={spec.invertDelta ?? false} />
+      )}
 
       {series.length > 1 ? (
         <div className="legend">

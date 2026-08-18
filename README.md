@@ -118,6 +118,7 @@ If `DASHBOARD_PASSWORD` is configured (minimum 8 characters), the application se
 | **MRR contribution by app** | MRR split by app. If there are more than four apps, the tail is grouped under "Other". |
 | **Trials** | Count of trials started in the period, split into converted and cancelled. |
 | **On trial** | Instantaneous count of active trials at that exact point in time. |
+| **Trialing** | Current trial subscription value grouped by each expected trial end date. |
 | **New subscriptions** | Subscriptions starting their first paid cycle in the period, excluding plan upgrades or downgrades. |
 | **Subscription growth** | Percentage change in live paid subscriptions over the period. |
 | **Churn** | Rolling 30-day loss rate. The denominator is the live population at the start of the window. |

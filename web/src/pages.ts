@@ -26,6 +26,8 @@ export interface CardSpec {
   invertDelta?: boolean;
   /** Let one card take the whole row; still at most three cards across. */
   full?: boolean;
+  /** Forecasts describe the current pipeline rather than a prior period. */
+  comparisonNote?: string;
 }
 
 export interface PageSpec {
@@ -83,7 +85,7 @@ const OVERVIEW: PageSpec = {
   id: 'overview',
   label: 'Overview',
   title: 'Overview',
-  blurb: 'The five figures that say whether the business is working.',
+  blurb: 'The six figures that say whether the business is working.',
   cards: [
     {
       metric: 'mrr',
@@ -116,6 +118,13 @@ const OVERVIEW: PageSpec = {
       label: 'On trial',
       subtitle: 'Inside the free period at each point.',
       plot: 'line',
+    },
+    {
+      metric: 'trialing',
+      label: 'Trialing',
+      subtitle: 'Subscription value by expected trial end date.',
+      plot: 'bar',
+      comparisonNote: 'Expected if every current trial converts',
     },
   ],
 };
@@ -195,6 +204,13 @@ const SUBSCRIPTIONS: PageSpec = {
       label: 'On trial',
       subtitle: 'Inside the free period at each point.',
       plot: 'line',
+    },
+    {
+      metric: 'trialing',
+      label: 'Trialing',
+      subtitle: 'Subscription value by expected trial end date.',
+      plot: 'bar',
+      comparisonNote: 'Expected if every current trial converts',
     },
     {
       metric: 'trial_conversion_rate',

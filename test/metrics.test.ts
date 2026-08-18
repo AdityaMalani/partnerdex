@@ -803,6 +803,57 @@ describe('growth, inflow and live trials', () => {
     assert.equal(pointAt(onTrial, '2024-02'), 1, 'inside the free period');
     assert.equal(pointAt(onTrial, '2024-03'), 0, 'the charge landed, so it is a customer now');
   });
+
+  it('plots current trial value on each expected end date', () => {
+    const now = new Date();
+    const at = (days: number) => new Date(now.getTime() + days * 86_400_000).toISOString();
+    const firstEnd = at(5);
+    const lastEnd = at(8);
+
+    seed([
+      {
+        chargeRef: 'trial-1',
+        shopId: '10',
+        amount: 29,
+        activatedAt: at(-2),
+        billingOn: firstEnd,
+      },
+      {
+        chargeRef: 'trial-2',
+        shopId: '11',
+        amount: 49,
+        activatedAt: at(-3),
+        billingOn: firstEnd,
+      },
+      {
+        chargeRef: 'trial-3',
+        shopId: '12',
+        amount: 99,
+        activatedAt: at(-1),
+        billingOn: lastEnd,
+      },
+      {
+        chargeRef: 'paid',
+        shopId: '13',
+        amount: 500,
+        activatedAt: at(-20),
+        billingOn: at(-10),
+        firstSaleAt: at(-10),
+      },
+    ]);
+
+    const trialing = runMetric('trialing', { period: 'last_30_days' }, { now });
+    assert.equal(trialing.format, 'money');
+    assert.equal(trialing.currency, 'USD');
+    assert.equal(trialing.value, 177, 'the headline sums the whole current pipeline');
+    assert.equal(pointAt(trialing, firstEnd.slice(0, 10)), 78, 'same-day trials stack');
+    assert.equal(pointAt(trialing, lastEnd.slice(0, 10)), 99);
+    assert.ok(
+      trialing.timeSeries.at(-1)!.periodStart.startsWith(lastEnd.slice(0, 10)),
+      'the forecast ends on the last current trial date',
+    );
+    assert.equal(trialing.comparison, undefined, 'a forecast has no prior-period comparison');
+  });
 });
 
 describe('period-over-period comparison', () => {

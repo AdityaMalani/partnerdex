@@ -1,6 +1,7 @@
 import { bucketsCte, onTrialSeries } from '../asof.js';
 import type { MetricContext } from '../context.js';
 import { buildResponse, type MetricResponse } from '../response.js';
+import { addInterval, resolveWindow, startOfInterval } from '../time.js';
 
 /**
  * Trials (spec 4.11).
@@ -121,6 +122,98 @@ export function onTrialReport(context: MetricContext): MetricResponse {
     meta: {
       definition: 'Trials started but neither converted nor cancelled as of the instant.',
       excludes: 'trials whose outcome was never recorded, which have no end instant to test',
+    },
+  });
+}
+
+/**
+ * The value waiting at the end of today's trial pipeline.
+ *
+ * Unlike `on_trial`, this is a forecast: one daily bar for the billed
+ * subscription amount expected to start on that date, from today through the
+ * latest currently-open trial. Empty dates remain visible as zero so the
+ * distance to each expected conversion is legible.
+ */
+export function trialingReport(context: MetricContext): MetricResponse {
+  const params: Record<string, unknown> = { forecastNow: context.now.toISOString() };
+  const appNames = context.appIds.map((id, index) => {
+    params[`fapp${index}`] = id;
+    return `@fapp${index}`;
+  });
+  const appFilter = appNames.length > 0 ? `AND s.app_id IN (${appNames.join(', ')})` : '';
+  const currentTrial = `
+    s.is_test = 0
+    AND s.trial_status = 'in_trial'
+    AND s.trial_ends_at IS NOT NULL
+    AND s.trial_ends_at > @forecastNow
+    ${appFilter}`;
+
+  const summary = context.db
+    .prepare(
+      `SELECT MAX(s.trial_ends_at) AS latestEnd, COUNT(*) AS trials
+       FROM subscriptions s
+       WHERE ${currentTrial}`,
+    )
+    .get(params) as { latestEnd: string | null; trials: number };
+
+  const timeZone = context.window.timeZone;
+  const firstDay = startOfInterval(context.now, 'day', timeZone);
+  const lastDay = summary.latestEnd
+    ? startOfInterval(new Date(summary.latestEnd), 'day', timeZone)
+    : firstDay;
+  const end = addInterval(lastDay, 'day', 1, timeZone);
+  const window = resolveWindow({
+    period: 'custom',
+    start: firstDay.toISOString(),
+    end: end.toISOString(),
+    interval: 'day',
+    timeZone,
+    allTimeStart: firstDay.toISOString().slice(0, 10),
+    now: context.now,
+    allowFutureDates: true,
+  });
+
+  const cte = bucketsCte(window.buckets);
+  const rows = context.db
+    .prepare(
+      `WITH ${cte.sql}
+       SELECT b.idx AS idx, COALESCE(SUM(s.amount), 0) AS value
+       FROM buckets b
+       LEFT JOIN subscriptions s
+         ON ${currentTrial}
+        AND s.trial_ends_at >= b.bucket_from
+        AND s.trial_ends_at < b.as_of
+       GROUP BY b.idx
+       ORDER BY b.idx`,
+    )
+    .all({ ...params, ...cte.params }) as Array<{ idx: number; value: number }>;
+  const byIndex = new Map(rows.map((row) => [row.idx, row.value]));
+
+  const currencies = context.db
+    .prepare(
+      `SELECT s.currency AS currency, COUNT(*) AS n
+       FROM subscriptions s
+       WHERE ${currentTrial}
+         AND s.currency IS NOT NULL
+         AND s.currency <> ''
+       GROUP BY s.currency
+       ORDER BY n DESC`,
+    )
+    .all(params) as Array<{ currency: string; n: number }>;
+
+  return buildResponse({
+    metric: 'trialing',
+    kind: 'flow',
+    format: 'money',
+    window,
+    values: window.buckets.map((_, idx) => byIndex.get(idx) ?? 0),
+    currency: currencies[0]?.currency ?? context.currency,
+    now: context.now,
+    meta: {
+      trials: summary.trials,
+      mixedCurrencies: currencies.length > 1,
+      definition: 'Billed subscription amount grouped by the expected end date of current trials.',
+      basis: 'Raw billed amount, not monthly-normalized MRR.',
     },
   });
 }
