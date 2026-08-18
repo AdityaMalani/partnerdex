@@ -296,6 +296,21 @@ This utility checks source transaction parity, cross-foots reconstructed metrics
 
 ---
 
+## Sponsors
+
+PartnerDex is free, GPL-3.0, and built in evenings. Sponsorship covers the
+hosting it's tested against and buys time to review pull requests.
+
+Sponsors at $25/month:
+
+- [@becketto](https://github.com/becketto)
+
+Want to be on this list? [Sponsor the project](https://github.com/sponsors/AdityaMalani).
+Sponsorship is thanks, not leverage. It doesn't buy roadmap influence or a
+merged pull request.
+
+---
+
 ## License
 
 PartnerDex is licensed under the GNU General Public License v3.0. See the [LICENSE](LICENSE) file for details.
