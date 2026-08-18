@@ -21,6 +21,7 @@ import { Customers } from './components/Customers';
 import { Login } from './components/Login';
 import { MetricCard } from './components/MetricCard';
 import { Nav } from './components/Nav';
+import { PageActionSlot } from './components/PageAction';
 import { Listings } from './components/Listings';
 import { BigQuery } from './components/BigQuery';
 import { Funnel } from './components/Funnel';
@@ -112,40 +113,6 @@ function greeting(): { title: string; blurb: string } {
     title: 'Good evening — welcome back',
     blurb: "Winding down? Here's how the day left your business.",
   };
-}
-
-function ThemeToggle({ theme, onToggle }: { theme: 'dark' | 'light'; onToggle: () => void }) {
-  const label = theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme';
-
-  return (
-    <button
-      type="button"
-      className="theme-toggle"
-      onClick={onToggle}
-      aria-label={label}
-      title={label}
-    >
-      {/* The icon shows the theme you would move to, not the one you are in. */}
-      <svg viewBox="0 0 22 22" aria-hidden="true" focusable="false">
-        {theme === 'dark' ? (
-          <>
-            <circle cx="11" cy="11" r="4" fill="none" strokeWidth="1.7" />
-            <path
-              d="M11 2v2M11 18v2M2 11h2M18 11h2M4.6 4.6l1.4 1.4M16 16l1.4 1.4M17.4 4.6L16 6M6 16l-1.4 1.4"
-              fill="none"
-              strokeWidth="1.7"
-            />
-          </>
-        ) : (
-          <path
-            d="M18 13.4A7.5 7.5 0 0 1 8.6 4a7.5 7.5 0 1 0 9.4 9.4z"
-            fill="none"
-            strokeWidth="1.7"
-          />
-        )}
-      </svg>
-    </button>
-  );
 }
 
 /**
@@ -291,6 +258,8 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [theme, toggleTheme] = useTheme();
+  /** The header's action slot, once it has been laid down. See `PageAction`. */
+  const [actionSlot, setActionSlot] = useState<HTMLElement | null>(null);
 
   useEffect(() => {
     fetchApps()
@@ -433,16 +402,26 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
   const fixedRange = isFunnel && query.granularity === 'previous_7_days';
 
   return (
+    /* The page header keeps a slot for whatever the open page calls its primary
+       action; the page fills it from wherever in its own tree it is decided. */
+    <PageActionSlot.Provider value={actionSlot}>
     <div className={collapsed ? 'shell collapsed' : 'shell'}>
-      <Nav current={page.id} collapsed={collapsed} onToggle={toggleNav} onLogout={onLogout} />
+      <Nav
+        current={page.id}
+        collapsed={collapsed}
+        onToggle={toggleNav}
+        theme={theme}
+        onToggleTheme={toggleTheme}
+        onLogout={onLogout}
+      />
 
       <main className="main">
         <header className="masthead">
-          <div>
+          <div className="masthead-title">
             <h1>{heading.title}</h1>
             <p className="subtitle">{heading.blurb}</p>
           </div>
-          <ThemeToggle theme={theme} onToggle={toggleTheme} />
+          <div className="masthead-actions" ref={setActionSlot} />
         </header>
 
         {/* Which filters a page shows is declared on the page, because they are
@@ -683,5 +662,6 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
         ) : null}
       </main>
     </div>
+    </PageActionSlot.Provider>
   );
 }

@@ -69,6 +69,59 @@
 
   --shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.06);
   --shadow-md: 0 1px 3px rgba(15, 23, 42, 0.08), 0 4px 12px rgba(15, 23, 42, 0.05);
+
+  /* --- the rule ----------------------------------------------------------
+   * `--border` draws the edge of a *thing* — a card, a field, a pill — and has
+   * to be found by the eye. A rule *between* rows of one thing has the opposite
+   * job: the eye should be able to run down a column without counting the lines
+   * it crosses. It is a separate token because it is a separate job, and every
+   * row divider in the dashboard is drawn in it.
+   *
+   * `--grid` is the chart gridline and `--border` is a card's edge; both were
+   * standing in for this, and both were chosen for something else.
+   */
+  --rule: #edf1f6;
+
+  /* --- spacing ------------------------------------------------------------
+   * One scale, six steps, used everywhere a gap is deliberate. Colour here is
+   * already a system — every value is a role, maintained in both themes — and
+   * spacing was not: the same idea is written as 10, 12, 14, 16, 18 and 20 in
+   * different files, so two forms side by side never agree on what "a gap
+   * between fields" is.
+   *
+   *   1  4px   inside a control: a label and the hint under it
+   *   2  8px   between siblings that belong together
+   *   3 12px   between fields on one row
+   *   4 16px   between rows of a form, between cards
+   *   5 24px   between sections of a form or a page
+   *   6 32px   between a page's major bands
+   */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+
+  /* The card's own padding, named so that anything wanting to sit flush with a
+     card's content — or to bleed past it — can measure against the real value
+     instead of repeating the number. */
+  --card-px: 16px;
+  --card-py: 14px;
+
+  --radius: 8px;
+
+  /* --- the shell ----------------------------------------------------------
+   * The rail's two widths, named because the grid and the rail itself both
+   * state them and a disagreement is a visible seam.
+   *
+   * `--measure` is a ceiling on the report, not a target: wide enough that no
+   * ordinary display reaches it, and there only so a row of cards on very wide
+   * glass stops before it stops reading as a row.
+   */
+  --rail: 256px;
+  --rail-collapsed: 64px;
+  --measure: 2400px;
 }
 
 /*
@@ -117,6 +170,9 @@
   /* Elevation is carried by surface value in dark mode, not by shadow. */
   --shadow-sm: none;
   --shadow-md: none;
+
+  /* One step up from the card it is drawn on, not five. */
+  --rule: #2b2b2a;
 }
 
 * {
@@ -152,12 +208,12 @@ h3,
  */
 .shell {
   display: grid;
-  grid-template-columns: 256px minmax(0, 1fr);
+  grid-template-columns: var(--rail) minmax(0, 1fr);
   min-height: 100vh;
 }
 
 .shell.collapsed {
-  grid-template-columns: 64px minmax(0, 1fr);
+  grid-template-columns: var(--rail-collapsed) minmax(0, 1fr);
 }
 
 /* A column, so the sign-out item can claim the foot of the rail rather than
@@ -191,8 +247,30 @@ h3,
   overflow: hidden;
 }
 
-.nav.collapsed .nav-brand {
-  display: none;
+/*
+ * Collapsed, a label leaves the page but not the document.
+ *
+ * `display: none` takes the wordmark and the item names out of the
+ * accessibility tree with them, so a collapsed rail is a column of unnamed
+ * glyphs and a wordless mark to anything not reading it with its eyes. The
+ * hover titles are the only naming left, and a `title` is a last-resort
+ * accessible name, not a plan.
+ *
+ * Clipped rather than removed. Every item keeps its name for a screen reader,
+ * the wordmark still says whose dashboard this is, and the hover title still
+ * names each icon for a sighted reader who cannot place one.
+ */
+.nav.collapsed .nav-brand,
+.nav.collapsed .nav-label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }
 
 /*
@@ -314,26 +392,24 @@ h3,
   stroke-linejoin: round;
 }
 
-.nav.collapsed .nav-label {
-  display: none;
-}
-
 .nav.collapsed .nav-link {
   justify-content: center;
   padding: 8px 0;
 }
 
 /* `margin-top: auto` takes the slack in the column, so the rule sits directly
-   above sign-out on a short rail and at the foot of the viewport on a tall one. */
+   above the pair on a short rail and at the foot of the viewport on a tall one.
+   The theme control and sign-out live here together: neither is a destination,
+   and they are the two things you reach for after you have finished reading. */
 .nav-foot {
   margin-top: auto;
-  padding-top: 12px;
+  padding-top: var(--space-3);
   border-top: 1px solid var(--border);
 }
 
 /* A button wearing a nav item's clothes: the browser's own button styling has
-   to be undone for the two to line up. */
-.nav-logout {
+   to be undone for the two to line up with the links above them. */
+.nav-action {
   width: 100%;
   border: 0;
   background: transparent;
@@ -343,10 +419,37 @@ h3,
   cursor: pointer;
 }
 
+.nav-action:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: -2px;
+}
+
+/*
+ * The report, which takes the width it is given.
+ *
+ * This was capped at a fixed measure, on the reasoning that a table running the
+ * full width of a 27-inch display is hard to read across — which is true of
+ * prose and of a single wide table, and false of this page. What is actually on
+ * it is a grid of cards that reflow: more width means another card on the row,
+ * not a longer line. The cap was answering a question the layout does not ask,
+ * and everything past it became a gap on the right that got wider with the
+ * display.
+ *
+ * Collapsing the rail is what made that visible. It moves 192px from the rail
+ * to the column beside it, and under a fixed cap the report ignored all of them:
+ * the content kept its width and the 192px opened as dead space on the right, so
+ * the one control whose entire purpose is to give the report more room gave it
+ * none. With nothing capping the report, the column grows and the content grows
+ * with it.
+ *
+ * `--measure` survives as a ceiling rather than a target, and it is deliberately
+ * far out: past about 2400px a row of cards stops reading as a row. Anyone
+ * inside that — every laptop and nearly every desktop — sees the full width.
+ */
 .main {
   min-width: 0;
-  max-width: 1240px;
-  padding: 24px 20px 64px;
+  max-width: var(--measure);
+  padding: var(--space-5) 20px 64px;
 }
 
 /* Under a tablet the rail goes horizontal so the report keeps the full width. */
@@ -368,6 +471,45 @@ h3,
     display: none;
   }
 
+  /*
+   * Collapse is meaningless here and is undone.
+   *
+   * The rail is horizontal under a tablet and the toggle that would set the
+   * state is not on the page, so a reader who collapsed the rail on a laptop
+   * arrives on a phone to a row of unlabelled glyphs, group headings reduced
+   * to stray 1px rules, and no control anywhere to undo it. The state survives
+   * in storage; it just stops being expressed.
+   */
+  .nav.collapsed .nav-head {
+    flex-direction: row;
+    padding: 0 6px 14px;
+  }
+
+  .nav.collapsed .nav-brand,
+  .nav.collapsed .nav-label {
+    position: static;
+    width: auto;
+    height: auto;
+    margin: 0;
+    padding: 0;
+    overflow: visible;
+    clip: auto;
+  }
+
+  .nav.collapsed .nav-link {
+    justify-content: flex-start;
+    padding: 7px 8px;
+  }
+
+  .nav.collapsed .nav-group-label {
+    height: auto;
+    margin: 0;
+    padding: 0 8px 6px;
+    overflow: visible;
+    color: var(--muted);
+    background: none;
+  }
+
   .nav-group {
     display: flex;
     align-items: center;
@@ -383,26 +525,46 @@ h3,
   /* Horizontal rail: there is no "foot" to pin to, so it becomes one more item
      in the row rather than a full-width bar under everything. */
   .nav-foot {
-    margin-top: 8px;
-    padding-top: 8px;
+    display: flex;
+    gap: var(--space-1);
+    margin-top: var(--space-2);
+    padding-top: var(--space-2);
   }
 
-  .nav-logout {
+  .nav-action {
     width: auto;
   }
 }
 
 /* ---------------------------------------------------------------- header */
 
-/* Top-aligned rather than baseline-aligned: the toggle has no text to sit a
-   baseline on, so it would hang below the greeting instead of beside it. */
+/* Top-aligned rather than baseline-aligned: whatever sits on the right of the
+   title has no text to share a baseline with, so it would hang below the
+   greeting instead of beside it. */
 .masthead {
   display: flex;
   flex-wrap: wrap;
   align-items: flex-start;
   justify-content: space-between;
-  gap: 12px;
+  gap: var(--space-3);
   margin-bottom: 20px;
+}
+
+.masthead-title {
+  min-width: 0;
+}
+
+/*
+ * The page's primary action, on the title's line and at the right of it.
+ *
+ * Empty on a page that declares no action, and an empty flex child takes no
+ * room, so such a page is laid out exactly as it was before the slot existed.
+ */
+.masthead-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex: 0 0 auto;
 }
 
 .masthead h1 {
@@ -414,35 +576,6 @@ h3,
   color: var(--text-secondary);
   font-size: 13px;
   margin: 2px 0 0;
-}
-
-/* Icon only: the glyph shows the theme the click moves to, and the accessible
-   name is on the button rather than in visible text. */
-.theme-toggle {
-  flex: 0 0 auto;
-  display: grid;
-  place-items: center;
-  width: 32px;
-  height: 32px;
-  padding: 0;
-  border: 1px solid var(--border);
-  background: var(--surface-1);
-  color: var(--text-secondary);
-  border-radius: 8px;
-  cursor: pointer;
-}
-
-.theme-toggle:hover {
-  background: var(--hover-wash);
-  color: var(--text-primary);
-}
-
-.theme-toggle svg {
-  width: 17px;
-  height: 17px;
-  stroke: currentColor;
-  stroke-linecap: round;
-  stroke-linejoin: round;
 }
 
 /* --------------------------------------------------------------- filters */
@@ -463,7 +596,13 @@ h3,
   min-width: 0;
 }
 
-.control label {
+/*
+ * The child combinator is load-bearing. A `.control` that holds a group of
+ * checkboxes holds labels of its own, and unscoped this rule sets those in
+ * 11px muted uppercase — the field-label treatment — so a checkbox's *name*
+ * reads as a second field label and the box floats above it.
+ */
+.control > label {
   font-size: 11px;
   font-weight: 600;
   letter-spacing: 0.04em;
@@ -741,9 +880,30 @@ h3,
 
 /* ----------------------------------------------------------- table view */
 
+/*
+ * A table bleeds to the edges of the card it is in.
+ *
+ * Two things follow from that, and they are the same decision seen twice.
+ *
+ * The row rule spans the whole container. A rule that stops 16px short at each
+ * end reads as a line drawn *under some text*; one that runs edge to edge reads
+ * as the seam between two rows, which is what it is. So the scroll container
+ * cancels the card's padding and the rules run the full width of the card.
+ *
+ * The text then lines up with everything else on the card. The first column
+ * takes the card's own padding back — not as decoration, but so the first
+ * merchant name starts on the same vertical as the card's label above it and
+ * the stat tiles beside it. What is gone is the extra 10px a cell used to carry
+ * on both sides, which put the table's content 10px inside every other thing on
+ * the page and made the table look like it was sitting in a box of its own.
+ *
+ * Columns are separated by a gap on the *left* of every cell but the first, so
+ * a column boundary is one space rather than two half-spaces, and the outermost
+ * columns never pay for it.
+ */
 .table-wrap {
   overflow-x: auto;
-  margin-bottom: 12px;
+  margin: 0 calc(-1 * var(--card-px)) var(--space-3);
 }
 
 table {
@@ -756,14 +916,25 @@ table {
 th,
 td {
   text-align: right;
-  padding: 6px 10px;
-  border-bottom: 1px solid var(--grid);
+  padding: 6px 0;
+  border-bottom: 1px solid var(--rule);
   white-space: nowrap;
+}
+
+th+th,
+td+td {
+  padding-left: var(--space-4);
 }
 
 th:first-child,
 td:first-child {
+  padding-left: var(--card-px);
   text-align: left;
+}
+
+th:last-child,
+td:last-child {
+  padding-right: var(--card-px);
 }
 
 thead th {
@@ -1087,11 +1258,6 @@ thead th {
 
 /* --------------------------------------------------------- notifications */
 
-.channel-form .card-subtitle {
-  margin-bottom: 14px;
-  max-width: 62ch;
-}
-
 /*
  * Name, URL, and the button on one line, with the URL taking the slack. Slack
  * webhook URLs run to about 80 characters, and a field that shows half of one
@@ -1101,7 +1267,7 @@ thead th {
   display: flex;
   flex-wrap: wrap;
   align-items: flex-end;
-  gap: 12px;
+  gap: var(--space-3);
 }
 
 .control-grow {
@@ -1159,12 +1325,107 @@ button.primary:disabled,
   color: var(--delta-down);
 }
 
+/* ----------------------------------------------------------------- forms
+ *
+ * One rhythm for every form in the dashboard.
+ *
+ * A form is a card with rows dropped into it and no spacing of its own:
+ * `.field-row` carries no vertical margin — correct everywhere it appears
+ * once, inside something that already spaces it, and wrong the moment a form
+ * stacks six — so what air there is comes from whichever child happens to have
+ * a margin, and the same gap is written as 10, 12, 14 and 18 depending on the
+ * file. `.form-stack` exists because of exactly this, and it only covers the
+ * one form that hit it first.
+ *
+ * The form is a column with one gap between its parts, and the parts reset
+ * their own margins so the column owns the rhythm outright.
+ */
+.channel-form {
+  gap: var(--space-5);
+  padding: var(--space-5) var(--card-px);
+}
+
+.channel-form > * {
+  margin-top: 0;
+  margin-bottom: 0;
+}
+
+/* The subtitle belongs to the heading above it, not to the gap below it. */
+.channel-form > .card-label + .card-subtitle,
+.channel-form > .card-head + .card-subtitle {
+  margin-top: calc(var(--space-2) - var(--space-5));
+  max-width: 72ch;
+}
+
+/*
+ * Where a form ends. Separated by a rule and the section gap rather than
+ * sitting flush under the last field, so "submit" is visibly not one more
+ * thing to fill in.
+ */
+.channel-form > .channel-actions {
+  flex-wrap: wrap;
+  padding-top: var(--space-5);
+  border-top: 1px solid var(--rule);
+}
+
+/*
+ * A checkbox and its name.
+ *
+ * The box lines up with the FIRST LINE of the label, at any font size and
+ * whether the label runs to one line or three. `1lh` is one line of the
+ * label's own text — the input takes `font: inherit` so it resolves against
+ * the label rather than against the browser's form font — so the box centres
+ * itself in that line by arithmetic instead of by a hand-tuned nudge.
+ */
+.check {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+.check > input[type='checkbox'] {
+  flex: 0 0 auto;
+  width: 15px;
+  height: 15px;
+  /* `.control input` sets a 150px floor, written for text fields, and a
+     checkbox inside a `.control` inherits it: the box stays 15px and reserves
+     150, which is a gulf between the box and its name. A box states its own
+     size. */
+  min-width: 0;
+  margin: 0;
+  margin-block: calc((1lh - 15px) / 2);
+  font: inherit;
+  accent-color: var(--brand);
+  cursor: pointer;
+}
+
+.check > input[type='checkbox']:disabled {
+  cursor: default;
+}
+
+.check:has(input:disabled) {
+  color: var(--muted);
+  cursor: default;
+}
+
+/* Several of them. Wide enough apart that a box reads as belonging to the name
+   on its right rather than to the one on its left. */
+.check-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-5);
+}
+
 /* Used as a plain container by Notifications and as a real <ul> by App
    listings, so the list reset lives here rather than at either call site. */
 .channel-list {
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: var(--space-4);
   list-style: none;
   margin: 0;
   padding: 0;
@@ -1183,7 +1444,10 @@ button.primary:disabled,
   border: 1px solid var(--border);
   border-radius: 8px;
   box-shadow: var(--shadow-md);
-  padding: 18px 20px;
+  /* The same edge every card in the system keeps: a panel listed under a card
+     used to run 20px while the card above it ran 16, so two labels one level
+     apart never lined up. */
+  padding: var(--space-4) var(--card-px);
 }
 
 .channel-head {
@@ -1218,9 +1482,9 @@ button.primary:disabled,
 }
 
 .topic+.topic {
-  margin-top: 14px;
-  padding-top: 14px;
-  border-top: 1px solid var(--border);
+  margin-top: var(--space-4);
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--rule);
 }
 
 /*
@@ -1442,26 +1706,15 @@ button.primary:disabled,
   min-width: 0;
 }
 
+/* A `.check` with a place on the login card. The layout is the shared one. */
 .login-remember {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-top: 16px;
-  font-size: 13px;
-  color: var(--text-primary);
-  cursor: pointer;
+  margin-top: var(--space-4);
 }
 
-.login-remember input {
-  width: 15px;
-  height: 15px;
-  margin: 0;
-  accent-color: var(--brand);
-  cursor: pointer;
-}
-
+/* Indented to the label's own left edge — the box's width plus the gap — so
+   the note reads as belonging to the choice above it. */
 .login-note {
-  margin: 4px 0 0 23px;
+  margin: var(--space-1) 0 0 calc(15px + var(--space-2));
   color: var(--muted);
   font-size: 12px;
 }
@@ -1497,8 +1750,8 @@ button.primary:disabled,
 }
 
 .review {
-  padding: 16px 0;
-  border-bottom: 1px solid var(--border);
+  padding: var(--space-4) 0;
+  border-bottom: 1px solid var(--rule);
 }
 
 .review:first-child {
@@ -2141,7 +2394,7 @@ button.primary:disabled,
   text-align: right;
   vertical-align: top;
   white-space: nowrap;
-  border-bottom: 1px solid var(--grid);
+  border-bottom: 1px solid var(--rule);
 }
 
 .funnel-table thead th {
@@ -2603,16 +2856,14 @@ button.primary:disabled,
 /*
  * A column of form rows with even spacing.
  *
- * `.field-row` carries no vertical margin because everywhere else it appears
- * exactly once, inside a list item that already spaces it. The BigQuery
- * connection form is the first place several of them stack, so the spacing
- * lives here rather than being added to `.field-row` and re-spacing every
- * existing form.
+ * The form's own column gap is the section gap; this is the tighter gap
+ * between fields *within* a section, which is why it survives now that
+ * `.channel-form` owns the rhythm.
  */
 .form-stack {
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: var(--space-4);
 }
 
 /* The stack owns the rhythm; the children's own margins would double it. */
