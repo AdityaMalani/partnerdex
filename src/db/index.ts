@@ -2,7 +2,7 @@ import Database from 'better-sqlite3';
 import fs from 'node:fs';
 import path from 'node:path';
 import { getConfig } from '../config.js';
-import { ADD_APP_CLICK_EVENT, LISTING_VIEW_EVENT } from '../bigquery/events.js';
+import { migrate } from './migrate.js';
 import { SCHEMA_SQL } from './schema.js';
 
 export type Db = Database.Database;
@@ -19,119 +19,13 @@ export function getDb(): Db {
 
   const db = new Database(runtime.databasePath);
   db.pragma('busy_timeout = 5000');
+  // Schema first, then the changes it cannot express. A migration may reference
+  // a table SCHEMA_SQL creates, so the order is load-bearing.
   db.exec(SCHEMA_SQL);
   migrate(db);
 
   handle = db;
   return db;
-}
-
-/**
- * The few changes `CREATE TABLE IF NOT EXISTS` cannot make on its own.
- *
- * The schema above is idempotent for a *new* database and silent for an
- * existing one — a table that is already there is left exactly as it was,
- * including columns that have since moved or been dropped. This closes that
- * gap, and only for columns: anything structural enough to need a rebuild would
- * want a real migration ledger, and nothing here has earned one yet.
- */
-function migrate(db: Db): void {
-  const columns = (table: string): Set<string> =>
-    new Set(
-      (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map(
-        (row) => row.name,
-      ),
-    );
-
-  // The GA4 export dataset moved from the connection to the app. A partner
-  // running one GA4 property per listing has a dataset per app, so a single
-  // connection-level value made the common case the awkward one.
-  const connection = columns('bigquery_connection');
-  if (connection.has('dataset')) {
-    db.exec('ALTER TABLE bigquery_connection DROP COLUMN dataset');
-  }
-
-  /*
-   * The GA4 event names stopped being settings.
-   *
-   * A database configured before that holds whichever names were entered, and
-   * listing traffic collected under them. Rows are typed by *step*, not by
-   * event name, so anything pulled as `view_item` is already labelled
-   * "listing view" and would sit beside the `page_view` rows counting the same
-   * visit twice. Where the stored names differ from the ones now compiled in,
-   * the collected traffic and its watermarks go, and the next sync re-reads the
-   * range. Nothing is lost that BigQuery cannot re-serve.
-   */
-  if (connection.has('view_event') || connection.has('click_event')) {
-    const row = db
-      .prepare('SELECT view_event, click_event FROM bigquery_connection')
-      .get() as { view_event?: string; click_event?: string } | undefined;
-
-    if (
-      row &&
-      (row.view_event !== LISTING_VIEW_EVENT || row.click_event !== ADD_APP_CLICK_EVENT)
-    ) {
-      db.exec('DELETE FROM listing_events');
-      db.exec(`DELETE FROM sync_state WHERE key LIKE 'bigquery:%'`);
-      db.exec('DELETE FROM metric_cache');
-    }
-
-    if (connection.has('view_event')) db.exec('ALTER TABLE bigquery_connection DROP COLUMN view_event');
-    if (connection.has('click_event')) db.exec('ALTER TABLE bigquery_connection DROP COLUMN click_event');
-  }
-
-  const sources = columns('bigquery_app_sources');
-  if (sources.size > 0 && !sources.has('location')) {
-    db.exec('ALTER TABLE bigquery_app_sources ADD COLUMN location TEXT');
-  }
-
-  /*
-   * Install intervals learned which event opened them.
-   *
-   * The column defaults to 'installed', which is wrong for every interval a
-   * reopening opened — and the table is only rewritten by the next sync, so a
-   * default left to stand would report reopenings as installs until then. The
-   * backfill reads it straight off the raw events the interval was built from:
-   * an exact match on the opening timestamp, preferring a real install where a
-   * shop somehow carries both at the same instant. Cached figures computed
-   * under the old reading go with it.
-   */
-  const installs = columns('install_intervals');
-  if (installs.size > 0 && !installs.has('started_by')) {
-    db.exec(
-      `ALTER TABLE install_intervals ADD COLUMN started_by TEXT NOT NULL DEFAULT 'installed'`,
-    );
-    db.exec(
-      `UPDATE install_intervals AS t
-          SET started_by = 'reactivated'
-        WHERE EXISTS (SELECT 1 FROM app_events e
-                       WHERE e.app_id = t.app_id AND e.shop_id = t.shop_id
-                         AND e.occurred_at = t.started_at
-                         AND e.type = 'RELATIONSHIP_REACTIVATED')
-          AND NOT EXISTS (SELECT 1 FROM app_events e
-                           WHERE e.app_id = t.app_id AND e.shop_id = t.shop_id
-                             AND e.occurred_at = t.started_at
-                             AND e.type = 'RELATIONSHIP_INSTALLED')`,
-    );
-    db.exec('DELETE FROM metric_cache');
-  }
-
-  // Who a listing event belongs to became a resolved value rather than always
-  // the browser cookie. Existing rows keep a blank one and fall back to
-  // `anonymous_id` at read time, so no re-sync is needed to keep counting.
-  const listing = columns('listing_events');
-  if (listing.size > 0) {
-    if (!listing.has('user_key')) {
-      db.exec(`ALTER TABLE listing_events ADD COLUMN user_key TEXT NOT NULL DEFAULT ''`);
-    }
-    // Only once the column is certain to exist. In the schema block this ran
-    // before the ALTER above and brought the process down on any database
-    // created before the column.
-    db.exec(
-      `CREATE INDEX IF NOT EXISTS idx_listing_events_user
-         ON listing_events (app_id, type, user_key)`,
-    );
-  }
 }
 
 export function closeDb(): void {
