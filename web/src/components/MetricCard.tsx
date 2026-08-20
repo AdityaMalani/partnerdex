@@ -6,6 +6,7 @@ import {
   BarPlot,
   DataTable,
   LinePlot,
+  ShareTable,
   StackedAreaPlot,
   useChartData,
   type ChartSeries,
@@ -48,16 +49,24 @@ export function MetricCard({
 
   const breakdown = spec.breakdown ? metric?.series ?? [] : [];
 
+  // A table identifies its rows and columns by their headers, so the four-slot
+  // cap that keeps a plot legible does not apply — it would silently drop the
+  // very entries the reader asked to see.
+  const isTable = spec.plot === 'table';
+  const isShare = spec.plot === 'share';
+  const isFigures = isTable || isShare;
+
   const series = useMemo<ChartSeries[]>(() => {
     if (breakdown.length > 0) {
-      return breakdown.slice(0, SLOT.length).map((item, index) => ({
+      const shown = isFigures ? breakdown : breakdown.slice(0, SLOT.length);
+      return shown.map((item, index) => ({
         key: item.key,
         name: item.name,
-        color: SLOT[index]!,
+        color: SLOT[index % SLOT.length]!,
       }));
     }
     return [{ key: 'value', name: spec.label, color: spec.tone ? TONE[spec.tone] : SLOT[0]! }];
-  }, [breakdown, spec.label, spec.tone]);
+  }, [breakdown, isFigures, spec.label, spec.tone]);
 
   const total = useMemo(
     () => [
@@ -89,7 +98,7 @@ export function MetricCard({
   const height = spec.full ? 260 : 150;
 
   const plot =
-    spec.plot === 'area' ? (
+    isFigures ? null : spec.plot === 'area' ? (
       <StackedAreaPlot
         data={data}
         series={series}
@@ -126,8 +135,9 @@ export function MetricCard({
           {spec.subtitle ? <p className="card-subtitle">{spec.subtitle}</p> : null}
         </div>
         {/* Multi-series cards owe the reader a table: past two series, colour
-            alone stops being a reliable way to pick one out. */}
-        {series.length > 1 ? (
+            alone stops being a reliable way to pick one out. A card that is
+            already a table has nowhere to toggle to. */}
+        {series.length > 1 && !isFigures ? (
           <button
             type="button"
             className="card-toggle"
@@ -150,7 +160,7 @@ export function MetricCard({
         <Comparison metric={metric} invert={spec.invertDelta ?? false} />
       )}
 
-      {series.length > 1 ? (
+      {series.length > 1 && !isFigures ? (
         <div className="legend">
           {series.map((item) => (
             <span className="legend-item" key={item.key}>
@@ -161,13 +171,23 @@ export function MetricCard({
         </div>
       ) : null}
 
-      {showTable ? (
+      {isShare ? (
+        <ShareTable
+          series={series}
+          data={data}
+          format={format}
+          currency={currency}
+          partLabel={spec.share?.partLabel ?? 'Part'}
+          totalLabel={spec.share?.totalLabel ?? 'Total'}
+        />
+      ) : showTable || isTable ? (
         <DataTable
           series={series}
           data={data}
           format={format}
           currency={currency}
           interval={interval}
+          ledger={spec.ledger}
         />
       ) : (
         plot

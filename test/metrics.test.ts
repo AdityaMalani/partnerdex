@@ -1291,3 +1291,331 @@ describe('billing cadence before the first sale settles', () => {
     );
   });
 });
+
+/**
+ * MRR movement — the accounting view of the same money the MRR report levels.
+ *
+ * Two invariants carry this report, and both are asserted rather than assumed:
+ * every row adds across to Net (the six categories are exhaustive over the
+ * events that carry a delta), and the Net summed over all of history lands on
+ * the MRR the as-of reconstruction reports (the ledger and the level are two
+ * independent paths through the same facts).
+ */
+describe('MRR movement (spec 2.4)', () => {
+  beforeEach(() => resetEnvironment());
+
+  const CATEGORIES = ['added', 'frozen', 'unfrozen', 'churned', 'upgraded', 'downgraded'];
+
+  const columnAt = (response: ReturnType<typeof runMetric>, key: string, date: string): number => {
+    const series = response.series?.find((item) => item.key === key);
+    if (!series) throw new Error(`No "${key}" column. Got: ${response.series?.map((s) => s.key).join(', ')}`);
+    const point = series.data.find((entry) => entry.date.startsWith(date));
+    if (!point) throw new Error(`No bucket starting ${date} in "${key}".`);
+    return point.value;
+  };
+
+  /** Every bucket's categories must add across to the Net column. */
+  const assertRowsBalance = (response: ReturnType<typeof runMetric>) => {
+    const net = response.series?.find((item) => item.key === 'net');
+    assert.ok(net, 'the report carries a Net column');
+    net.data.forEach((point, idx) => {
+      const parts = CATEGORIES.reduce(
+        (sum, key) => sum + (response.series!.find((s) => s.key === key)!.data[idx]!.value),
+        0,
+      );
+      assert.equal(
+        Math.round(parts * 100) / 100,
+        point.value,
+        `bucket ${point.date} does not add across to its net`,
+      );
+    });
+  };
+
+  it('books a first paid subscription as new MRR in the month it starts paying', () => {
+    seed([
+      {
+        chargeRef: '1',
+        shopId: '10',
+        amount: 50,
+        activatedAt: '2024-02-01T00:00:00Z',
+        firstSaleAt: '2024-02-01T00:00:00Z',
+      },
+    ]);
+
+    const response = runMetric('mrr_movement', monthly, { now: NOW });
+    assert.equal(columnAt(response, 'added', '2024-02'), 50);
+    assert.equal(columnAt(response, 'net', '2024-02'), 50);
+    // A level persists; a movement does not. March saw no movement at all, even
+    // though the subscription was live throughout it.
+    assert.equal(columnAt(response, 'net', '2024-03'), 0);
+    assertRowsBalance(response);
+  });
+
+  it('books a cancellation as a negative in the churned column', () => {
+    seed([
+      {
+        chargeRef: '1',
+        shopId: '10',
+        amount: 50,
+        activatedAt: '2024-02-01T00:00:00Z',
+        firstSaleAt: '2024-02-01T00:00:00Z',
+        churnedAt: '2024-04-10T00:00:00Z',
+      },
+    ]);
+
+    const response = runMetric('mrr_movement', monthly, { now: NOW });
+    assert.equal(columnAt(response, 'churned', '2024-04'), -50);
+    assert.equal(columnAt(response, 'net', '2024-04'), -50);
+    // The whole window nets to nothing: it arrived and it left inside the range.
+    assert.equal(response.value, 0);
+    assertRowsBalance(response);
+  });
+
+  it('separates a freeze from a loss, and reverses it on the thaw', () => {
+    seed([
+      {
+        chargeRef: '1',
+        shopId: '10',
+        amount: 80,
+        activatedAt: '2024-01-05T00:00:00Z',
+        firstSaleAt: '2024-01-05T00:00:00Z',
+        frozenAt: '2024-03-01T00:00:00Z',
+        unfrozenAt: '2024-05-01T00:00:00Z',
+      },
+    ]);
+
+    const response = runMetric('mrr_movement', monthly, { now: NOW });
+    assert.equal(columnAt(response, 'frozen', '2024-03'), -80);
+    assert.equal(columnAt(response, 'churned', '2024-03'), 0, 'a freeze is not a churn');
+    assert.equal(columnAt(response, 'unfrozen', '2024-05'), 80);
+    assertRowsBalance(response);
+  });
+
+  it('books a plan change as an upgrade rather than a churn and a new sale', () => {
+    seed([
+      {
+        chargeRef: 'small',
+        shopId: '10',
+        amount: 30,
+        activatedAt: '2024-01-10T00:00:00Z',
+        firstSaleAt: '2024-01-10T00:00:00Z',
+        churnedAt: '2024-03-15T00:00:00Z',
+      },
+      {
+        chargeRef: 'large',
+        shopId: '10',
+        amount: 90,
+        activatedAt: '2024-03-15T00:00:00Z',
+        firstSaleAt: '2024-03-15T00:00:00Z',
+      },
+    ]);
+
+    const response = runMetric('mrr_movement', monthly, { now: NOW });
+    assert.equal(columnAt(response, 'added', '2024-01'), 30, 'the original sale');
+    // Only the difference moves: the merchant was already paying 30.
+    assert.equal(columnAt(response, 'upgraded', '2024-03'), 60);
+    assert.equal(columnAt(response, 'churned', '2024-03'), 0, 'the cancel was half of the change');
+    assert.equal(columnAt(response, 'added', '2024-03'), 0, 'and the activation was the other half');
+    assertRowsBalance(response);
+  });
+
+  it('books a move to a cheaper plan as a downgrade', () => {
+    seed([
+      {
+        chargeRef: 'large',
+        shopId: '10',
+        amount: 90,
+        activatedAt: '2024-01-10T00:00:00Z',
+        firstSaleAt: '2024-01-10T00:00:00Z',
+        churnedAt: '2024-03-15T00:00:00Z',
+      },
+      {
+        chargeRef: 'small',
+        shopId: '10',
+        amount: 30,
+        activatedAt: '2024-03-15T00:00:00Z',
+        firstSaleAt: '2024-03-15T00:00:00Z',
+      },
+    ]);
+
+    const response = runMetric('mrr_movement', monthly, { now: NOW });
+    assert.equal(columnAt(response, 'downgraded', '2024-03'), -60);
+    assertRowsBalance(response);
+  });
+
+  it('nets the whole window to the movement inside it, not the level', () => {
+    seed([
+      {
+        chargeRef: 'kept',
+        shopId: '10',
+        amount: 40,
+        activatedAt: '2024-02-01T00:00:00Z',
+        firstSaleAt: '2024-02-01T00:00:00Z',
+      },
+      {
+        chargeRef: 'lost',
+        shopId: '11',
+        amount: 25,
+        activatedAt: '2024-02-01T00:00:00Z',
+        firstSaleAt: '2024-02-01T00:00:00Z',
+        churnedAt: '2024-05-01T00:00:00Z',
+      },
+    ]);
+
+    const response = runMetric('mrr_movement', monthly, { now: NOW });
+    assert.equal(columnAt(response, 'added', '2024-02'), 65);
+    assert.equal(columnAt(response, 'churned', '2024-05'), -25);
+    assert.equal(response.value, 40, 'headline is the net movement across the range');
+    assertRowsBalance(response);
+  });
+
+  /**
+   * The ledger and the level are computed from different tables by different
+   * code. Over all of history they must agree, or one of them is wrong.
+   */
+  it('reconciles with the reconstructed MRR level over all of history', () => {
+    seed([
+      {
+        chargeRef: 'a',
+        shopId: '10',
+        amount: 55,
+        activatedAt: '2024-01-05T00:00:00Z',
+        firstSaleAt: '2024-01-05T00:00:00Z',
+      },
+      {
+        chargeRef: 'b',
+        shopId: '11',
+        amount: 120,
+        activatedAt: '2024-02-01T00:00:00Z',
+        firstSaleAt: '2024-02-01T00:00:00Z',
+        churnedAt: '2024-04-01T00:00:00Z',
+      },
+      {
+        chargeRef: 'c',
+        shopId: '12',
+        amount: 20,
+        activatedAt: '2024-03-01T00:00:00Z',
+        firstSaleAt: '2024-03-01T00:00:00Z',
+        frozenAt: '2024-05-01T00:00:00Z',
+      },
+    ]);
+
+    const allTime = { period: 'all_time', interval: 'month', end: '2024-06-30' };
+    const movement = runMetric('mrr_movement', allTime, { now: NOW });
+    const level = runMetric('mrr', allTime, { now: NOW });
+
+    assert.equal(movement.value, level.value);
+    assertRowsBalance(movement);
+  });
+
+  /**
+   * The rows balance by construction now that Net is summed from the columns,
+   * so the claim worth testing moved: that the six categories really do cover
+   * every event carrying a delta, with nothing falling outside them.
+   */
+  it('leaves no movement outside the six categories', () => {
+    seed([
+      {
+        chargeRef: 'a',
+        shopId: '10',
+        amount: 35,
+        activatedAt: '2024-01-05T00:00:00Z',
+        firstSaleAt: '2024-01-20T00:00:00Z',
+        frozenAt: '2024-03-01T00:00:00Z',
+        unfrozenAt: '2024-04-01T00:00:00Z',
+      },
+      {
+        chargeRef: 'b',
+        shopId: '11',
+        amount: 90,
+        activatedAt: '2024-02-01T00:00:00Z',
+        firstSaleAt: '2024-02-01T00:00:00Z',
+        churnedAt: '2024-05-01T00:00:00Z',
+      },
+    ]);
+
+    const response = runMetric('mrr_movement', { period: 'all_time', interval: 'month', end: '2024-06-30' }, { now: NOW });
+    assert.equal(response.meta?.unattributed, 0);
+  });
+
+  it('leaves test subscriptions out, the same as every other money report', () => {
+    seed([
+      {
+        chargeRef: 'real',
+        shopId: '10',
+        amount: 45,
+        activatedAt: '2024-02-01T00:00:00Z',
+        firstSaleAt: '2024-02-01T00:00:00Z',
+      },
+      {
+        chargeRef: 'fake',
+        shopId: '11',
+        amount: 999,
+        test: true,
+        activatedAt: '2024-02-01T00:00:00Z',
+        firstSaleAt: '2024-02-01T00:00:00Z',
+      },
+    ]);
+
+    assert.equal(columnAt(runMetric('mrr_movement', monthly, { now: NOW }), 'added', '2024-02'), 45);
+  });
+});
+
+/**
+ * MRR by app is read as a table of every app and its share, so the report owes
+ * the reader a complete split rather than a legible one: no tail folded into
+ * "Other", and an order a reader can scan.
+ */
+describe('MRR contribution by app', () => {
+  beforeEach(() => resetEnvironment({ PARTNER_APP_IDS: '' }));
+
+  /** Six apps, deliberately more than the four the old palette could colour. */
+  const seedSixApps = () => {
+    const prices = [90, 15, 60, 5, 30, 45];
+    prices.forEach((amount, index) => {
+      seedForApp(String(100 + index), `c${index}`, String(10 + index), amount);
+    });
+    return prices;
+  };
+
+  it('gives every app its own row, past the four a palette could colour', () => {
+    seedSixApps();
+
+    const response = runMetric('mrr_by_app', monthly, { now: NOW });
+    assert.equal(response.series?.length, 6, 'six apps, six series');
+    assert.ok(
+      !response.series?.some((item) => item.key === 'other'),
+      'and no tail folded away into "Other"',
+    );
+    assert.equal(response.meta?.apps, 6);
+  });
+
+  it('orders them largest first', () => {
+    seedSixApps();
+
+    const response = runMetric('mrr_by_app', monthly, { now: NOW });
+    const latest = response.series!.map((item) => item.data.at(-1)!.value);
+    assert.deepEqual(latest, [90, 60, 45, 30, 15, 5]);
+  });
+
+  it('splits the MRR total without losing or inventing any of it', () => {
+    const prices = seedSixApps();
+
+    const byApp = runMetric('mrr_by_app', monthly, { now: NOW });
+    const mrr = runMetric('mrr', monthly, { now: NOW });
+
+    const parts = byApp.series!.reduce((sum, item) => sum + item.data.at(-1)!.value, 0);
+    assert.equal(parts, prices.reduce((sum, price) => sum + price, 0));
+    assert.equal(parts, mrr.value, 'the parts are the whole, split');
+    assert.equal(byApp.value, mrr.value);
+  });
+
+  it('reports no apps rather than an empty band when nothing is live', () => {
+    seed([]);
+
+    const response = runMetric('mrr_by_app', monthly, { now: NOW });
+    assert.equal(response.series?.length, 0);
+    assert.equal(response.meta?.apps, 0);
+    assert.equal(response.value, 0);
+  });
+});

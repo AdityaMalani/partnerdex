@@ -6,7 +6,16 @@
  * dashboard knows about. Adding a card to a page is a one-line change here.
  */
 
-export type PlotKind = 'line' | 'bar' | 'area';
+/**
+ * How a card draws its data. Two of these are not plots:
+ *
+ *   `table` — a ledger with seven signed columns has no shape worth seeing, and
+ *     the reader's question, "what did each column contribute?", is answered by
+ *     the figures.
+ *   `share` — a composition read at one instant: rows are the parts, not the
+ *     buckets, each with its value and its share of the whole.
+ */
+export type PlotKind = 'line' | 'bar' | 'area' | 'table' | 'share';
 
 export interface CardSpec {
   /** Key into the overview response, and the metric the server computes. */
@@ -16,6 +25,14 @@ export interface CardSpec {
   plot: PlotKind;
   /** Draw the metric's component breakdown instead of its total. */
   breakdown?: boolean;
+  /**
+   * Append a row totalling each column over the whole window, and colour the
+   * signs. Only flows total meaningfully — summing a level across twelve months
+   * produces a number that means nothing.
+   */
+  ledger?: { totalLabel: string; emphasize?: string };
+  /** What a `share` card calls its rows, and the line that totals them. */
+  share?: { partLabel: string; totalLabel: string };
   /**
    * What the plot is measuring, when that is not neutral. Growth draws green and
    * churn draws red, per the design system; everything else draws in the brand.
@@ -163,12 +180,23 @@ const REVENUE: PageSpec = {
       plot: 'line',
     },
     {
-      metric: 'mrr_by_app',
-      label: 'MRR contribution by app',
-      subtitle: 'Where the recurring revenue comes from.',
-      plot: 'area',
+      metric: 'mrr_movement',
+      label: 'MRR movement',
+      subtitle:
+        'Where the recurring revenue moved in each period. Losses are negative, so a row adds across to Net. Read from the event ledger, which counts money from the first paid charge whichever way the trials filter is set.',
+      plot: 'table',
       breakdown: true,
       full: true,
+      ledger: { totalLabel: 'Whole range', emphasize: 'net' },
+    },
+    {
+      metric: 'mrr_by_app',
+      label: 'MRR contribution by app',
+      subtitle: 'Where the recurring revenue comes from, as it stands at the end of the range.',
+      plot: 'share',
+      breakdown: true,
+      full: true,
+      share: { partLabel: 'App', totalLabel: 'All apps' },
     },
   ],
 };

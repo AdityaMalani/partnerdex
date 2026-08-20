@@ -7,6 +7,7 @@ import {
   grossEarningsReport,
   mrrByAppReport,
   mrrGrowthReport,
+  mrrMovementReport,
   mrrReport,
 } from './reports/revenue.js';
 import {
@@ -72,6 +73,13 @@ export const METRICS: MetricDefinition[] = [
     label: 'MRR growth',
     description: 'Bucket-over-bucket percentage change in MRR.',
     run: mrrGrowthReport,
+  },
+  {
+    key: 'mrr_movement',
+    label: 'MRR movement',
+    description:
+      'Where MRR moved inside each bucket: new, frozen, unfrozen, churned, upgraded, downgraded, and the net of them.',
+    run: mrrMovementReport,
   },
   {
     key: 'mrr_by_app',

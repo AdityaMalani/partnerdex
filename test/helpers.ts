@@ -207,14 +207,15 @@ export function pointAt(response: { timeSeries: Array<{ value: number; periodSta
  * Seeds one live paid subscription for an arbitrary app id, so tests can build a
  * shop that subscribes to more than one app.
  */
-export function seedForApp(appId: string, chargeRef: string, shopId = '10') {
+export function seedForApp(appId: string, chargeRef: string, shopId = '10', amount = 25) {
   const db = getDb();
+  const price = String(amount);
   const charge = {
     id: `gid://shopify/AppSubscription/${chargeRef}`,
     name: 'Plan',
     test: false,
     billingOn: null,
-    amount: { amount: '25', currencyCode: 'USD' },
+    amount: { amount: price, currencyCode: 'USD' },
   };
   insertAppEvents(db, appId, [
     {
@@ -234,9 +235,9 @@ export function seedForApp(appId: string, chargeRef: string, shopId = '10') {
       shop: shop(shopId),
       chargeId: `gid://shopify/AppSubscription/${chargeRef}`,
       billingInterval: 'EVERY_30_DAYS',
-      grossAmount: { amount: '25', currencyCode: 'USD' },
-      netAmount: { amount: '21', currencyCode: 'USD' },
-      shopifyFee: { amount: '4', currencyCode: 'USD' },
+      grossAmount: { amount: price, currencyCode: 'USD' },
+      netAmount: { amount: price, currencyCode: 'USD' },
+      shopifyFee: { amount: '0', currencyCode: 'USD' },
     },
   ]);
   rebuildDerivedTables(db);

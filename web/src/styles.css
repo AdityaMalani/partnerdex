@@ -938,6 +938,55 @@ thead th {
   text-transform: uppercase;
 }
 
+/*
+ * A ledger table, where the sign of a figure is half of what it says.
+ *
+ * Colour is the second cue, never the only one: the minus sign is already in
+ * the formatted value, so the palette speeds the read for those who see it and
+ * takes nothing away from those who do not.
+ */
+.cell-down {
+  color: var(--delta-down);
+}
+
+.cell-up {
+  color: var(--delta-up);
+}
+
+/* The column the others add up to, carried at full weight so the eye lands on
+   it after crossing the row rather than having to hunt for the last cell. */
+.cell-emphasis {
+  font-weight: 600;
+}
+
+/* A share is the same fact as the figure beside it, read a second way, so it
+   sits back rather than competing with the money for attention. */
+.cell-share {
+  color: var(--text-secondary);
+}
+
+thead th.cell-emphasis {
+  color: var(--text-primary);
+}
+
+/*
+ * The window total. A stronger rule above it separates the summary from the
+ * periods, the way a rule under a column of figures does on paper.
+ */
+tfoot th,
+tfoot td {
+  border-bottom: none;
+  border-top: 2px solid var(--rule);
+  font-weight: 600;
+}
+
+/* Only where a total row follows: elsewhere the closing rule is the table's
+   own bottom edge and is doing its job. */
+table:has(tfoot) tbody tr:last-child th,
+table:has(tfoot) tbody tr:last-child td {
+  border-bottom: none;
+}
+
 /* ------------------------------------------------------------- customers */
 
 /*

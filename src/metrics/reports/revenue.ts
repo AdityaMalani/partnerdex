@@ -125,15 +125,19 @@ export function mrrGrowthReport(context: MetricContext): MetricResponse {
 }
 
 /**
- * The palette carries four categorical slots, so at most four series can be
- * told apart by colour. Beyond that the tail folds into "Other" rather than
- * inventing a fifth hue.
- */
-const MAX_APP_SERIES = 4;
-
-/**
  * MRR split by the app earning it. The components sum to the MRR report's total
  * by construction — same predicate, one more GROUP BY column.
+ *
+ * Every app gets its own row. This used to fold the tail past the fourth into
+ * an "Other" band, because the palette carries four categorical slots and a
+ * fifth hue would not have been distinguishable from the others. The dashboard
+ * reads this as a table now, where a row is identified by its name rather than
+ * its colour, so the cap has nothing left to protect — and folding the tail
+ * would have hidden exactly the figure the table exists to show.
+ *
+ * Ordered largest first. The old order was by app id, which kept a colour
+ * attached to an app as the ranking moved underneath it; a table has no colours
+ * to keep stable, and size is the order a reader wants to scan.
  */
 export function mrrByAppReport(context: MetricContext): MetricResponse {
   const buckets = context.window.buckets;
@@ -146,35 +150,23 @@ export function mrrByAppReport(context: MetricContext): MetricResponse {
     if (point.appName) nameByApp.set(point.appId, point.appName);
   }
 
-  /**
-   * Which apps get their own slot is a size question, but their colour is not:
-   * the kept ids are sorted by id so a slot belongs to an app rather than to a
-   * rank, and adding a bigger app later does not repaint the others.
-   */
   const ranked = [...totalByApp.entries()].sort((a, b) => b[1] - a[1]).map(([id]) => id);
-  const folds = ranked.length > MAX_APP_SERIES;
-  const kept = new Set(ranked.slice(0, folds ? MAX_APP_SERIES - 1 : MAX_APP_SERIES));
-  const keptIds = [...kept].sort();
 
   const byIdxAndApp = new Map<string, number>();
   for (const point of points) {
-    const app = kept.has(point.appId) ? point.appId : 'other';
-    const key = `${point.idx} ${app}`;
+    const key = `${point.idx} ${point.appId}`;
     byIdxAndApp.set(key, (byIdxAndApp.get(key) ?? 0) + point.mrr);
   }
 
   const dates = buckets.map((bucket) => bucket.start.toISOString());
-  const seriesFor = (key: string, name: string): NamedSeries => ({
-    key,
-    name,
+  const series: NamedSeries[] = ranked.map((id) => ({
+    key: id,
+    name: nameByApp.get(id) ?? `App ${id}`,
     data: dates.map((date, idx) => ({
       date,
-      value: Math.round((byIdxAndApp.get(`${idx} ${key}`) ?? 0) * 100) / 100,
+      value: Math.round((byIdxAndApp.get(`${idx} ${id}`) ?? 0) * 100) / 100,
     })),
-  });
-
-  const series = keptIds.map((id) => seriesFor(id, nameByApp.get(id) ?? `App ${id}`));
-  if (folds) series.push(seriesFor('other', `Other (${ranked.length - kept.size} apps)`));
+  }));
 
   const values = buckets.map((_, idx) =>
     series.reduce((total, item) => total + (item.data[idx]?.value ?? 0), 0),
@@ -190,9 +182,7 @@ export function mrrByAppReport(context: MetricContext): MetricResponse {
     series,
     meta: {
       apps: totalByApp.size,
-      note: folds
-        ? `Only the ${MAX_APP_SERIES - 1} largest apps get their own band; the rest are folded into "Other".`
-        : undefined,
+      basis: 'MRR as of the end of the range, split by app and ordered largest first',
     },
   });
 }
@@ -314,6 +304,145 @@ export function grossEarningsReport(context: MetricContext): MetricResponse {
       // Net is what actually reaches the payout after Shopify's revenue share;
       // carried in meta so the headline stays unambiguously gross.
       netEarnings: Math.round(netTotal * 100) / 100,
+    },
+  });
+}
+
+/**
+ * How MRR moved inside each bucket, as an accounting ledger rather than a level
+ * (spec 2.4 — the "movement" view).
+ *
+ * The source is `customer_events.net_change`, not the as-of reconstruction: a
+ * level tells you MRR fell by 400 last month, and only the ledger tells you
+ * that 900 arrived, 500 was upgraded onto, and 1,800 walked out. The six
+ * categories below are exhaustive over the events that carry a delta at all, so
+ * every row adds across to `Net` with nothing unattributed — `test/metrics`
+ * asserts it rather than trusting it.
+ *
+ * Signs are kept as the ledger stores them: losses are negative. That is what
+ * lets a reader sum a row by eye instead of tracking which columns to subtract.
+ */
+const MOVEMENTS = [
+  // Money arrives at the first paid charge, so a trial converting is an
+  // acquisition here even though the subscription activated months earlier.
+  // Win-backs join it: both are an install that was paying nothing and now is.
+  ['added', 'New', ['subscribed', 'resubscribed', 'trial_converted']],
+  ['frozen', 'Frozen', ['subscription_frozen']],
+  ['unfrozen', 'Unfrozen', ['subscription_unfrozen']],
+  ['churned', 'Churned', ['unsubscribed']],
+  // Direction is the plan's list price, the delta is what is actually earned,
+  // and the two can disagree — an upgrade taken mid-trial moves less money than
+  // the price list suggests. Summing signed deltas keeps the ledger balanced
+  // whichever way an individual movement lands.
+  ['upgraded', 'Upgraded', ['upgraded']],
+  ['downgraded', 'Downgraded', ['downgraded']],
+] as const satisfies ReadonlyArray<readonly [string, string, readonly string[]]>;
+
+type MovementRow = { idx: number; net: number } & Record<string, number>;
+
+export function mrrMovementReport(context: MetricContext): MetricResponse {
+  const buckets = context.window.buckets;
+  const cte = bucketsCte(buckets);
+  const params: Record<string, unknown> = { ...cte.params };
+
+  const appNames = context.appIds.map((id, index) => {
+    params[`mapp${index}`] = id;
+    return `@mapp${index}`;
+  });
+  const appFilter = appNames.length > 0 ? `AND e.app_id IN (${appNames.join(', ')})` : '';
+
+  // The same gate the MRR report applies, so the two agree on which
+  // subscriptions are in scope. NULL is kept: an event with no charge behind it
+  // has no cadence to exclude on.
+  const annualFilter = context.asOf.includeAnnual
+    ? ''
+    : `AND (e.billing_interval IS NULL OR e.billing_interval <> 'ANNUAL')`;
+
+  const columns = MOVEMENTS.map(([key, , types]) => {
+    const names = types.map((type, index) => {
+      const name = `${key}_t${index}`;
+      params[name] = type;
+      return `@${name}`;
+    });
+    return `COALESCE(SUM(CASE WHEN e.type IN (${names.join(', ')}) THEN e.net_change ELSE 0 END), 0) AS ${key}`;
+  });
+
+  const rows = context.db
+    .prepare(
+      `WITH ${cte.sql}
+       SELECT b.idx AS idx,
+              ${columns.join(',\n              ')},
+              COALESCE(SUM(e.net_change), 0) AS net
+       FROM buckets b
+       LEFT JOIN customer_events e
+         ON e.suppressed = 0
+        AND e.net_change IS NOT NULL
+        AND e.occurred_at >= b.bucket_from
+        AND e.occurred_at < b.as_of
+        ${appFilter}
+        ${annualFilter}
+       GROUP BY b.idx
+       ORDER BY b.idx`,
+    )
+    .all(params) as MovementRow[];
+
+  const byIndex = new Map(rows.map((row) => [row.idx, row]));
+  const dates = buckets.map((bucket) => bucket.start.toISOString());
+  const round = (value: number): number => Math.round(value * 100) / 100;
+  const cell = (idx: number, key: string): number => round(byIndex.get(idx)?.[key] ?? 0);
+
+  /**
+   * Net is the sum of the columns as *displayed*, not an independently rounded
+   * total of the same events. The two differ by a cent often enough to matter,
+   * and a ledger the reader adds across has to close: a row that lands a penny
+   * short reads as a bug in the figures rather than as rounding.
+   */
+  const net = buckets.map((_, idx) =>
+    round(MOVEMENTS.reduce((sum, [key]) => sum + cell(idx, key), 0)),
+  );
+
+  const series: NamedSeries[] = [
+    ...MOVEMENTS.map(([key, name]) => ({
+      key,
+      name,
+      data: dates.map((date, idx) => ({ date, value: cell(idx, key) })),
+    })),
+    { key: 'net', name: 'Net', data: dates.map((date, idx) => ({ date, value: net[idx]! })) },
+  ];
+
+  /**
+   * What the ledger moved that no column claimed. Zero by construction — the six
+   * categories cover every event type that carries a delta — so it is carried as
+   * an observable rather than an assurance: an event type that gains a
+   * `net_change` later shows up here instead of quietly going missing.
+   */
+  const unattributed = round(
+    buckets.reduce((total, _, idx) => total + (byIndex.get(idx)?.net ?? 0), 0) -
+      net.reduce((total, value) => total + value, 0),
+  );
+
+  return buildResponse({
+    metric: 'mrr_movement',
+    kind: 'flow',
+    format: 'money',
+    window: context.window,
+    values: net,
+    currency: context.currency,
+    series,
+    meta: {
+      basis: 'customer_events.net_change, suppressed rows excluded',
+      // Rounding alone, unless a delta-carrying event type has escaped the six
+      // categories — in which case this is the size of what is missing.
+      unattributed,
+      includeAnnual: context.asOf.includeAnnual,
+      // Worth stating rather than leaving to be discovered: the trials toggle
+      // moves the MRR card beside this one and cannot move this table. The
+      // ledger records money from the first paid charge, and a trial-inclusive
+      // delta is not a figure it holds.
+      includeTrials: false,
+      trialsNote:
+        'The ledger counts money from the first paid charge, so the trials filter does not apply here.',
+      note: 'Movement view. It may differ slightly from the change in the reconstructed MRR level, which reads a state rather than summing events.',
     },
   });
 }
