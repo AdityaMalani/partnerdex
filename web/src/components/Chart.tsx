@@ -162,7 +162,10 @@ export function ShareTable({
     total === 0 ? '—' : `${((value / total) * 100).toFixed(1)}%`;
 
   return (
-    <div className="table-wrap">
+    /* Three columns stretched across a full-width card strand the figures at the
+       far edge, and the eye loses the row on the way over. The table keeps its
+       natural width and the rest of the card stays empty. */
+    <div className="table-wrap share-wrap">
       <table>
         <thead>
           <tr>

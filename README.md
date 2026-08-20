@@ -115,7 +115,7 @@ If `DASHBOARD_PASSWORD` is configured (minimum 8 characters), the application se
 | **ARPU** | MRR divided by active paying population. `METRICS_BY_SHOP` determines whether population is counted by subscribers or individual subscriptions. |
 | **LTV** | ARPU divided by the monthly subscription churn rate. Represents an instantaneous, forward-looking cohort value. |
 | **MRR growth** | Percentage change in MRR compared to the start of the period. |
-| **MRR contribution by app** | MRR split by app. If there are more than four apps, the tail is grouped under "Other". |
+| **MRR contribution by app** | MRR as of the end of the range, split by the app earning it, with each app's share of the total. Every app gets its own row, ordered largest first — the parts sum to the MRR headline by construction. |
 | **MRR movement** | Where MRR moved inside each bucket, summed from the signed `net_change` on the event ledger: **New** (first subscriptions, win-backs and trial conversions), **Frozen**, **Unfrozen**, **Churned**, **Upgraded**, **Downgraded**, and the **Net** of them. Losses are negative, so each row adds across to Net. The six categories are exhaustive over the events that carry a delta. Because the ledger books money at the first paid charge, the trials toggle does not apply to it, and the net may differ slightly from the change in the reconstructed MRR level — a movement view and a level are two different readings of the same facts. |
 | **Trials** | Count of trials started in the period, split into converted and cancelled. |
 | **On trial** | Instantaneous count of active trials at that exact point in time. |

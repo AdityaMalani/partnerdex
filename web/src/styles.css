@@ -965,6 +965,13 @@ thead th {
   color: var(--text-secondary);
 }
 
+/* Wide enough for a long app name and two figures, narrow enough that the row
+   still reads as one line. Below that width it behaves like any other table and
+   scrolls. */
+.share-wrap table {
+  max-width: 640px;
+}
+
 thead th.cell-emphasis {
   color: var(--text-primary);
 }
