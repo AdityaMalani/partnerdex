@@ -126,6 +126,18 @@ function dashboardPassword(): string | null {
   return value;
 }
 
+/**
+ * Shared secret for POST /api/contacts/ingest (machine-to-machine).
+ *
+ * Separate from DASHBOARD_PASSWORD on purpose: that credential is for a human
+ * at a browser; this one is what app producers send as a bearer token. Null
+ * disables the endpoint with 503.
+ */
+function contactsIngestToken(): string | null {
+  const value = process.env.CONTACTS_INGEST_TOKEN?.trim() ?? '';
+  return value ? value : null;
+}
+
 /** `:memory:` is passed through verbatim; anything else is a real file path. */
 function databasePath(): string {
   const raw = optional('DATABASE_PATH', './data/partnerdex.db');
@@ -175,6 +187,8 @@ export interface Config {
      * the gate on; nothing else has to change.
      */
     password: string | null;
+    /** Null disables POST /api/contacts/ingest. */
+    contactsIngestToken: string | null;
   };
   scope: {
     appIds: string[];
@@ -248,6 +262,7 @@ export function getConfig(): Config {
     },
     auth: {
       password: dashboardPassword(),
+      contactsIngestToken: contactsIngestToken(),
     },
     scope: {
       appIds: appIds(),

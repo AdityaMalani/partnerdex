@@ -54,15 +54,16 @@ export interface PageSpec {
   blurb: string;
   cards: CardSpec[];
   /**
-   * Metric pages are a grid of cards over a shared time window. Customers and
-   * notifications are different shapes entirely — a searchable population, and
-   * a settings form — so they opt out of the window controls rather than
-   * showing filters that would not apply to them.
+   * Metric pages are a grid of cards over a shared time window. Customers,
+   * contacts, and notifications are different shapes entirely — a searchable
+   * population, a searchable people list, and a settings form — so they opt
+   * out of the window controls rather than showing filters that would not
+   * apply to them.
    *
    * Reviews is the one page that is both: cards over the shared window, and a
    * searchable list of the documents behind them.
    */
-  kind?: 'metrics' | 'customers' | 'notifications' | 'reviews' | 'listings' | 'funnel' | 'bigquery';
+  kind?: 'metrics' | 'customers' | 'contacts' | 'notifications' | 'reviews' | 'listings' | 'funnel' | 'bigquery';
   /**
    * Which shared filters this page shows, in order.
    *
@@ -81,6 +82,12 @@ export interface PageSpec {
    * change them afterwards.
    */
   defaults?: Partial<PageDefaults>;
+  /**
+   * Nested pages that appear under this item in the rail, only after the
+   * parent is the current section. Contacts lives under Customers this way:
+   * the child is not a sibling in the top-level list.
+   */
+  children?: PageSpec[];
 }
 
 export interface PageDefaults {
@@ -283,6 +290,15 @@ const CHURN: PageSpec = {
   ],
 };
 
+const CONTACTS: PageSpec = {
+  id: 'contacts',
+  label: 'Contacts',
+  title: 'Contacts',
+  blurb: 'Every person who logs into one of your apps, and the store they belong to.',
+  kind: 'contacts',
+  cards: [],
+};
+
 const CUSTOMERS: PageSpec = {
   id: 'customers',
   label: 'Customers',
@@ -290,6 +306,7 @@ const CUSTOMERS: PageSpec = {
   blurb: 'Every merchant, what they run today, and everything that has happened to them.',
   kind: 'customers',
   cards: [],
+  children: [CONTACTS],
 };
 
 const REVIEWS: PageSpec = {
@@ -387,7 +404,11 @@ export const NAV: NavGroup[] = [
   { label: 'Settings', pages: [LISTINGS, BIGQUERY, NOTIFICATIONS] },
 ];
 
-export const PAGES: PageSpec[] = NAV.flatMap((group) => group.pages);
+function flattenPages(pages: PageSpec[]): PageSpec[] {
+  return pages.flatMap((page) => [page, ...(page.children ?? [])]);
+}
+
+export const PAGES: PageSpec[] = NAV.flatMap((group) => flattenPages(group.pages));
 
 export function pageById(id: string): PageSpec {
   return PAGES.find((page) => page.id === id) ?? OVERVIEW;

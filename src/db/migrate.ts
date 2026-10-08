@@ -36,6 +36,49 @@ function columns(db: Db, table: string): Set<string> {
   return new Set(rows.map((row) => row.name));
 }
 
+/**
+ * Contacts store — Role 4. The Partner API never had this data, so nothing here
+ * can be recovered by re-syncing. Email is the natural key (email-global
+ * suppression assumes it). contact_shops is a separate table because one person
+ * can manage many stores and the same person can appear across apps;
+ * contact_suppressions is separate so an opt-out survives every rewrite of the
+ * rows around it. A contact_suppressions row is do-not-contact / opt-out, not
+ * erasure (erasure would delete the person).
+ */
+export const CONTACTS_SCHEMA_SQL = `
+CREATE TABLE IF NOT EXISTS contacts (
+  email         TEXT PRIMARY KEY,
+  first_name    TEXT,
+  last_name     TEXT,
+  is_suppressed INTEGER NOT NULL DEFAULT 0,
+  source        TEXT NOT NULL,
+  first_seen_at TEXT,
+  last_seen_at  TEXT,
+  created_at    TEXT NOT NULL,
+  updated_at    TEXT NOT NULL
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS contact_shops (
+  email         TEXT NOT NULL,
+  app_id        TEXT NOT NULL,
+  shop_id       TEXT NOT NULL,
+  role          TEXT NOT NULL DEFAULT 'staff',
+  match_method  TEXT NOT NULL DEFAULT 'none',
+  first_seen_at TEXT,
+  last_seen_at  TEXT,
+  PRIMARY KEY (email, app_id, shop_id)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS idx_contact_shops_shop ON contact_shops (app_id, shop_id);
+
+CREATE TABLE IF NOT EXISTS contact_suppressions (
+  email         TEXT PRIMARY KEY,
+  suppressed_at TEXT NOT NULL,
+  source        TEXT NOT NULL,
+  reason        TEXT
+) WITHOUT ROWID;
+`;
+
 export const MIGRATIONS: Migration[] = [
   /*
    * The BigQuery connection stopped carrying per-app and per-spelling settings.
@@ -151,6 +194,21 @@ export const MIGRATIONS: Migration[] = [
                                AND e.type = 'RELATIONSHIP_INSTALLED')`,
       );
       db.exec('DELETE FROM metric_cache');
+    },
+  },
+
+  /*
+   * Contacts — Role 4, fork-only. Numbered 3 rather than 1: migrations 1 and 2
+   * are the upstream BigQuery/funnel fixups (see issue #2 upstream), absorbed
+   * here from what was originally an unversioned `migrate()` in
+   * src/db/index.ts. This fork's contacts store shipped first locally and
+   * carried migration number 1 until that reconciliation — this body is
+   * unchanged from that version, only its version number moved.
+   */
+  {
+    version: 3,
+    up: (db) => {
+      db.exec(CONTACTS_SCHEMA_SQL);
     },
   },
 ];

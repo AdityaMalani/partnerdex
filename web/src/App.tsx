@@ -18,6 +18,7 @@ import {
 import { formatDateTime } from './format';
 import { CustomerDetail } from './components/CustomerDetail';
 import { Customers } from './components/Customers';
+import { Contacts } from './components/Contacts';
 import { Login } from './components/Login';
 import { MetricCard } from './components/MetricCard';
 import { Nav } from './components/Nav';
@@ -119,14 +120,19 @@ function greeting(): { title: string; blurb: string } {
  * can be linked and survives a reload, and the server's catch-all never has to
  * know about client routes.
  *
- * One segment deep is enough — `#/customers/12345` opens one merchant — which
- * keeps a single merchant as linkable as a report.
+ * `#/customers/12345` opens one merchant, which keeps a single merchant as
+ * linkable as a report. An optional third segment picks a section of that
+ * page — `#/customers/12345/contacts` — so a tab is linkable too.
  */
-function useRoute(): { pageId: string; param: string } {
+function useRoute(): { pageId: string; param: string; section: string } {
   const read = () => {
     const raw = window.location.hash.replace(/^#\/?/, '');
-    const [pageId = 'overview', param = ''] = raw.split('/');
-    return { pageId: pageId || 'overview', param: decodeURIComponent(param) };
+    const [pageId = 'overview', param = '', section = ''] = raw.split('/');
+    return {
+      pageId: pageId || 'overview',
+      param: decodeURIComponent(param),
+      section: decodeURIComponent(section),
+    };
   };
   const [route, setRoute] = useState(read);
 
@@ -225,6 +231,7 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
   }
 
   const isCustomers = page.kind === 'customers';
+  const isContacts = page.kind === 'contacts';
   const isNotifications = page.kind === 'notifications';
   const isReviews = page.kind === 'reviews';
   const isListings = page.kind === 'listings';
@@ -236,7 +243,7 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
   //
   // The funnel is the odd one: it takes the same filters but fetches its own
   // shape, so it shows the controls without joining the overview request.
-  const isMetrics = !isCustomers && !isNotifications && !isListings && !isBigQuery;
+  const isMetrics = !isCustomers && !isContacts && !isNotifications && !isListings && !isBigQuery;
   const filters = page.filters ?? DEFAULT_FILTERS;
 
   const [collapsed, setCollapsed] = useState(
@@ -554,6 +561,7 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
         !isReviews &&
         !isBigQuery &&
         !isFunnel &&
+        !isContacts &&
         status &&
         !hasData ? (
           <div className="notice">
@@ -578,11 +586,13 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
 
         {isCustomers ? (
           route.param ? (
-            <CustomerDetail shopId={route.param} appId={query.appId} />
+            <CustomerDetail shopId={route.param} appId={query.appId} section={route.section} />
           ) : (
             <Customers appId={query.appId} />
           )
         ) : null}
+
+        {isContacts ? <Contacts appId={query.appId} /> : null}
 
         {isNotifications ? <Notifications /> : null}
 

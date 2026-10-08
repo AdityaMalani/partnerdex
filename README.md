@@ -250,6 +250,7 @@ The server exposes several endpoints (requires session authentication if `DASHBO
 - `GET /api/overview`: Retrieve configured metrics.
 - `GET /api/metrics/:metric`: Retrieve details and historical timeseries for a specific metric.
 - `GET /api/customers`: Search and list customer profiles and timelines.
+- `GET /api/contacts`: Search and list people (name, email, linked stores, live store MRR). `PUT /api/contacts/:email/shop` confirms a store match; `PUT /api/contacts/:email/suppression` suppresses or unsuppresses.
 - `GET /api/reviews`: List reviews, ratings, and linking statuses.
 - `GET /api/funnel`: The six funnel steps with per-period counts and conversions. Takes `granularity` (`day`, `week`, `month`, `previous_7_days`), plus the usual `period`/`start`/`end`/`appIds`.
 - `GET /api/funnel/apps`: Apps the funnel can be read for — those with a GA4 dataset configured. This is what the page's App filter offers.

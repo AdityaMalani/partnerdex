@@ -15,6 +15,7 @@ const ICONS: Record<string, string> = {
   subscriptions: 'M8 9a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM2 19a6 6 0 0 1 12 0M16 8h5M18.5 5.5v5',
   churn: 'M3 6l5 5 4-3 6 7M15 15h5v-5',
   customers: 'M9 10a3.2 3.2 0 1 0 0-6.4 3.2 3.2 0 0 0 0 6.4zM2.5 19a6.5 6.5 0 0 1 13 0M16 4.2a3.2 3.2 0 0 1 0 6.2M17.5 13.2A6.5 6.5 0 0 1 21 19',
+  contacts: 'M11 10a3.2 3.2 0 1 0 0-6.4 3.2 3.2 0 0 0 0 6.4zM4.5 19a6.5 6.5 0 0 1 13 0',
   notifications: 'M5.5 15.5V10a5.5 5.5 0 0 1 11 0v5.5l1.5 2h-14zM9 17.5a2 2 0 0 0 4 0',
   reviews: 'M11 3.2l2.5 5.1 5.6.8-4 4 .9 5.6-5-2.7-5 2.7.9-5.6-4-4 5.6-.8z',
   listings: 'M3.5 6.5h15v11h-15zM3.5 9.5h15M7 13h8M7 15.5h5',
@@ -39,6 +40,14 @@ const MOON_ICON = 'M18 13.4A7.5 7.5 0 0 1 8.6 4a7.5 7.5 0 1 0 9.4 9.4z';
 const SUN_RAYS =
   'M11 2v2M11 18v2M2 11h2M18 11h2M4.6 4.6l1.4 1.4M16 16l1.4 1.4M17.4 4.6L16 6M6 16l-1.4 1.4';
 
+function childIds(page: PageSpec): string[] {
+  return (page.children ?? []).map((child) => child.id);
+}
+
+function isInSection(page: PageSpec, current: string): boolean {
+  return page.id === current || childIds(page).includes(current);
+}
+
 export function Nav({
   current,
   collapsed,
@@ -58,19 +67,58 @@ export function Nav({
   /* The icon and the label both name the theme the click moves *to*, not the
      one you are in — the same convention the control kept when it floated. */
   const themeLabel = theme === 'dark' ? 'Light theme' : 'Dark theme';
-  const item = (page: PageSpec) => (
-    <li key={page.id}>
-      <a
-        href={`#/${page.id}`}
-        className={page.id === current ? 'nav-link active' : 'nav-link'}
-        aria-current={page.id === current ? 'page' : undefined}
-        title={collapsed ? page.label : undefined}
-      >
-        <Icon id={page.id} />
-        <span className="nav-label">{page.label}</span>
-      </a>
-    </li>
-  );
+  const item = (page: PageSpec) => {
+    const children = page.children ?? [];
+    const expanded = !collapsed && children.length > 0 && isInSection(page, current);
+    const inSection = page.id !== current && isInSection(page, current);
+    const classes = [
+      'nav-link',
+      page.id === current ? 'active' : '',
+      inSection ? 'nav-link-section' : '',
+    ]
+      .filter(Boolean)
+      .join(' ');
+
+    return (
+      <li key={page.id}>
+        <a
+          href={`#/${page.id}`}
+          className={classes}
+          aria-current={page.id === current ? 'page' : undefined}
+          aria-expanded={children.length > 0 ? expanded : undefined}
+          title={collapsed ? page.label : undefined}
+        >
+          <Icon id={page.id} />
+          <span className="nav-label">{page.label}</span>
+          {children.length > 0 ? (
+            <svg
+              className={expanded ? 'nav-chevron open' : 'nav-chevron'}
+              viewBox="0 0 22 22"
+              aria-hidden="true"
+              focusable="false"
+            >
+              <path d="M6 8l5 5 5-5" fill="none" strokeWidth="1.8" />
+            </svg>
+          ) : null}
+        </a>
+        {expanded ? (
+          <ul className="nav-children">
+            {children.map((child) => (
+              <li key={child.id}>
+                <a
+                  href={`#/${child.id}`}
+                  className={child.id === current ? 'nav-link nav-child active' : 'nav-link nav-child'}
+                  aria-current={child.id === current ? 'page' : undefined}
+                >
+                  <span className="nav-label">{child.label}</span>
+                </a>
+              </li>
+            ))}
+          </ul>
+        ) : null}
+      </li>
+    );
+  };
 
   return (
     <nav className={collapsed ? 'nav collapsed' : 'nav'} aria-label="Reports">

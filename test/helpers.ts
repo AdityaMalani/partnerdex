@@ -24,6 +24,7 @@ export function resetEnvironment(overrides: Record<string, string> = {}): void {
   // Explicitly off, so a password exported in the developer's shell cannot
   // decide whether the fixture's API is gated. The auth tests override it.
   process.env.DASHBOARD_PASSWORD = '';
+  process.env.CONTACTS_INGEST_TOKEN = '';
   process.env.SYNC_START_DATE = '2020-01-01';
   process.env.REPORTING_TIMEZONE = 'UTC';
   process.env.CACHE_TTL_SECONDS = '0';

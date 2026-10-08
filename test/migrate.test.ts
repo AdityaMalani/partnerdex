@@ -74,6 +74,18 @@ function legacyDb(): Db {
 }
 
 describe('migration runner', () => {
+  it('numbers MIGRATIONS 1, 2, 3… with no repeats and no gaps', () => {
+    // Two branches that each add "the next" migration both pick the same
+    // number. A database already at that version skips whichever arrives
+    // second, with no error. Failing here is the only place that is visible.
+    const versions = MIGRATIONS.map((migration) => migration.version);
+    assert.deepEqual(
+      versions,
+      versions.map((_, index) => index + 1),
+      `migration versions must run 1..${versions.length} in order, got [${versions.join(', ')}]`,
+    );
+  });
+
   it('starts a new database at 0 and leaves it at the highest version', () => {
     const db = freshDb();
     assert.equal(readUserVersion(db), 0);
