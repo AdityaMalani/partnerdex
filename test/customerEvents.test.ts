@@ -167,6 +167,52 @@ describe("customer events: the raw feed compiled into a lifecycle", () => {
     assert.equal(suppressed[0]!.type, "unsubscribed");
   });
 
+  /**
+   * The reported failure. A merchant started a Starter trial and moved to Pro
+   * two minutes later; Shopify cancelled the one and activated the other a
+   * second apart, carrying the trial's end date across. Nothing had been paid
+   * on Starter, and the fold read that as a trial abandoned followed by a
+   * return. It was one upgrade.
+   */
+  it("reads a plan change made mid-trial as an upgrade, not an abandoned trial and a return", () => {
+    resetEnvironment();
+    seed([
+      {
+        chargeRef: "starter",
+        shopId: "1",
+        amount: 14,
+        activatedAt: "2024-03-01T10:57:45Z",
+        billingOn: "2024-03-15T00:00:00Z",
+        churnedAt: "2024-03-01T11:00:09Z",
+      },
+      {
+        chargeRef: "pro",
+        shopId: "1",
+        amount: 29,
+        activatedAt: "2024-03-01T11:00:10Z",
+        billingOn: "2024-03-15T00:00:00Z",
+        firstSaleAt: "2024-03-15T00:00:00Z",
+      },
+    ]);
+
+    const types = typesFor("1");
+    assert.equal(types.filter((type) => type === "upgraded").length, 1);
+    for (const wrong of ["trial_abandoned", "charge_abandoned", "resubscribed", "unsubscribed"]) {
+      assert.equal(types.includes(wrong), false, `no ${wrong}`);
+    }
+
+    // A trial is still running, so the move carries no money until it converts.
+    const upgrade = eventsFor("1").find((row) => row.type === "upgraded")!;
+    assert.ok(upgrade.prev_charge_id.endsWith("starter"));
+    assert.equal(upgrade.net_change, 0);
+    assert.equal(ledgerTotal(), 29);
+
+    const suppressed = eventsFor("1", { includeSuppressed: true }).filter(
+      (row) => row.suppressed === 1,
+    );
+    assert.deepEqual(suppressed.map((row) => row.type), ["unsubscribed"]);
+  });
+
   it("reads a downgrade as a negative move, still without churn", () => {
     resetEnvironment();
     seed([
@@ -237,11 +283,14 @@ describe("customer events: the raw feed compiled into a lifecycle", () => {
   });
 
   /**
-   * The reported failure. A merchant dropped a trial and signed up again half a
-   * minute later, and the fold called the second charge an upgrade: an
-   * abandonment left the running state sitting on the charge nobody was paying
-   * for, so the return looked like a merchant who had never left moving tier.
-   * They did leave. It is a win-back.
+   * The reported failure. A merchant dropped a trial and signed up again a
+   * couple of minutes later, and the fold called the second charge an upgrade:
+   * an abandonment left the running state sitting on the charge nobody was
+   * paying for, so the return looked like a merchant who had never left moving
+   * tier. They did leave. It is a win-back.
+   *
+   * Outside the plan-change window, that is. A return inside 60 seconds is
+   * spec §4.a's plan change, and is covered by the mid-trial upgrade above.
    */
   it("calls a return after an abandoned trial a win-back, not a plan change", () => {
     resetEnvironment();
@@ -258,7 +307,7 @@ describe("customer events: the raw feed compiled into a lifecycle", () => {
         chargeRef: "again",
         shopId: "1",
         amount: 14,
-        activatedAt: "2024-01-14T00:00:29Z",
+        activatedAt: "2024-01-14T00:02:00Z",
         billingOn: "2024-01-28T00:00:00Z",
         firstSaleAt: "2024-01-28T00:00:00Z",
       },

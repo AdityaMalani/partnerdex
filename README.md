@@ -16,7 +16,7 @@ PartnerDex provides a privacy-first, fully customizable, self-hosted analytics d
 - **Deterministic Historical Metrics:** MRR, ARR, and subscriber counts as of any past date remain perfectly consistent. Late-arriving cancellations or retroactively issued refunds automatically correct historical calculations on the subsequent sync.
 - **Self-Hosted & Private:** All fetched data is stored in a local SQLite database on your own infrastructure. No third-party servers are involved.
 - **Comprehensive Lifecycle Insights:** Reconstructs detailed customer lifecycles, uninstall timelines, trials, churn, App Store reviews, and revenue analytics.
-- **Install Funnel:** Listing page view → Add app click → install → trial → conversion, with the count and step-over-step conversion for every period. The two pre-install steps are read from the GA4 BigQuery export; where that is not connected they are reported as unmeasurable rather than as zero.
+- **Install Funnel:** Listing page view → Add app click → install → trial → conversion → review, with the count and step-over-step conversion for every period. The two pre-install steps are read from the GA4 BigQuery export and the last from the crawled App Store listing; where either is unavailable those steps are reported as unmeasurable rather than as zero.
 - **Slack Notifications:** Real-time, deduplicated alerts for subscription events (starts, upgrades, churn) and App Store review changes.
 - **CLI & HTTP API:** Query metrics directly from the command line, export custom intervals, or connect your own reporting tools.
 
@@ -132,6 +132,7 @@ If `DASHBOARD_PASSWORD` is configured (minimum 8 characters), the application se
 | **Funnel — installed** | Distinct shops whose install interval began in the period. |
 | **Funnel — trial started** | Distinct shops that began a free period. Plan changes carry a nominal trial window they never sat through and are excluded. |
 | **Funnel — trial converted** | Of the trials *started* in the period, those that reached a paid charge. Credited to the cohort that produced them, which is why the newest columns are provisional. |
+| **Funnel — left a review** | Reviews posted on the App Store listing in the period. Counted in reviews rather than in shops, because a review publishes a store name and not a shop id and the link back to a customer is a guess; counting shops would drop every review the matcher could not place. Reviews later removed still count — the merchant did leave them. |
 
 ### Under-the-Hood Inferences
 1. **Inferred Trials:** Trial periods are detected based on the gap between subscription activation and the first paid charge transaction. `TRIAL_MIN_GAP_DAYS` (default `2`) defines this threshold.
@@ -161,7 +162,7 @@ Since the Partner API does not include review data, PartnerDex crawls the public
 - **Attribution:** Reviews are matched to customer database entries by unique installer store name. Unmatched reviews can be linked manually via the UI.
 
 ### Install Funnel and BigQuery
-The funnel spans five steps, and it is deliberately fed by two different stores:
+The funnel spans six steps, and it is deliberately fed by three different stores:
 
 | Step | Source | Unit |
 | --- | --- | --- |
@@ -170,6 +171,7 @@ The funnel spans five steps, and it is deliberately fed by two different stores:
 | 3. Installed | Partner API | shop |
 | 4. Trial started | Partner API | shop |
 | 5. Trial converted | Partner API | shop |
+| 6. Left a review | App Store listing crawl | review |
 
 **Why the split.** Nothing before the install exists in the Partner API. Shopify emits `page_view` when a merchant opens your listing and `Add App button` — spaces and capitals included, a name it kept from Universal Analytics — when they click Install, but only into the Google Analytics property whose measurement id is on the listing. Installs, trials and conversions, on the other hand, are *complete* in the Partner API and are only partially observable in GA4 — so each step is taken from the store that actually knows it.
 
@@ -249,7 +251,7 @@ The server exposes several endpoints (requires session authentication if `DASHBO
 - `GET /api/metrics/:metric`: Retrieve details and historical timeseries for a specific metric.
 - `GET /api/customers`: Search and list customer profiles and timelines.
 - `GET /api/reviews`: List reviews, ratings, and linking statuses.
-- `GET /api/funnel`: The five funnel steps with per-period counts and conversions. Takes `granularity` (`day`, `week`, `month`, `previous_7_days`), plus the usual `period`/`start`/`end`/`appIds`.
+- `GET /api/funnel`: The six funnel steps with per-period counts and conversions. Takes `granularity` (`day`, `week`, `month`, `previous_7_days`), plus the usual `period`/`start`/`end`/`appIds`.
 - `GET /api/funnel/apps`: Apps the funnel can be read for — those with a GA4 dataset configured. This is what the page's App filter offers.
 - `GET /api/bigquery`: BigQuery account state and per-app sources. The service-account key is write-only and never appears in a response. `POST /api/bigquery/check` verifies the account and lists visible datasets; `POST /api/bigquery/apps/:appId/check` verifies one app's dataset.
 - `GET /api/status`: System counts, sync logs, and background worker state.
@@ -293,6 +295,7 @@ This utility checks source transaction parity, cross-foots reconstructed metrics
 - **Store Name Matching:** Matching App Store review authors with Shopify merchants is a best-effort heuristic based on store names.
 - **LTV Calculation:** Periods with zero churn will report an LTV of zero.
 - **Funnel Identity:** Steps 1–2 count browsers and steps 3–5 count shops; there is no per-merchant join across that seam, so the conversion between them is directional rather than a true per-visitor rate.
+- **Funnel Review Step:** Step 6 is last because it happens last, not because those merchants came through step 5 — a merchant who never trialled can still review, so the step is not a subset of the one above and routinely exceeds it. The report says so in a note rather than raising a warning or capping the count.
 - **Funnel Freshness:** GA4 intraday tables are not read, so the top two steps lag the bottom three by up to a day.
 - **Cross-device Identity:** Pre-install events carry no shop, so a merchant is usually a browser. One person on a laptop and a desktop counts as two, and the same person after clearing cookies counts as two.
 

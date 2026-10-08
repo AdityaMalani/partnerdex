@@ -1,5 +1,5 @@
 import type { Db } from '../db/index.js';
-import { monthlyAmountFor } from './derive.js';
+import { monthlyAmountFor, PLAN_CHANGE_WINDOW_SECONDS } from './derive.js';
 
 /**
  * Raw feed -> clean customer lifecycle events (customer-events spec 3).
@@ -217,6 +217,23 @@ function contributionAt(sub: SubRow | undefined, at: string): number {
   return gate <= at ? sub.monthly_amount : 0;
 }
 
+/**
+ * Did another charge on this install activate within the plan-change window
+ * after `cancel` (spec §4.a)? `derive.ts` has already decided the cancel is a
+ * plan change; this only tells its §4.a half, where the merchant moved onto a
+ * new plan, from §4.b's re-emit.
+ */
+function movedOnFrom(items: TimelineItem[], cancel: RawEventRow): boolean {
+  const from = Date.parse(cancel.occurred_at);
+  return items.some(({ raw }) => {
+    if (raw?.type !== 'SUBSCRIPTION_CHARGE_ACTIVATED' || raw.charge_id === cancel.charge_id) {
+      return false;
+    }
+    const gap = Date.parse(raw.occurred_at) - from;
+    return gap >= 0 && gap < PLAN_CHANGE_WINDOW_SECONDS * 1000;
+  });
+}
+
 function foldInstall(items: TimelineItem[], out: CleanEvent[]): void {
   let currentState = 'none';
   /** What the install is contributing to MRR right now. */
@@ -393,6 +410,40 @@ function foldInstall(items: TimelineItem[], out: CleanEvent[]): void {
       case 'SUBSCRIPTION_CHARGE_CANCELED':
       case 'SUBSCRIPTION_CHARGE_EXPIRED':
       case 'SUBSCRIPTION_CHARGE_DECLINED': {
+        // The row is kept either way. Suppressed events are filtered out of
+        // every default read, so the audit trail survives without the churn
+        // number ever seeing them.
+        const suppress = (reason: string) =>
+          push('unsubscribed', {
+            suppressed: 1,
+            plan_amount: planAmount,
+            net_change: 0,
+            detail: JSON.stringify({ suppressedAs: reason }),
+          });
+
+        // A plan change is a plan change whether or not the old charge had been
+        // paid for yet (spec §4.a, §6.4). A merchant who moves tier mid-trial
+        // cancels a charge nothing has settled on, and this check used to sit
+        // below the abandonment branch, which never reached it: the move was
+        // announced as a cancelled trial, the state was released, and the new
+        // charge read as a return — "Trial cancelled" then "Trial restarted" for
+        // one upgrade. Holding the state here is what lets the activation that
+        // follows take the plan-change branch.
+        //
+        // Only when the install really was on this charge and really did move
+        // onto another. `is_plan_change` also covers §4.b's re-emit, which says
+        // nothing about where the merchant went; an unpaid charge flagged for
+        // that alone is still an abandonment, and holding the state on it would
+        // leave the install subscribed to a charge that is gone.
+        if (
+          sub?.is_plan_change === 1 &&
+          currentCharge === raw.charge_id &&
+          movedOnFrom(items, raw)
+        ) {
+          suppress('plan_change');
+          break;
+        }
+
         // A charge that never reached a paid state was abandoned, not churned:
         // there is no revenue to lose. Expiries are back-dated to where the
         // merchant actually stopped, clamped to their first interaction.
@@ -452,20 +503,8 @@ function foldInstall(items: TimelineItem[], out: CleanEvent[]): void {
         //     counting it would report a merchant as lost and upgraded at once;
         //   - an uninstall already ended the subscription earlier, and the loss
         //     is carried by the derived event at that instant instead.
-        //
-        // The row is kept either way. Suppressed events are filtered out of
-        // every default read, so the audit trail survives without the churn
-        // number ever seeing them.
         if (sub.is_plan_change === 1 || sub.churn_at !== raw.occurred_at) {
-          push('unsubscribed', {
-            suppressed: 1,
-            plan_amount: planAmount,
-            net_change: 0,
-            detail: JSON.stringify({
-              suppressedAs:
-                sub.is_plan_change === 1 ? 'plan_change' : (sub.churn_reason ?? 'not_churn'),
-            }),
-          });
+          suppress(sub.is_plan_change === 1 ? 'plan_change' : (sub.churn_reason ?? 'not_churn'));
           break;
         }
 

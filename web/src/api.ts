@@ -436,14 +436,15 @@ export interface FunnelStep {
   label: string;
   description: string;
   /** Which store the figure comes from. Rendered as a pill beside each step. */
-  source: 'bigquery' | 'partner';
-  unit: 'visitor' | 'shop';
+  source: 'bigquery' | 'partner' | 'appstore';
+  unit: 'visitor' | 'shop' | 'review';
 }
 
 /**
  * Note that every figure is nullable. Null is not zero: it means the step could
- * not be measured — no BigQuery connection, or no listing traffic collected —
- * and rendering it as 0 would claim nobody visited the listing.
+ * not be measured — no BigQuery connection, no listing traffic collected, or no
+ * App Store listing crawled — and rendering it as 0 would claim nobody visited
+ * the listing, or that nobody reviewed it.
  */
 export interface FunnelBucket {
   periodStart: string;
@@ -474,6 +475,11 @@ export interface FunnelResponse {
     directToPaid: number;
     /** Shops that reopened in the window, held off step 3 and said in the notes. */
     reopenedNotCounted: number;
+    /** Apps whose App Store listing has been crawled, and those that have not. */
+    appsWithReviewCrawl: number;
+    appsWithoutReviewCrawl: string[];
+    /** When a listing here was first crawled; before it, removals are invisible. */
+    reviewsCrawledFrom: string | null;
     notes: string[];
     warnings: string[];
   };

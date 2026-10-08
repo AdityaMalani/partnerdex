@@ -22,7 +22,7 @@ import { APP_ID, resetEnvironment, seed, seedForApp } from './helpers.js';
 /**
  * The funnel, and the seam down the middle of it.
  *
- * What is worth asserting here is not that five counts come back — it is the
+ * What is worth asserting here is not that a count comes back per step — it is the
  * handful of places the report could lie quietly:
  *
  *   - an unmeasurable step reported as zero, which reads as "nobody visited"
@@ -30,6 +30,10 @@ import { APP_ID, resetEnvironment, seed, seedForApp } from './helpers.js';
  *   - a trial conversion credited to the month the money landed rather than the
  *     month the trial began, which would put conversions in a column with no
  *     trials in it
+ *   - a review landing in the column before its own, because the listing
+ *     publishes a bare date that sorts ahead of an ISO instant
+ *   - a review the matcher could not attach to a shop, or one that has since
+ *     been taken down, dropped out of a period it really happened in
  *   - a service-account key leaking back out through the settings API
  */
 
@@ -115,6 +119,46 @@ function addLegacyListingEvent(row: { type: string; at: string; visitor: string 
        VALUES (?, ?, ?, ?, '', ?)`,
     )
     .run(`legacy:${row.visitor}:${row.at}`, APP_ID, row.type, row.at, row.visitor);
+}
+
+/**
+ * A crawled listing, whether or not it found anything.
+ *
+ * A snapshot row is what the ingest writes on every successful crawl, and it is
+ * what the funnel reads to tell "nobody reviewed" from "nobody looked". Seeded
+ * on its own so a listing with no reviews can be tested.
+ */
+function addReviewCrawl(appId = APP_ID, capturedAt = '2024-01-15T00:00:00.000Z') {
+  getDb()
+    .prepare(
+      `INSERT INTO app_review_snapshots (app_id, captured_at, rating_value, rating_count)
+       VALUES (?, ?, ?, ?)`,
+    )
+    .run(appId, capturedAt, 4.8, 12);
+}
+
+/** `postedOn` is a bare date, exactly as the listing publishes it. */
+function addReviews(
+  rows: Array<{ id: string; postedOn: string; appId?: string; shopId?: string; removedAt?: string }>,
+) {
+  const statement = getDb().prepare(
+    `INSERT INTO app_reviews (
+       review_id, app_id, rating, posted_on, body, store_name, shop_id,
+       match_method, content_hash, first_seen_at, last_seen_at, removed_at
+     ) VALUES (?, ?, 5, ?, 'Good app', 'Acme', ?, ?, '', ?, ?, ?)`,
+  );
+  for (const row of rows) {
+    statement.run(
+      row.id,
+      row.appId ?? APP_ID,
+      row.postedOn,
+      row.shopId ?? '',
+      row.shopId ? 'auto' : 'none',
+      '2024-01-15T00:00:00.000Z',
+      '2024-01-15T00:00:00.000Z',
+      row.removedAt ?? null,
+    );
+  }
 }
 
 const MARCH = { period: 'custom', start: '2024-03-01', end: '2024-03-31' };
@@ -304,6 +348,158 @@ describe('funnel: visitors and conversion', () => {
     assert.ok(
       report.meta.warnings.some((warning) => warning.includes('Installed')),
       'the non-monotonic step must be reported',
+    );
+  });
+});
+
+/**
+ * The review step, and the three ways it is unlike the five above it.
+ *
+ * It comes from a third store, it is counted in events rather than in people,
+ * and it is not a subset of the step before it. Each of those is a way the
+ * report could quietly mislead, so each has a test.
+ */
+describe('funnel: left a review', () => {
+  it('counts reviews posted in the period, from the crawled listing', () => {
+    seedMarch();
+    addReviewCrawl();
+    addReviews([
+      { id: 'r1', postedOn: '2024-03-05' },
+      { id: 'r2', postedOn: '2024-03-20' },
+      // February, and so in neither the March column nor the March total.
+      { id: 'r3', postedOn: '2024-02-28' },
+    ]);
+
+    const report = funnelReport({ ...MARCH, granularity: 'month' }, { now: NOW });
+
+    assert.equal(report.buckets[0]!.counts[stepIndex('review_posted')], 2);
+    assert.equal(report.totals.counts[stepIndex('review_posted')], 2);
+  });
+
+  it('reports the step as null, never zero, when no listing has been crawled', () => {
+    seedMarch();
+    const report = funnelReport({ ...MARCH, granularity: 'month' }, { now: NOW });
+
+    assert.equal(
+      report.buckets[0]!.counts[stepIndex('review_posted')],
+      null,
+      'a listing nobody has read is not a listing nobody reviewed',
+    );
+    assert.equal(report.totals.counts[stepIndex('review_posted')], null);
+    assert.equal(report.meta.appsWithReviewCrawl, 0);
+    assert.equal(report.meta.reviewsCrawledFrom, null);
+    assert.ok(report.meta.notes.some((note) => note.includes('cannot be measured')));
+  });
+
+  it('reports a real zero once the listing has been crawled and nobody reviewed', () => {
+    seedMarch();
+    addReviewCrawl();
+
+    const report = funnelReport({ ...MARCH, granularity: 'month' }, { now: NOW });
+    assert.equal(
+      report.buckets[0]!.counts[stepIndex('review_posted')],
+      0,
+      'a crawled listing with a quiet month reports zero, not null',
+    );
+    assert.equal(report.meta.reviewsCrawledFrom, '2024-01-15T00:00:00.000Z');
+  });
+
+  it('puts a review in its own column rather than the one before it', () => {
+    // The listing publishes `2024-03-01`, which sorts *before*
+    // `2024-03-01T00:00:00.000Z` lexically. Without both sides in the same form
+    // the first review of a period falls into the period before it.
+    seedMarch();
+    addReviewCrawl();
+    addReviews([{ id: 'r1', postedOn: '2024-03-01' }]);
+
+    const report = funnelReport({ ...MARCH, granularity: 'day' }, { now: NOW });
+    const first = report.buckets[0]!;
+
+    assert.equal(first.periodStart, '2024-03-01T00:00:00.000Z');
+    assert.equal(first.counts[stepIndex('review_posted')], 1);
+    assert.equal(
+      report.buckets.slice(1).reduce((sum, bucket) => sum + (bucket.counts[stepIndex('review_posted')] ?? 0), 0),
+      0,
+      'the review belongs to one day only',
+    );
+  });
+
+  it('keeps a review that has since been taken down, and one with no shop', () => {
+    // Removal is not attributable and not retroactive: the merchant did leave
+    // the review in March. And a review the matcher could not place is still a
+    // review — counting distinct shops would delete exactly those.
+    seedMarch();
+    addReviewCrawl();
+    addReviews([
+      { id: 'r1', postedOn: '2024-03-05', shopId: '10' },
+      { id: 'r2', postedOn: '2024-03-06', removedAt: '2024-04-01T00:00:00.000Z' },
+      { id: 'r3', postedOn: '2024-03-07' },
+    ]);
+
+    const report = funnelReport({ ...MARCH, granularity: 'month' }, { now: NOW });
+    assert.equal(report.buckets[0]!.counts[stepIndex('review_posted')], 3);
+  });
+
+  it('explains rather than warns when reviews exceed the step above', () => {
+    // Six reviews against one trial conversion is the ordinary case, not a
+    // fault: reviewers need not have trialled. A warning that fires every month
+    // is a warning nobody reads.
+    seedMarch();
+    addReviewCrawl();
+    addReviews(
+      ['r1', 'r2', 'r3', 'r4', 'r5', 'r6'].map((id, index) => ({
+        id,
+        postedOn: `2024-03-1${index}`,
+      })),
+    );
+
+    const report = funnelReport({ ...MARCH, granularity: 'month' }, { now: NOW });
+
+    assert.equal(report.totals.counts[stepIndex('trial_converted')], 1);
+    assert.equal(report.totals.counts[stepIndex('review_posted')], 6, 'never capped');
+    assert.equal(
+      report.meta.warnings.some((warning) => warning.includes('Left a review')),
+      false,
+      'exceeding the step above is the normal case here, so it is not a warning',
+    );
+    assert.ok(
+      report.meta.notes.some((note) => note.includes('have to have trialled or paid')),
+      'the reason it exceeds must be on the response',
+    );
+  });
+
+  it('says which apps have no crawled listing when only some do', () => {
+    resetEnvironment({ PARTNER_APP_IDS: '111,222' });
+    seedMarch();
+    seedForApp('222', '7788', '40');
+    addReviewCrawl();
+    addReviews([{ id: 'r1', postedOn: '2024-03-05' }]);
+
+    const report = funnelReport({ ...MARCH, granularity: 'month' }, { now: NOW });
+
+    assert.equal(report.meta.appsWithReviewCrawl, 1);
+    assert.deepEqual(report.meta.appsWithoutReviewCrawl, ['App 222']);
+    assert.ok(
+      report.meta.warnings.some(
+        (warning) => warning.includes('Left a review') && warning.includes('App 222'),
+      ),
+      'the app missing from the bottom of the funnel must be named',
+    );
+  });
+
+  it('flags the periods that predate the first crawl', () => {
+    seedMarch();
+    // First looked at the listing in April, so a review deleted in March was
+    // never on a page we read.
+    addReviewCrawl(APP_ID, '2024-04-02T00:00:00.000Z');
+    addReviews([{ id: 'r1', postedOn: '2024-03-05' }]);
+
+    const report = funnelReport({ ...MARCH, granularity: 'month' }, { now: NOW });
+
+    assert.equal(report.buckets[0]!.counts[stepIndex('review_posted')], 1);
+    assert.ok(
+      report.meta.notes.some((note) => note.includes('2024-04-02')),
+      'the horizon before which removals are invisible must be stated',
     );
   });
 });

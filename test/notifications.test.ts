@@ -305,7 +305,7 @@ describe('what a channel is told', () => {
 
   /**
    * The reported failure, end to end: a merchant dropped a trial and signed up
-   * again half a minute later, and the channel was told twice — "Subscription
+   * again a couple of minutes later, and the channel was told twice — "Subscription
    * upgraded" and "Trial started" — for one merchant action, neither of which
    * was what happened. The compiler now calls the return a win-back, and the
    * pair of rows it shares its instant with becomes the one sentence that is
@@ -325,7 +325,7 @@ describe('what a channel is told', () => {
         chargeRef: 'again',
         shopId: '1',
         amount: 14,
-        activatedAt: '2024-03-10T00:00:29Z',
+        activatedAt: '2024-03-10T00:02:00Z',
         billingOn: '2024-03-24T00:00:00Z',
         firstSaleAt: '2024-03-24T00:00:00Z',
       },
@@ -338,7 +338,7 @@ describe('what a channel is told', () => {
     const compiled = db
       .prepare(
         `SELECT type FROM customer_events
-          WHERE shop_id = '1' AND occurred_at = '2024-03-10T00:00:29.000Z' AND suppressed = 0
+          WHERE shop_id = '1' AND occurred_at = '2024-03-10T00:02:00.000Z' AND suppressed = 0
           ORDER BY type`,
       )
       .all() as Array<{ type: string }>;
@@ -409,6 +409,40 @@ describe('what a channel is told', () => {
     await dispatchPending(db);
 
     assert.deepEqual(headlines(), ['Subscription upgraded']);
+    assert.match(JSON.stringify(sent[0]!.blocks), /Was on/);
+  });
+
+  /**
+   * The reported failure, end to end: a merchant moved from a Starter trial to
+   * Pro, and the channel heard "Trial cancelled" and then "Trial restarted".
+   */
+  it('reports a plan change made mid-trial as one upgrade', async () => {
+    const db = seed([
+      {
+        chargeRef: 'starter',
+        shopId: '1',
+        amount: 14,
+        activatedAt: '2024-03-01T10:57:45Z',
+        billingOn: '2024-03-15T00:00:00Z',
+        churnedAt: '2024-03-01T11:00:09Z',
+      },
+      {
+        chargeRef: 'pro',
+        shopId: '1',
+        amount: 29,
+        activatedAt: '2024-03-01T11:00:10Z',
+        billingOn: '2024-03-15T00:00:00Z',
+      },
+    ]);
+    const channelId = channelWithTopic(db);
+    watermark(db, channelId, '2024-03-01T10:58:00Z');
+    stubFetch(ok);
+
+    await dispatchPending(db);
+
+    // The trial carried across to Pro, so it still converts on the date Starter's
+    // would have — which is news of its own, a fortnight later.
+    assert.deepEqual(headlines(), ['Subscription upgraded', 'Trial converted']);
     assert.match(JSON.stringify(sent[0]!.blocks), /Was on/);
   });
 

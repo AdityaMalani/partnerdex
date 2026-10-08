@@ -2269,25 +2269,32 @@ button.primary:disabled,
  * Stage colours: ordinal, not categorical.
  *
  * Funnel steps are a sequence — swapping two would change the meaning — so they
- * take ONE hue stepping in lightness rather than five identities. Both ramps
+ * take ONE hue stepping in lightness rather than six identities. Both ramps
  * are checked for monotone lightness, a visible gap between neighbours, and a
  * light end that still clears its surface. Step 1 is the anchor end, which
  * flips between modes so the first stage is always the most present.
+ *
+ * Six stops now that "Left a review" is one. Re-spaced across the range rather
+ * than extended past it: both ends are where they already were and already
+ * checked, so the light end still clears white at the same ratio it did, and
+ * only the interior gaps tighten. Every neighbouring pair stays above 1.2:1.
  */
 :root {
   --funnel-1: #1d4f96;
   --funnel-2: #2560b4;
   --funnel-3: #2e72d2;
-  --funnel-4: #5a94dd;
-  --funnel-5: #8fb8e8;
+  --funnel-4: #4a86d8;
+  --funnel-5: #6da3e0;
+  --funnel-6: #8fb8e8;
 }
 
 :root[data-theme='dark'] {
   --funnel-1: #b5d3f5;
-  --funnel-2: #8fb8e8;
-  --funnel-3: #6ba3e8;
-  --funnel-4: #4587d9;
-  --funnel-5: #2560b4;
+  --funnel-2: #97bfec;
+  --funnel-3: #7aabe8;
+  --funnel-4: #5d93dd;
+  --funnel-5: #4084cf;
+  --funnel-6: #2560b4;
 }
 
 /* --- the headline ------------------------------------------------------- */
@@ -2532,7 +2539,8 @@ button.primary:disabled,
 }
 
 .funnel-source-bigquery,
-.funnel-source-partner {
+.funnel-source-partner,
+.funnel-source-appstore {
   margin-left: 8px;
   font-size: 10px;
   vertical-align: middle;
@@ -2541,6 +2549,15 @@ button.primary:disabled,
 .funnel-source-bigquery {
   color: var(--series-2);
   border-color: color-mix(in srgb, var(--series-2) 40%, transparent);
+}
+
+/* The third store. Tinted like the GA4 pill rather than left on the default,
+   because Partner is the one that owns the plain pill: the two tinted ends are
+   what a reader scans for, and the middle of the funnel is where they stop
+   needing to ask. */
+.funnel-source-appstore {
+  color: var(--series-3);
+  border-color: color-mix(in srgb, var(--series-3) 40%, transparent);
 }
 
 /*
