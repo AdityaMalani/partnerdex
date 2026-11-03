@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import {
+  fetchContacts,
   fetchCustomer,
   type CustomerApp,
   type CustomerDetail as Detail,
@@ -7,6 +8,7 @@ import {
   type CustomerSubscription,
 } from '../api';
 import { formatCalendarDate, formatFullDate, formatValue } from '../format';
+import { CustomerContacts, toStoreContacts, type StoreContact } from './CustomerContacts';
 import { StatusPill } from './Customers';
 import { Stars } from './Reviews';
 
@@ -479,11 +481,42 @@ function SubscriptionTable({
   );
 }
 
-export function CustomerDetail({ shopId, appId }: { shopId: string; appId: string }) {
+export function CustomerDetail({
+  shopId,
+  appId,
+  section,
+}: {
+  shopId: string;
+  appId: string;
+  section: string;
+}) {
   const [detail, setDetail] = useState<Detail | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [timelineOpen, setTimelineOpen] = useState(false);
+  const [contacts, setContacts] = useState<StoreContact[] | null>(null);
+  const [contactsError, setContactsError] = useState<string | null>(null);
+  const [selectedContact, setSelectedContact] = useState<string | null>(null);
+  const tab = section === 'contacts' ? 'contacts' : 'overview';
+
+  // Loaded with the page rather than on first click, so the tab can show its
+  // count. A store has a handful of people; 200 is the list endpoint's ceiling.
+  useEffect(() => {
+    let cancelled = false;
+    setContacts(null);
+    setContactsError(null);
+    setSelectedContact(null);
+    fetchContacts({ shopId, appId: appId || undefined, limit: 200 })
+      .then((result) => {
+        if (!cancelled) setContacts(toStoreContacts(result.contacts, shopId));
+      })
+      .catch((cause: Error) => {
+        if (!cancelled) setContactsError(cause.message);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [shopId, appId]);
 
   useEffect(() => {
     let cancelled = false;
@@ -551,70 +584,99 @@ export function CustomerDetail({ shopId, appId }: { shopId: string; appId: strin
         </div>
       </div>
 
-      <div className="stat-row">
-        <Stat
-          label="Current MRR"
-          value={formatValue(detail.mrr, 'money', detail.currency)}
-          note={`${payingApps} paying app${payingApps === 1 ? '' : 's'}`}
-        />
-        <Stat
-          label="Paid to date"
-          value={formatValue(detail.lifetimeGross, 'money', detail.currency)}
-          note={`${detail.paymentCount} charge(s)`}
-        />
-        <Stat
-          label="Net of revenue share"
-          value={formatValue(detail.lifetimeNet, 'money', detail.currency)}
-          note={`${formatValue(share, 'money', detail.currency)} to Shopify`}
-        />
-        <Stat
-          label="Customer since"
-          value={detail.firstSeenAt ? formatFullDate(detail.firstSeenAt) : '—'}
-          note={detail.lastEventAt ? `Last seen ${formatFullDate(detail.lastEventAt)}` : null}
-        />
-      </div>
-
-      <AppsTable rows={detail.apps} currency={detail.currency} />
-
-      {/* Kept below the per-app view because it answers a different question:
-          Apps says where the relationship stands, this says how it got there —
-          every tier they moved between, each as its own charge. */}
-      <SubscriptionTable rows={past} currency={detail.currency} caption="Past subscriptions" />
-
-      <div className="card full">
-        {/* A merchant of any age has hundreds of events, and they are history
-            rather than the answer to "how is this account doing" — so the card
-            folds, and the count on the toggle says what is behind it. */}
-        <button
-          type="button"
-          className="card-collapse"
-          onClick={() => setTimelineOpen((current) => !current)}
-          aria-expanded={timelineOpen}
+      <nav className="page-tabs" aria-label="Customer sections">
+        <a
+          className={tab === 'overview' ? 'page-tab is-active' : 'page-tab'}
+          href={`#/customers/${encodeURIComponent(detail.shopId)}`}
+          aria-current={tab === 'overview' ? 'page' : undefined}
         >
-          <span className="card-label">Timeline</span>
-          <span className="card-collapse-meta">
-            {detail.events.length.toLocaleString()} event
-            {detail.events.length === 1 ? '' : 's'}
-            <svg
-              className={timelineOpen ? 'chevron chevron-open' : 'chevron'}
-              viewBox="0 0 20 20"
-              aria-hidden="true"
-              focusable="false"
+          Overview
+        </a>
+        <a
+          className={tab === 'contacts' ? 'page-tab is-active' : 'page-tab'}
+          href={`#/customers/${encodeURIComponent(detail.shopId)}/contacts`}
+          aria-current={tab === 'contacts' ? 'page' : undefined}
+        >
+          Contacts
+          {contacts ? <span className="page-tab-count">{contacts.length}</span> : null}
+        </a>
+      </nav>
+
+      {tab === 'contacts' ? (
+        <CustomerContacts
+          rows={contacts}
+          error={contactsError}
+          selected={selectedContact}
+          onSelect={setSelectedContact}
+        />
+      ) : (
+        <>
+          <div className="stat-row">
+            <Stat
+              label="Current MRR"
+              value={formatValue(detail.mrr, 'money', detail.currency)}
+              note={`${payingApps} paying app${payingApps === 1 ? '' : 's'}`}
+            />
+            <Stat
+              label="Paid to date"
+              value={formatValue(detail.lifetimeGross, 'money', detail.currency)}
+              note={`${detail.paymentCount} charge(s)`}
+            />
+            <Stat
+              label="Net of revenue share"
+              value={formatValue(detail.lifetimeNet, 'money', detail.currency)}
+              note={`${formatValue(share, 'money', detail.currency)} to Shopify`}
+            />
+            <Stat
+              label="Customer since"
+              value={detail.firstSeenAt ? formatFullDate(detail.firstSeenAt) : '—'}
+              note={detail.lastEventAt ? `Last seen ${formatFullDate(detail.lastEventAt)}` : null}
+            />
+          </div>
+
+          <AppsTable rows={detail.apps} currency={detail.currency} />
+
+          {/* Kept below the per-app view because it answers a different question:
+              Apps says where the relationship stands, this says how it got there —
+              every tier they moved between, each as its own charge. */}
+          <SubscriptionTable rows={past} currency={detail.currency} caption="Past subscriptions" />
+
+          <div className="card full">
+            {/* A merchant of any age has hundreds of events, and they are history
+                rather than the answer to "how is this account doing" — so the card
+                folds, and the count on the toggle says what is behind it. */}
+            <button
+              type="button"
+              className="card-collapse"
+              onClick={() => setTimelineOpen((current) => !current)}
+              aria-expanded={timelineOpen}
             >
-              <path d="M6 8l4 4 4-4" fill="none" strokeWidth="1.7" />
-            </svg>
-          </span>
-        </button>
-        {!timelineOpen ? null : detail.events.length === 0 ? (
-          <p className="footnote">No events recorded for this merchant.</p>
-        ) : (
-          <ol className="timeline">
-            {detail.events.map((event) => (
-              <EventRow key={event.eventId} event={event} currency={detail.currency} />
-            ))}
-          </ol>
-        )}
-      </div>
+              <span className="card-label">Timeline</span>
+              <span className="card-collapse-meta">
+                {detail.events.length.toLocaleString()} event
+                {detail.events.length === 1 ? '' : 's'}
+                <svg
+                  className={timelineOpen ? 'chevron chevron-open' : 'chevron'}
+                  viewBox="0 0 20 20"
+                  aria-hidden="true"
+                  focusable="false"
+                >
+                  <path d="M6 8l4 4 4-4" fill="none" strokeWidth="1.7" />
+                </svg>
+              </span>
+            </button>
+            {!timelineOpen ? null : detail.events.length === 0 ? (
+              <p className="footnote">No events recorded for this merchant.</p>
+            ) : (
+              <ol className="timeline">
+                {detail.events.map((event) => (
+                  <EventRow key={event.eventId} event={event} currency={detail.currency} />
+                ))}
+              </ol>
+            )}
+          </div>
+        </>
+      )}
     </>
   );
 }

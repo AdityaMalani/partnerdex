@@ -397,6 +397,40 @@ h3,
   padding: 8px 0;
 }
 
+/*
+ * A parent with children (Customers → Contacts) opens its submenu only when
+ * that section is the current page. The child has no icon; the indent lines
+ * it up with the parent's label.
+ */
+.nav-link-section {
+  background: color-mix(in srgb, var(--brand) 8%, transparent);
+  color: var(--brand-accent);
+}
+
+.nav-chevron {
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  margin-left: auto;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  opacity: 0.55;
+}
+
+.nav.collapsed .nav-chevron {
+  display: none;
+}
+
+.nav-children {
+  margin: 2px 0 4px;
+}
+
+.nav-link.nav-child {
+  padding-left: 36px;
+  gap: 0;
+}
+
 /* `margin-top: auto` takes the slack in the column, so the rule sits directly
    above the pair on a short rail and at the foot of the viewport on a tall one.
    The theme control and sign-out live here together: neither is a destination,
@@ -1134,6 +1168,46 @@ table:has(tfoot) tbody tr:last-child td {
 
 .back-link:hover {
   color: var(--text-primary);
+}
+
+/* Sections of one merchant's page. Links, not buttons, so each tab has a URL. */
+.page-tabs {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 18px;
+  border-bottom: 1px solid var(--border);
+  overflow-x: auto;
+}
+
+.page-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px;
+  margin-bottom: -1px;
+  border-bottom: 2px solid transparent;
+  color: var(--muted);
+  font-weight: 500;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.page-tab:hover {
+  color: var(--text-primary);
+}
+
+.page-tab.is-active {
+  color: var(--brand-accent);
+  border-bottom-color: var(--brand-accent);
+}
+
+.page-tab-count {
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
 }
 
 .customer-title {
@@ -3033,4 +3107,177 @@ button.primary:disabled,
 /* A second heading inside the panel needs air above it; the first does not. */
 .funnel-settings-title.spaced {
   margin-top: 14px;
+}
+
+/* -------------------------------------------------------------- contacts */
+
+.contact-person {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+}
+
+.contact-customer {
+  display: flex;
+  flex-direction: row;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.contacts-table td {
+  vertical-align: top;
+}
+
+.contacts-table th.col-customer,
+.contacts-table td.col-customer {
+  text-align: left;
+}
+
+.th-sort {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  font-weight: inherit;
+  letter-spacing: inherit;
+  text-transform: inherit;
+  cursor: pointer;
+}
+
+.th-sort:hover,
+.th-sort.is-active {
+  color: var(--text-primary);
+}
+
+.th-sort:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 2px;
+}
+
+.th-sort-mark {
+  font-size: 10px;
+  line-height: 1;
+}
+
+.contact-customer-link .customer-name {
+  color: var(--brand-accent);
+  font-weight: 500;
+}
+
+.contact-role,
+.contact-email {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.contact-email {
+  overflow-wrap: anywhere;
+}
+
+.contact-row-suppressed .customer-name,
+.contact-row-suppressed .customer-domain,
+.contact-row-suppressed .contact-role,
+.contact-row-suppressed .contact-email {
+  color: var(--muted);
+}
+
+.customer-table td .customer-name + .pill {
+  margin-left: 8px;
+}
+
+.pill-source-app_capture {
+  color: var(--brand-accent);
+  background: color-mix(in srgb, var(--brand-accent) 12%, transparent);
+  border-color: transparent;
+}
+
+.pill-source-csv_import {
+  color: var(--delta-up);
+  background: color-mix(in srgb, var(--delta-up) 12%, transparent);
+  border-color: transparent;
+}
+
+.pill-ambiguous {
+  margin-left: 6px;
+  color: var(--warning, #8a6116);
+  border-color: color-mix(in srgb, var(--warning, #c9a227) 40%, transparent);
+}
+
+.contact-customer .pill-ambiguous {
+  margin-left: 0;
+  margin-top: 0;
+}
+
+.pill-suppressed {
+  color: var(--delta-down);
+  border-color: color-mix(in srgb, var(--delta-down) 40%, transparent);
+}
+
+.customer-table td .link-button {
+  display: inline-block;
+  margin-left: 8px;
+}
+
+.customer-table td .review-picker {
+  margin-top: 10px;
+}
+
+.contact-footnote {
+  margin: 10px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+/* -------------------------------------------------- customer contacts tab */
+.contact-open {
+  font-size: inherit;
+  font-weight: 500;
+}
+
+.contact-modal-name {
+  margin: 0;
+  font-size: 18px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.contact-facts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px 20px;
+  margin: 18px 0 0;
+}
+
+.contact-facts dt {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.contact-facts dd {
+  margin: 2px 0 0;
+}
+
+.contact-modal-section {
+  display: grid;
+  gap: 8px;
+  margin-top: 20px;
+}
+
+@media (max-width: 560px) {
+  .contact-facts {
+    grid-template-columns: 1fr;
+  }
 }

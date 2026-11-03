@@ -299,6 +299,106 @@ export const fetchCustomer = (shopId: string, appId = ''): Promise<CustomerDetai
   );
 };
 
+/* --------------------------------------------------------------- contacts */
+
+export type ContactRole = 'owner' | 'staff' | 'collaborator';
+export type ContactMatchMethod = 'auto' | 'manual' | 'ambiguous' | 'none';
+export type ContactLinkedFilter = 'all' | 'unlinked' | 'ambiguous' | 'suppressed';
+
+export interface ContactShop {
+  shopId: string;
+  appId: string;
+  name: string | null;
+  domain: string | null;
+  role: ContactRole;
+  matchMethod: ContactMatchMethod;
+  mrr: number;
+  currency: string | null;
+  firstSeenAt: string | null;
+  lastSeenAt: string | null;
+}
+
+export interface ContactSummary {
+  email: string;
+  firstName: string | null;
+  lastName: string | null;
+  isSuppressed: boolean;
+  source: string;
+  role: ContactRole | null;
+  matchMethod: ContactMatchMethod | null;
+  shops: ContactShop[];
+  primaryShop: ContactShop | null;
+  firstSeenAt: string | null;
+  lastSeenAt: string | null;
+  createdAt: string | null;
+}
+
+export interface ContactListResult {
+  contacts: ContactSummary[];
+  total: number;
+  limit: number;
+  offset: number;
+  query: string;
+  totals: {
+    all: number;
+    unlinked: number;
+    ambiguous: number;
+    suppressed: number;
+  };
+}
+
+export interface ContactShopCandidate {
+  shopId: string;
+  name: string | null;
+  domain: string | null;
+}
+
+export const fetchContacts = (options: {
+  search?: string;
+  linked?: ContactLinkedFilter;
+  sort?: string;
+  limit?: number;
+  offset?: number;
+  appId?: string;
+  shopId?: string;
+}): Promise<ContactListResult> => {
+  const params = new URLSearchParams();
+  if (options.search) params.set('q', options.search);
+  if (options.linked && options.linked !== 'all') params.set('linked', options.linked);
+  if (options.sort) params.set('sort', options.sort);
+  if (options.limit) params.set('limit', String(options.limit));
+  if (options.offset) params.set('offset', String(options.offset));
+  if (options.appId) params.set('appIds', options.appId);
+  if (options.shopId) params.set('shopId', options.shopId);
+  return getJson<ContactListResult>(`/api/contacts?${params.toString()}`);
+};
+
+export const fetchContactCandidates = (
+  search: string,
+): Promise<{ candidates: ContactShopCandidate[] }> => {
+  const params = new URLSearchParams();
+  if (search) params.set('q', search);
+  return getJson<{ candidates: ContactShopCandidate[] }>(
+    `/api/contacts/candidates?${params.toString()}`,
+  );
+};
+
+export const matchContactToShop = (
+  email: string,
+  shopId: string,
+  appId = '',
+): Promise<{ email: string; shopId: string; appId: string; matchMethod: ContactMatchMethod }> =>
+  sendJson('PUT', `/api/contacts/${encodeURIComponent(email)}/shop`, {
+    shopId,
+    ...(appId ? { appId } : {}),
+  });
+
+export const setContactSuppressed = (
+  email: string,
+  suppressed: boolean,
+): Promise<{ ok: boolean; email: string; isSuppressed: boolean }> =>
+  sendJson('PUT', `/api/contacts/${encodeURIComponent(email)}/suppression`, { suppressed });
+
 /* --------------------------------------------------------------- reviews */
 
 export type ReviewMatchMethod = 'auto' | 'manual' | 'ambiguous' | 'none';

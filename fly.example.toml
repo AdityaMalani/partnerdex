@@ -56,6 +56,9 @@ primary_region = "<your-region>"
   # puts your revenue data on the public internet. 8 chars is the floor the
   # config enforces, not a recommendation.
   DASHBOARD_PASSWORD = "<your-dashboard-password>"
+  # Prefer: fly secrets set CONTACTS_INGEST_TOKEN=...
+  # Machine-to-machine bearer for POST /api/contacts/ingest (not the dashboard password).
+  # CONTACTS_INGEST_TOKEN = "<your-ingest-token>"
 
 [mounts]
   source = "partnerdex_data"

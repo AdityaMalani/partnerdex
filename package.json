@@ -21,6 +21,9 @@
     "rebuild": "tsx src/cli.ts rebuild",
     "doctor": "tsx src/cli.ts doctor",
     "validate": "tsx src/cli.ts validate",
+    "contacts:dump": "tsx src/cli.ts contacts:dump",
+    "contacts:coverage": "tsx src/cli.ts contacts:coverage",
+    "contacts:import": "tsx src/cli.ts contacts:import",
     "start": "node dist/cli.js serve",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p web/tsconfig.json --noEmit",
     "test": "node --test --import tsx test/*.test.ts"

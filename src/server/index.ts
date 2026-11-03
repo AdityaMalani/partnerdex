@@ -20,6 +20,7 @@ import { buildReviewEvents } from '../appstore/events.js';
 import { resolveScopedAppIds } from '../sync/index.js';
 import { onSyncComplete, startSyncScheduler, syncStatus } from '../sync/scheduler.js';
 import { authRequired, authRouter, requireAuth } from './auth.js';
+import { contactsDashboardRouter, contactsRouter } from './contacts.js';
 import { sendError } from './errors.js';
 import { notificationsRouter } from './notifications.js';
 import { listingsRouter } from './listings.js';
@@ -100,6 +101,10 @@ export function createApp(): express.Express {
   // dashboard that it needs to show a login form.
   app.use('/api/auth', authRouter());
 
+  // Machine-to-machine contacts ingest — bearer token, not the dashboard
+  // cookie. Must sit ahead of requireAuth so producers can POST without a session.
+  app.use('/api/contacts', contactsRouter());
+
   /*
    * Everything below reads the store, so everything below is gated. The static
    * dashboard bundle deliberately is not: it holds no data, and it has to load
@@ -110,6 +115,7 @@ export function createApp(): express.Express {
   app.use('/api/notifications', notificationsRouter());
   app.use('/api/listings', listingsRouter());
   app.use('/api/bigquery', bigqueryRouter());
+  app.use('/api/contacts', contactsDashboardRouter());
 
   /**
    * The install funnel.
